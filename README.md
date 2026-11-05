@@ -1,6 +1,17 @@
 # kw-campus
 
-광운대 공개 공지를 AWS(서울)에서 모아 Discord 채널로 알려 주는 서비스입니다. 지금은 1단계로, 메인 공지 게시판만 다룹니다. 전체 계획은 `../kw-mcp/docs/plan.md`에 있습니다.
+광운대 공개 정보를 AWS(서울)에서 모아 Discord 채널로 알리고, Claude·ChatGPT에서 쓸 수 있는 공개 MCP로 제공합니다. 전체 계획은 `../kw-mcp/docs/plan.md`에 있습니다.
+
+## 2단계: 공개 MCP
+
+- 주소: `https://<api-id>.execute-api.ap-northeast-2.amazonaws.com/c/<토큰>/mcp` (POST만, Streamable HTTP, stateless)
+- 토큰: 사람마다 하나씩 줍니다. SSM `/kw/mcp/tokens`에는 SHA-256 해시 목록만 둡니다. 본인 토큰은 `~/.config/kw-campus/mcp-token`에 있습니다.
+- 도구: `list_notice_categories`, `latest_notices`, `search_notices`, `get_notice`, `cafeteria_menu`, `academic_calendar`
+- 로컬 kw-mcp용 JSON: `/c/<토큰>/api/notices`, `/api/menu`, `/api/calendar`
+- 학식·학사일정: `kw-campus` Lambda가 평일 07:30에 돕니다. 이번 주 식단이 없거나 월요일일 때만 학식 페이지를 읽고, 학사일정은 7일마다 한 번 읽습니다. 두 요청 사이에는 실제로 61초를 쉽니다.
+- 남용 방어: API Gateway가 초당 2건, 순간 최대 5건으로 제한합니다. GET/DELETE는 405를 돌려주어 SSE 연결이 Lambda를 붙잡지 않게 합니다.
+
+친구에게 토큰을 줄 때는 새 토큰을 만들어 해시를 목록에 더합니다. 회수할 때는 그 해시를 지웁니다. 반영까지 최대 5분 걸립니다.
 
 ## 1단계 구성
 

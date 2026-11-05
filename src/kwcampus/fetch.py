@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
@@ -53,11 +54,14 @@ def _has_challenge(body: bytes) -> bool:
     return any(marker in head for marker in CHALLENGE_MARKERS)
 
 
-def fetch_list_page(url: str) -> FetchResult:
-    request = urllib.request.Request(  # noqa: S310 - URL comes from source.build_list_url
-        url,
-        headers={"User-Agent": USER_AGENT, "Accept": "text/html", "Accept-Language": "ko"},
-    )
+def fetch_list_page(url: str, form: dict[str, str] | None = None) -> FetchResult:
+    """GET the page, or POST a small form (the academic calendar loads its year that way)."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "text/html", "Accept-Language": "ko"}
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    request = urllib.request.Request(url, data=data, headers=headers)  # noqa: S310 - fixed allowlisted URLs
     try:
         with _opener.open(request, timeout=TIMEOUT_S) as response:
             status = response.status
