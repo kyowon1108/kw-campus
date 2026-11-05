@@ -13,9 +13,13 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
+from kw_mcp.service import CLASS_CHANGE_WORDS as CLASS_CHANGE_WORDS  # re-exported for app.py
+from kw_mcp.service import schedule_note  # shared with the PC agent: one definition
+
 from kwcampus.config import KST
 
 WEEKDAYS = "월화수목금토일"
+
 _SLOT = re.compile(r"^\s*([월화수목금토일])\s*([\d,\s]+)교시\s*(?:/\s*(.*?))?\s*$")
 
 
@@ -68,9 +72,15 @@ def _rows(snap: dict, key: str, course: str | None):
 
 
 def courses(snap: dict) -> list[dict]:
-    return [{"course": c.get("subjNm"), "professor": c.get("profNm"), "schedule": c.get("lctrumSchdulInfo"),
-             "slots": parse_schedule(c.get("lctrumSchdulInfo")), "semester": c.get("yearhakgi")}
-            for c in snap.get("courses", [])]
+    out = []
+    for c in snap.get("courses", []):
+        schedule = c.get("lctrumSchdulInfo")
+        row = {"course": c.get("subjNm"), "professor": c.get("profNm"), "schedule": schedule,
+               "slots": parse_schedule(schedule), "semester": c.get("yearhakgi")}
+        if note := schedule_note(schedule):
+            row["note"] = note
+        out.append(row)
+    return out
 
 
 def assignments(snap: dict, course: str | None = None, pending_only: bool = False) -> list[dict]:
@@ -141,9 +151,11 @@ def deadlines(snap: dict, now: datetime, days: int = 7) -> dict:
                        ("quiz", quizzes(snap, pending_only=True)),
                        ("team_project", [p for p in projects(snap) if not p["submitted"]])):
         for row in rows:
-            due = parse_kst(row["due"])
+            due, late_due = parse_kst(row["due"]), parse_kst(row.get("late_due"))
             if due and now <= due <= until:
                 items.append({"kind": kind, **row})
+            elif due and late_due and due < now <= late_due:  # team projects have late windows too
+                items.append({"kind": kind, "late_submission": True, **row})
     items.sort(key=lambda i: i["late_due"] if i.get("late_submission") else i["due"])
     return {"semester": snap.get("semester"), "now": now.strftime("%Y-%m-%d %H:%M"), "days": days,
             "data_as_of": snap.get("fetched_at"), "items": items}

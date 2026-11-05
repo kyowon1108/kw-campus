@@ -81,8 +81,9 @@ def _filter(rows: Iterable[dict], category: str | None, since: date | None) -> l
     return out
 
 
-def latest(table, category: str | None = None, limit: int = 10, include_pinned: bool = True) -> list[dict]:
-    rows = _filter(notices(table), category, None)
+def latest(table, category: str | None = None, limit: int = 10, include_pinned: bool = True,
+           since: date | None = None) -> list[dict]:
+    rows = _filter(notices(table), category, since)
     if not include_pinned:
         rows = [r for r in rows if not r["pinned"]]
     return rows[: max(1, min(limit, 50))]

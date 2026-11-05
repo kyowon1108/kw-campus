@@ -40,6 +40,8 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 from kwcampus import params, public_http
+from kw_mcp.service import term_in_session
+
 from kwcampus.bridge import crypto, install, password, shapes, store
 from kwcampus.config import KST
 from kwcampus.obs import log
@@ -130,6 +132,7 @@ _ERRORS = {
     "klas_login_required": "PC 에이전트가 KLAS에 로그인하지 못했습니다. PC에서 `kw-mcp setup`으로 학번·비밀번호를 다시 저장해 주세요.",
     "klas_blocked": "KLAS가 자동 로그인을 막았습니다(보안문자 또는 2차 인증).",
     "klas_error": "KLAS에서 데이터를 읽지 못했습니다. 잠시 뒤 다시 시도해 주세요.",
+    "too_large": "결과가 너무 큽니다.",
 }
 
 
@@ -260,18 +263,20 @@ async def my_course_notices(course: str | None = None) -> list[dict[str, Any]]:
 
 @mcp.tool(annotations=READ_ONLY)
 async def my_deadlines(days: int = 7) -> dict[str, Any]:
-    """앞으로 days일 안에 마감되는 미제출 과제·퀴즈·팀플과 미완료 온라인 강의."""
+    """현재 학기에서 앞으로 days일(최대 180) 안에 마감되는 미제출 과제·퀴즈·팀플과 미완료 온라인 강의.
+    마감이 지났지만 지각 제출 기간인 과제·팀플은 late_submission=true로 포함합니다(이때 due는 과거)."""
     return shapes.deadlines(await _snapshot(), _now(), days)
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def this_week(days: int = 7) -> dict[str, Any]:
-    """이번 주 할 일: 마감 목록과 같은 기간의 학사일정."""
+    """이번 주 할 일(현재 학기): 마감 목록(지각 제출 가능 항목은 late_submission=true)과 같은 기간의 학사일정."""
     snap = await _snapshot()
     now = _now()
-    return {**shapes.deadlines(snap, now, days),
-            "academic_events": public_http.academic_calendar(now.date().isoformat(),
-                                                             (now.date() + timedelta(days=days)).isoformat())}
+    deadlines = shapes.deadlines(snap, now, days)  # clamps days to 0..180; the calendar follows it
+    return {**deadlines,
+            "academic_events": public_http.academic_calendar(
+                now.date().isoformat(), (now.date() + timedelta(days=deadlines["days"])).isoformat())}
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -285,9 +290,14 @@ async def today_briefing() -> dict[str, Any]:
     since = (now - timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
     return {
         "date": now.strftime("%Y-%m-%d"), "weekday": shapes.WEEKDAYS[now.weekday()],
-        "classes": shapes.classes_on(snap, now), "due_today_or_tomorrow": soon,
+        # Same rule as kw-mcp: no timetable outside the semester's class period.
+        "classes": shapes.classes_on(snap, now) if term_in_session(snap.get("semester"), now) else [],
+        **({} if term_in_session(snap.get("semester"), now)
+           else {"classes_note": f"{snap.get('semester')} 학기 수업 기간이 아니라 시간표를 비웠습니다."}),
+        "due_today_or_tomorrow": soon,
         "cafeteria": public_http.cafeteria_menu(now.date().isoformat()),
-        "new_course_posts": [p for p in shapes.course_posts(snap) if (p["posted"] or "") >= since],
+        "new_course_posts": (new_posts := [p for p in shapes.course_posts(snap) if (p["posted"] or "") >= since]),
+        "possible_class_changes": [p for p in new_posts if shapes.CLASS_CHANGE_WORDS.search(p.get("title") or "")],
         "new_school_notices": public_http.search_notices("", None, (now.date() - timedelta(days=1)).isoformat(), 10),
         "data_as_of": snap.get("fetched_at"),
     }
@@ -295,7 +305,8 @@ async def today_briefing() -> dict[str, Any]:
 
 @mcp.tool(annotations=READ_ONLY)
 async def my_notices(days: int = 7) -> dict[str, Any]:
-    """내 공지함: 최근 days일의 내 과목 게시판 글 + 학교 학사·장학 공지."""
+    """내 공지함: 최근 days일의 학교 학사·장학 공지 + 내 과목 게시판 새 글(KLAS 홈에 뜨는 최근 몇 개만).
+    오래된 과목 공지나 특정 주제는 my_course_board로 찾으세요."""
     snap = await _snapshot()
     now = _now()
     since_dt = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
@@ -332,6 +343,25 @@ async def my_course_post(course: str, title: str) -> dict[str, Any]:
     """과목 게시판(공지·자료실 등) 글 하나의 본문과 첨부 파일 이름.
     course는 과목명 일부, title은 글 제목 일부(my_course_notices 결과의 제목을 쓰세요)."""
     return await agent_call("course_post", course=course, title=title)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_attendance(course: str | None = None) -> list[dict[str, Any]]:
+    """출석 현황(KLAS 전자출석): 과목별 출석·결석·지각·조퇴·공결 횟수와 주차·회차별 기록. course는 과목명 일부(생략하면 전체)."""
+    return await agent_call("attendance", course=course or "")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_exams(course: str | None = None) -> list[dict[str, Any]]:
+    """시험 정보 모아 보기: 과목별 강의계획서의 시험 관련 주차·평가 비율과, 게시판에서 '시험'이 들어간 글(최신 6개).
+    "시험 범위", "기말 언제" 같은 질문에 먼저 쓰고, 범위·장소는 my_course_post로 글을 열어 확인하세요."""
+    return await agent_call("exam_info", course=course or "")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_class_changes(days: int = 14) -> dict[str, Any]:
+    """휴강·보강 공지: 모든 수강 과목의 강의 공지사항에서 최근 days일 안의 '휴강'·'보강' 글. "오늘 휴강이야?"에 쓰세요."""
+    return await agent_call("class_changes", days=str(days))
 
 
 @mcp.tool(annotations=READ_ONLY)

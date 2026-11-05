@@ -86,9 +86,9 @@ _WEEKDAYS = {"월": 0, "화": 1, "수": 2, "목": 3, "금": 4, "토": 5, "일": 
 
 def _resolve_day(value: str | None) -> date:
     today = datetime.now(UTC).astimezone(KST).date()
-    if not value or value.strip() in ("오늘", "today"):
+    v = (value or "").strip()
+    if not v or v in ("오늘", "today"):
         return today
-    v = value.strip()
     if v in ("내일", "tomorrow"):
         return today + timedelta(days=1)
     if v[0] in _WEEKDAYS:
@@ -150,8 +150,9 @@ def _notices_api(request: Request) -> JSONResponse:
     limit = int(q.get("limit", "20")) if q.get("limit", "20").isdigit() else 20
     if q.get("q"):
         rows = public_data.search(table, q["q"], q.get("category"), _date(q.get("since")), limit)
-    else:
-        rows = public_data.latest(table, q.get("category"), limit, q.get("pinned", "true") != "false")
+    else:  # `since` must hold here too: kw-mcp's "new notices" ask without a query
+        rows = public_data.latest(table, q.get("category"), limit, q.get("pinned", "true") != "false",
+                                  _date(q.get("since")))
     return JSONResponse({"notices": rows, "source": "www.kw.ac.kr 메인 공지", "unofficial": True})
 
 

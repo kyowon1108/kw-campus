@@ -136,6 +136,20 @@ def run(now: datetime, table, clock: Callable[[], datetime] | None = None,
                                  "fetched_at": int(now.timestamp())})
         out["calendar"] = f"{len(events)} events" if events else reason if reason != "ok" else "no_events"
 
+    # In December, also keep next year's calendar so "this week"/"next month" can see January.
+    next_year = today.year + 1
+    upcoming = table.get_item(Key={"PK": "CAMPUS#calendar", "SK": f"Y#{next_year}"}).get("Item")
+    if today.month == 12 and (not upcoming or now.timestamp() - int(upcoming.get("fetched_at", 0))
+                              > CALENDAR_MAX_AGE.total_seconds()):
+        if "cafeteria" in out or "calendar" in out:
+            sleep(politeness.MIN_INTERVAL.total_seconds() + 1)
+        html, reason = _fetch(table, clock(), CALENDAR_URL, {"sy": str(next_year), "sm": ""})
+        events = parse_calendar(html, next_year) if html else []
+        if events:
+            table.put_item(Item={"PK": "CAMPUS#calendar", "SK": f"Y#{next_year}", "events": events,
+                                 "fetched_at": int(now.timestamp())})
+        out["calendar_next_year"] = f"{len(events)} events" if events else reason if reason != "ok" else "no_events"
+
     log("campus_ok", **out)
     metrics(CampusFetched=int("cafeteria" in out) + int("calendar" in out))
     return out

@@ -16,7 +16,7 @@ from starlette.testclient import TestClient
 
 from kwcampus import params
 from kwcampus.bridge import app as bridge
-from kwcampus.bridge import crypto, password, store, ws
+from kwcampus.bridge import crypto, password, shapes, store, ws
 
 INVITE = "friend-token-0123456789abcdef"
 REDIRECT = "https://claude.ai/api/mcp/auth_callback"
@@ -77,8 +77,9 @@ def env(aws, monkeypatch):
         # The "extension" answers immediately by posting an encrypted result.
         sent.append((conn, message))
         if message["type"] == "call":
-            body = FakeDevice.encrypt(message["key"], message["request_id"],
-                                      {"result": {"op": message["op"], **message["args"]}})
+            echo = {"op": message["op"], **message["args"]}
+            result = [echo] if message["op"] in ("attendance", "exam_info") else echo  # list-returning ops
+            body = FakeDevice.encrypt(message["key"], message["request_id"], {"result": result})
             store.put_result(t, body["request_id"], body["iv"], body["ct"])
             return True
         if message["type"] != "snapshot":
@@ -456,3 +457,54 @@ def test_grades_and_attachments_go_to_the_agent(env):
         "course": "데이터", "title": "10주차 자료", "part": 2}}).json()["result"]
     assert att["structuredContent"] == {"op": "read_attachment", "course": "데이터", "title": "10주차 자료",
                                         "file_name": "", "part": "2", "source": "post"}
+
+
+def test_attendance_exams_and_class_changes_go_to_the_agent(env):
+    c, device = env["client"], FakeDevice()
+    register(c, device)
+    store.add_connection(env["table"], device.uid, "agent", 2)
+    _, tokens = oauth(c, device)
+
+    def call(name, **arguments):
+        return mcp_call(c, tokens["access_token"], "tools/call", {"name": name, "arguments": arguments}).json()["result"]
+
+    assert call("my_attendance")["structuredContent"]["result"] == [{"op": "attendance", "course": ""}]
+    assert call("my_exams", course="데이터")["structuredContent"]["result"] == [{"op": "exam_info", "course": "데이터"}]
+    assert call("my_class_changes", days=7)["structuredContent"] == {"op": "class_changes", "days": "7"}
+
+
+def test_course_notes_and_class_change_flags_match_kw_mcp():
+    from kw_mcp import service as local
+
+    snap = {**SNAPSHOT, "courses": [{**SNAPSHOT["courses"][0], "lctrumSchdulInfo": "토 18교시/미지정"}]}
+    assert shapes.courses(snap)[0]["note"] == local.schedule_note("토 18교시/미지정")
+    assert shapes.CLASS_CHANGE_WORDS is local.CLASS_CHANGE_WORDS
+
+
+def test_briefing_hides_timetable_outside_the_term(env, monkeypatch):
+    c, device = env["client"], FakeDevice()
+    register(c, device)
+    store.add_connection(env["table"], device.uid, "conn-1")
+    _, tokens = oauth(c, device)
+    from datetime import datetime
+
+    from kwcampus.config import KST
+    monkeypatch.setattr(bridge, "_now", lambda: datetime(2027, 1, 14, 9, 0, tzinfo=KST))  # winter break, Thursday
+    out = mcp_call(c, tokens["access_token"], "tools/call", {"name": "today_briefing", "arguments": {}}).json()
+    result = out["result"]["structuredContent"]
+    assert result["classes"] == [] and "2026,2" in result["classes_note"]
+
+
+def test_public_notice_api_honors_since_without_a_query(aws):
+    from datetime import date
+    from unittest import mock
+
+    from kwcampus import public_data
+    from kwcampus.public_http import _resolve_day
+
+    rows = [{"title": "옛 공지", "posted_date": "2026-09-01", "category_id": None, "pinned": False},
+            {"title": "새 공지", "posted_date": "2026-11-04", "category_id": None, "pinned": False}]
+    with mock.patch.object(public_data, "notices", return_value=rows):
+        assert [r["title"] for r in public_data.latest(None, None, 10, True, date(2026, 10, 29))] == ["새 공지"]
+        assert len(public_data.latest(None, None, 10, True)) == 2
+    assert _resolve_day(" ") == _resolve_day(None)

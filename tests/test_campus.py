@@ -62,3 +62,20 @@ def test_run_fetches_menu_and_calendar_with_real_spacing(aws, monkeypatch):
 
 def test_run_does_nothing_when_disabled(aws):
     assert campus.run(MONDAY, aws["public"]) == {"status": "disabled"}
+
+
+def test_december_also_keeps_next_years_calendar(aws, monkeypatch):
+    _enable(aws)
+    calls, sleeps = [], []
+
+    def fake_fetch(url, form=None):
+        calls.append((url, form))
+        return FetchResult(MENU if "facility11" in url else CAL, None, 200)
+
+    monkeypatch.setattr(campus, "fetch_list_page", fake_fetch)
+    december = datetime(2026, 11, 30, 22, 30, tzinfo=UTC)  # Tue 1 Dec 07:30 KST
+    ticks = iter(december + timedelta(seconds=61 * n) for n in range(1, 10))  # time passes with each sleep
+    out = campus.run(december, aws["public"], clock=lambda: next(ticks), sleep=sleeps.append)
+    assert [form for _, form in calls if form] == [{"sy": "2026", "sm": ""}, {"sy": "2027", "sm": ""}]
+    assert sleeps == [61.0, 61.0]  # never two requests to the school in a row
+    assert "calendar_next_year" in out and campus.calendar_events(aws["public"], 2027)
