@@ -365,6 +365,13 @@ async def my_class_changes(days: int = 14) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
+async def my_graduation() -> dict[str, Any]:
+    """졸업 이수 현황: 취득 학점(전공·교양·기타), 필수교양(광운인되기)과 균형교양 8개 영역별 이수 학점,
+    입학 연도에 맞는 교양 규칙 충족 여부. "균형교양 더 들어야 해?", "졸업까지 교양 몇 학점?"에 쓰세요."""
+    return await agent_call("graduation_progress")
+
+
+@mcp.tool(annotations=READ_ONLY)
 async def my_grades() -> dict[str, Any]:
     """성적·학점: 학기별 과목 성적과 학기 평점(4.5 만점, 계산값), KLAS 평량평균(학적부·성적증명서 기준),
     전공·교양·기타 신청/취득/삭제 학점, 학과·학년·학적 상태. 이름·학번·이메일·지도교수는 포함하지 않습니다."""

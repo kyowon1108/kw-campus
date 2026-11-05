@@ -508,3 +508,12 @@ def test_public_notice_api_honors_since_without_a_query(aws):
         assert [r["title"] for r in public_data.latest(None, None, 10, True, date(2026, 10, 29))] == ["새 공지"]
         assert len(public_data.latest(None, None, 10, True)) == 2
     assert _resolve_day(" ") == _resolve_day(None)
+
+
+def test_graduation_goes_to_the_agent(env):
+    c, device = env["client"], FakeDevice()
+    register(c, device)
+    store.add_connection(env["table"], device.uid, "agent", 2)
+    _, tokens = oauth(c, device)
+    out = mcp_call(c, tokens["access_token"], "tools/call", {"name": "my_graduation", "arguments": {}}).json()["result"]
+    assert out["structuredContent"] == {"op": "graduation_progress"}
