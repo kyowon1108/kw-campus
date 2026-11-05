@@ -1,7 +1,7 @@
 """kw-bridge table: devices, live connections, OAuth bookkeeping, short-lived results.
 
   DEV#<uid>        META            public key (JWK), created_at
-  DEV#<uid>        CONN#<conn>     connected_at (TTL 3 h)
+  DEV#<uid>        CONN#<conn>     connected_at, agent protocol version (TTL 3 h)
   CONN#<conn>      META            uid (TTL 3 h; for $disconnect cleanup)
   CLIENT#<id>      META            client_name, redirect_uris (dynamic client registration)
   AUTHREQ#<nonce>  META            pending authorize request (TTL 10 min, single use)
@@ -76,9 +76,10 @@ def delete_device(t, uid: str) -> None:
 
 # connections --------------------------------------------------------------------
 
-def add_connection(t, uid: str, conn: str) -> None:
+def add_connection(t, uid: str, conn: str, version: int = 1) -> None:
     now = _now()
-    t.put_item(Item={"PK": f"DEV#{uid}", "SK": f"CONN#{conn}", "connected_at": now, "ttl": now + CONN_TTL})
+    t.put_item(Item={"PK": f"DEV#{uid}", "SK": f"CONN#{conn}", "connected_at": now, "version": version,
+                     "ttl": now + CONN_TTL})
     t.put_item(Item={"PK": f"CONN#{conn}", "SK": "META", "uid": uid, "ttl": now + CONN_TTL})
 
 
@@ -89,12 +90,19 @@ def remove_connection(t, conn: str) -> None:
     t.delete_item(Key={"PK": f"CONN#{conn}", "SK": "META"})
 
 
-def latest_connection(t, uid: str) -> str | None:
+def latest_connection_info(t, uid: str) -> tuple[str, int] | None:
+    """(connection id, agent protocol version) of the device's newest live connection."""
     rows = t.query(KeyConditionExpression=Key("PK").eq(f"DEV#{uid}") & Key("SK").begins_with("CONN#"))["Items"]
     rows = [r for r in rows if int(r.get("ttl", 0)) > _now()]
     if not rows:
         return None
-    return max(rows, key=lambda r: int(r["connected_at"]))["SK"][len("CONN#"):]
+    row = max(rows, key=lambda r: int(r["connected_at"]))
+    return row["SK"][len("CONN#"):], int(row.get("version", 1))
+
+
+def latest_connection(t, uid: str) -> str | None:
+    info = latest_connection_info(t, uid)
+    return info[0] if info else None
 
 
 # OAuth --------------------------------------------------------------------------

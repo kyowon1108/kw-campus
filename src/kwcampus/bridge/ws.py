@@ -30,7 +30,11 @@ def handler(event, context):  # noqa: ARG001
                 or not store.use_once(t, crypto.sha256_hex(sig), MAX_SKEW_S * 2):
             log("ws_connect_denied", fresh=fresh, known_device=bool(jwk))
             return {"statusCode": 401}
-        store.add_connection(t, uid, conn)
+        try:
+            version = max(1, min(int(q.get("v", "1")), 99))
+        except ValueError:
+            version = 1
+        store.add_connection(t, uid, conn, version)
         log("ws_connected")
         return {"statusCode": 200}
     if route == "$disconnect":

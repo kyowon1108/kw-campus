@@ -55,6 +55,7 @@ SCOPE = "klas.read"
 ACCESS_TTL = 3600
 SNAPSHOT_WAIT_S = 22
 SNAPSHOT_CACHE_S = 60
+CALL_MIN_VERSION = 2  # PC agents from before single-item reads answer only "snapshot"
 DEVICE_SKEW_S = 300
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"  # no I/L/O/U/0/1
 
@@ -137,11 +138,35 @@ async def snapshot_for(uid: str, claims: dict | None = None) -> dict:
     if hit and time.monotonic() - hit[0] < SNAPSHOT_CACHE_S:
         return hit[1]
     data = await (_password_snapshot(uid, claims or {}) if uid.startswith("p_") else _agent_snapshot(uid))
-    if data.get("error"):
-        detail = str(data.get("message") or "")[:300]
-        raise ToolError(" ".join(x for x in (_ERRORS.get(data["error"], _ERRORS["klas_error"]), detail) if x))
+    _raise_for(data)
     _SNAP[uid] = (time.monotonic(), data)
     return data
+
+
+def _raise_for(data: dict) -> None:
+    if not data.get("error"):
+        return
+    detail = str(data.get("message") or "")[:300]
+    if data["error"] == "not_found":
+        raise ToolError(detail or "찾지 못했습니다.")
+    if data["error"] == "unsupported":
+        raise ToolError(_UPDATE_AGENT)
+    raise ToolError(" ".join(x for x in (_ERRORS.get(data["error"], _ERRORS["klas_error"]), detail) if x))
+
+
+_UPDATE_AGENT = "PC 에이전트가 옛 버전입니다. PC에서 처음 설치할 때 쓴 명령을 한 번 더 실행해 업데이트해 주세요(연결은 그대로 유지됩니다)."
+
+
+async def agent_call(op: str, **args: str):
+    """One read-only item (assignment detail, syllabus, post) from the caller's PC agent."""
+    token = get_access_token()
+    if token is None or not token.subject:
+        raise ToolError("인증이 필요합니다.")
+    if token.subject.startswith("p_"):
+        raise ToolError("이 기능은 PC 에이전트 연결에서만 쓸 수 있습니다.")
+    data = await _agent_request(token.subject, {"type": "call", "op": op, "args": args}, CALL_MIN_VERSION)
+    _raise_for(data)
+    return data.get("result")
 
 
 async def _password_snapshot(uid: str, claims: dict) -> dict:
@@ -155,13 +180,20 @@ async def _password_snapshot(uid: str, claims: dict) -> dict:
 
 
 async def _agent_snapshot(uid: str) -> dict:
+    return await _agent_request(uid, {"type": "snapshot"})
+
+
+async def _agent_request(uid: str, payload: dict, need_version: int = 1) -> dict:
     t = store.table()
-    conn = store.latest_connection(t, uid)
+    info = store.latest_connection_info(t, uid)
+    if info and info[1] < need_version:
+        raise ToolError(_UPDATE_AGENT)
+    conn = info[0] if info else None
     if not conn:
         raise ToolError("PC 에이전트가 연결돼 있지 않습니다. PC가 켜져 있는지 확인해 주세요(로그인하면 에이전트가 자동으로 연결됩니다).")
     request_id, key = crypto.random_token(16), crypto.new_result_key()
     store.open_result(t, request_id)  # /device/result only fills slots opened here
-    command = {"type": "snapshot", "request_id": request_id, "key": crypto.b64u(key),
+    command = {**payload, "request_id": request_id, "key": crypto.b64u(key),
                "result_url": f"{BASE_URL}/device/result"}
     if not await asyncio.to_thread(_post_to_connection, conn, command):
         store.remove_connection(t, conn)
@@ -222,7 +254,7 @@ async def my_team_projects(course: str | None = None) -> list[dict[str, Any]]:
 
 @mcp.tool(annotations=READ_ONLY)
 async def my_course_notices(course: str | None = None) -> list[dict[str, Any]]:
-    """내 과목 게시판 최근 글(공지·강의 자료실 등)."""
+    """내 과목 게시판 최근 글(KLAS 홈 화면에 뜨는 몇 개만). 오래된 공지나 특정 주제(시험·휴강 등)는 my_course_board로 찾으세요."""
     return shapes.course_posts(await _snapshot(), course)
 
 
@@ -273,6 +305,33 @@ async def my_notices(days: int = 7) -> dict[str, Any]:
             "school_academic": public_http.search_notices("", "학사", since, 20),
             "school_scholarship": public_http.search_notices("", "장학", since, 20),
             "data_as_of": snap.get("fetched_at")}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_assignment_detail(course: str, title: str) -> dict[str, Any]:
+    """과제 하나의 상세: 무엇을 내야 하는지(본문), 제출 형식, 첨부 파일 이름, 기간, 제출 상태.
+    course는 과목명 일부, title은 과제 제목 일부(my_assignments 결과의 이름을 쓰세요)."""
+    return await agent_call("assignment_detail", course=course, title=title)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_syllabus(course: str) -> dict[str, Any]:
+    """내 수강 과목의 강의계획서: 개요·목표, 주차별 계획, 평가 비율, 교재. course는 과목명 일부."""
+    return await agent_call("syllabus", course=course)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_course_board(course: str, keyword: str = "") -> dict[str, Any]:
+    """한 과목의 강의 공지사항·자료실 전체에서 글 찾기(최신순, 게시판마다 10개, total은 전체 개수).
+    keyword는 제목·본문 검색어(예: "시험", "휴강", "기말"). 본문은 my_course_post로 여세요."""
+    return await agent_call("search_course_posts", course=course, keyword=keyword)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_course_post(course: str, title: str) -> dict[str, Any]:
+    """과목 게시판(공지·자료실 등) 글 하나의 본문과 첨부 파일 이름.
+    course는 과목명 일부, title은 글 제목 일부(my_course_notices 결과의 제목을 쓰세요)."""
+    return await agent_call("course_post", course=course, title=title)
 
 
 # public tools: same functions as the public MCP, so one connector covers everything

@@ -76,6 +76,11 @@ def env(aws, monkeypatch):
     def fake_post(conn, message):
         # The "extension" answers immediately by posting an encrypted result.
         sent.append((conn, message))
+        if message["type"] == "call":
+            body = FakeDevice.encrypt(message["key"], message["request_id"],
+                                      {"result": {"op": message["op"], **message["args"]}})
+            store.put_result(t, body["request_id"], body["iv"], body["ct"])
+            return True
         if message["type"] != "snapshot":
             return True
         body = FakeDevice.encrypt(message["key"], message["request_id"], SNAPSHOT)
@@ -409,3 +414,28 @@ def test_device_signatures_are_single_use(env):
     body = signed(device, "pair")
     assert c.post("/device/pair", json=body).status_code == 200
     assert c.post("/device/pair", json=body).status_code == 403
+
+
+def test_single_item_reads_need_an_updated_agent(env):
+    c, device = env["client"], FakeDevice()
+    register(c, device)
+    store.add_connection(env["table"], device.uid, "old-agent")  # version 1: snapshot only
+    _, tokens = oauth(c, device)
+    args = {"name": "my_assignment_detail", "arguments": {"course": "데이터", "title": "HW3"}}
+    old = mcp_call(c, tokens["access_token"], "tools/call", args).json()["result"]
+    assert old["isError"] and "업데이트" in old["content"][0]["text"]
+    store.add_connection(env["table"], device.uid, "new-agent", 2)
+    new = mcp_call(c, tokens["access_token"], "tools/call", args).json()["result"]
+    assert new["structuredContent"] == {"op": "assignment_detail", "course": "데이터", "title": "HW3"}
+    sent = [m for conn, m in env["sent"] if m["type"] == "call"]
+    assert sent[-1]["op"] == "assignment_detail" and sent[-1]["args"] == {"course": "데이터", "title": "HW3"}
+
+
+def test_ws_connect_records_agent_version(env):
+    device = FakeDevice()
+    register(env["client"], device)
+    ts = str(int(time.time()))
+    q = {"uid": device.uid, "ts": ts, "sig": device.sign(f"kw-connect:{device.uid}:{ts}"), "v": "2"}
+    assert ws.handler({"requestContext": {"routeKey": "$connect", "connectionId": "c2"},
+                       "queryStringParameters": q}, None)["statusCode"] == 200
+    assert store.latest_connection_info(env["table"], device.uid) == ("c2", 2)
