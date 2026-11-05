@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 # channel keys match the keys of the JSON in the /kw/discord/channels parameter
-CHANNEL_KEYS = ("notice", "academic", "scholarship", "career", "international")
+CHANNEL_KEYS = ("notice", "academic", "scholarship", "career", "international", "department")
 
 CATEGORY_TO_CHANNEL: dict[str, str] = {
     "general": "notice",
@@ -17,6 +17,7 @@ CATEGORY_TO_CHANNEL: dict[str, str] = {
     "external": "career",
     "international-exchange": "international",
     "international-student": "international",
+    "dept-aicon": "department",  # 인공지능융합대학 (falls back to "notice" until a channel is set)
 }
 
 CATEGORY_LABEL: dict[str, str] = {
@@ -31,6 +32,7 @@ CATEGORY_LABEL: dict[str, str] = {
     "external": "외부",
     "international-exchange": "국제교류",
     "international-student": "국제학생",
+    "dept-aicon": "인공지능융합대학",
 }
 
 

@@ -20,7 +20,10 @@ CACHE_S = 60
 
 _LABEL_TO_ID = {label: cid for cid, label in CATEGORY_LABEL.items()}
 _ALIASES = {"장학": "registration-scholarship", "등록": "registration-scholarship", "취업": "external",
-            "대외활동": "external", "국제": "international-exchange"}
+            "대외활동": "external", "국제": "international-exchange",
+            "인융대": "dept-aicon", "인공지능융합": "dept-aicon", "학과": "dept-aicon"}
+# Every collected board: the main notice board and department boards.
+SOURCES = (NOTICE_SOURCE, "aicon")
 
 
 def category_id(value: str | None) -> str | None:
@@ -43,21 +46,30 @@ def _query_all(table, pk: str) -> list[dict]:
         kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
 
 
-def notices(table, source: str = NOTICE_SOURCE) -> list[dict]:
-    hit = _CACHE.get(source)
+def notices(table, source: str | None = None) -> list[dict]:
+    """Notices of one source, or of every source (main board + departments) by default."""
+    key = source or "*"
+    hit = _CACHE.get(key)
     if hit and time.monotonic() - hit[0] < CACHE_S:
         return hit[1]
-    rows = [public_view(i) for i in _query_all(table, f"SRC#{source}")]
+    rows = [public_view(i) for src in ((source,) if source else SOURCES) for i in _query_all(table, f"SRC#{src}")]
     rows.sort(key=lambda r: (r["posted_date"], r["post_id"]), reverse=True)
-    _CACHE[source] = (time.monotonic(), rows)
+    _CACHE[key] = (time.monotonic(), rows)
     return rows
+
+
+def _public_id(item: dict) -> str:
+    """Main-board ids stay as they are; other sources get a prefix so ids never collide."""
+    raw = str(item.get("post_id") or str(item["SK"])[2:])
+    source = str(item.get("source") or NOTICE_SOURCE)
+    return raw if source == NOTICE_SOURCE else f"{source}-{raw}"
 
 
 def public_view(item: dict) -> dict:
     """Only fields meant for readers; internal flags (seed, hashes, ttl) stay in the table."""
     cid = str(item.get("category_id", ""))
     return {
-        "post_id": str(item.get("post_id") or str(item["SK"])[2:]),
+        "post_id": _public_id(item),
         "title": str(item.get("title", "")),
         "category": CATEGORY_LABEL.get(cid, cid),
         "category_id": cid,

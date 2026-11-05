@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 
 import boto3
 
-from kwcampus import params, politeness, store
+from kwcampus import aicon, params, politeness, store
 from kwcampus.config import COLLECTOR_ENABLED_PARAM, NOTICE_SOURCE, PUBLIC_TABLE
 from kwcampus.fetch import fetch_list_page
 from kwcampus.kwnotice.list_parser import parse_list_soup
@@ -61,4 +61,12 @@ def run(now: datetime, table, fetch=fetch_list_page) -> dict[str, object]:
 
 def handler(event, context):  # noqa: ARG001 - Lambda signature
     table = boto3.resource("dynamodb").Table(PUBLIC_TABLE)
-    return run(datetime.now(UTC), table)
+    now = datetime.now(UTC)
+    out = run(now, table)
+    if out.get("status") != "disabled":  # same kill switch; a different host, so its own gate
+        try:
+            out = {**out, "aicon": aicon.collect(now, table)}
+        except Exception as e:  # a department site's trouble must not fail the main board's run
+            log("aicon_error", error=e.__class__.__name__)
+            out = {**out, "aicon": {"status": "error"}}
+    return out

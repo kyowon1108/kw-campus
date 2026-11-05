@@ -315,6 +315,7 @@ async def my_notices(days: int = 7) -> dict[str, Any]:
             "course_posts": [p for p in shapes.course_posts(snap) if (p["posted"] or "") >= since_dt],
             "school_academic": public_http.search_notices("", "학사", since, 20),
             "school_scholarship": public_http.search_notices("", "장학", since, 20),
+            "department": public_http.search_notices("", "인공지능융합대학", since, 20),
             "data_as_of": snap.get("fetched_at")}
 
 

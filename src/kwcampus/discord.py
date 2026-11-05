@@ -73,7 +73,8 @@ def _discord(method: str, path: str, token: str, body: dict) -> dict:
 
 
 def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str], send=_discord) -> str:
-    channel_id = channels.get(job["channel"])
+    # A department channel is optional: until its id is set, department notices go to "notice".
+    channel_id = channels.get(job["channel"]) or (channels.get("notice") if job["channel"] == "department" else None)
     if not channel_id:
         return "no_channel"
     item = public.get_item(Key=job["key"]).get("Item")
