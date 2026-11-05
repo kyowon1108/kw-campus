@@ -95,7 +95,7 @@ cd infra && npm install && ./node_modules/.bin/cdk synth
 
 ## 배포
 
-`build_lambda.sh`는 `../kw-mcp`의 wheel을 만들어 함께 넣습니다(KLAS 로그인 코드를 PC 에이전트와 같이 씀). Claude 데스크톱 확장도 내려 주려면 먼저 kw-mcp에서 `mcpb pack . dist/kw-klas.mcpb`를 실행해 둡니다.
+`build_lambda.sh`는 `../kw-mcp`의 wheel을 만들어 함께 넣습니다(KLAS 로그인 코드를 PC 에이전트와 같이 씀). 같은 wheel에 이 Mac 키체인의 릴리스 키로 서명한 `latest.json`도 만들어 넣습니다. PC 에이전트는 이걸 보고 스스로 업데이트하므로, 에이전트를 바꿨다면 kw-mcp의 version을 꼭 올리세요(같은 버전이면 아무도 받지 않음). Claude 데스크톱 확장도 내려 주려면 먼저 kw-mcp에서 `mcpb pack . dist/kw-klas.mcpb`를 실행해 둡니다.
 
 ```bash
 cd infra
