@@ -172,8 +172,10 @@ class KwCampusStack(cdk.Stack):
             actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/bridge/*", f"{ssm_arn}/kw/mcp/*"]))
         bridge_api.add_routes(path="/{proxy+}", methods=[apigw.HttpMethod.ANY],
                               integration=apigw_int.HttpLambdaIntegration("BridgeIntegration", bridge))
+        # Account-wide, not per IP (HTTP APIs take no WAF): high enough that one noisy client doesn't
+        # lock everyone out, low enough to cap the bill (the budget alarm covers the rest).
         bridge_api.add_stage("BridgeDefaultStage", stage_name="$default", auto_deploy=True,
-                             throttle=apigw.ThrottleSettings(rate_limit=5, burst_limit=10))
+                             throttle=apigw.ThrottleSettings(rate_limit=10, burst_limit=20))
 
         # schedules
         schedule_role = iam.Role(self, "ScheduleRole", assumed_by=iam.ServicePrincipal("scheduler.amazonaws.com"))

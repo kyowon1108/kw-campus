@@ -12,7 +12,7 @@
 - 도구: `this_week`, `today_briefing`, `my_notices`, `my_courses`, `my_assignments`, `my_quizzes`, `my_online_lectures`, `my_team_projects`, `my_course_notices`, `my_deadlines` + 공개 도구 5개
 - `kw-bridge` 테이블에는 기기 공개키, OAuth 클라이언트, 코드·토큰 해시, 연결 ID, 2분짜리 암호문, 비밀번호 거부 표시만 둡니다. 학번·비밀번호·개인 데이터는 없습니다.
 - redirect는 Claude·ChatGPT의 콜백 URL 3개(정확히 일치)와 localhost만 받습니다. 다른 사이트로 돌아가는 클라이언트로 승인을 낚는 것을 막기 위해서입니다.
-- 남용 방어: 승인 요청 하나에 실패 5번이면 닫습니다. `/device/result`는 서버가 연 요청 자리에만 한 번 쓸 수 있고 300KB까지입니다. 기기 서명은 한 번만 쓰입니다. 에이전트는 설치한 서버와 초대 코드의 서버가 다르면 연결하지 않습니다. 새 앱이 연결 코드로 붙으면 에이전트 로그에 남습니다. API는 전체 초당 5건으로 제한합니다(IP별 아님).
+- 남용 방어: 승인 요청 하나에 실패 5번이면 닫습니다. `/device/result`는 서버가 연 요청 자리에만 한 번 쓸 수 있고 300KB까지입니다. 기기 서명은 한 번만 쓰입니다. 에이전트는 설치한 서버와 초대 코드의 서버가 다르면 연결하지 않습니다. 새 앱이 연결 코드로 붙으면 에이전트 로그에 남습니다. API는 전체 초당 10건(순간 20건)으로 제한합니다. IP별 제한이 아니어서 누가 계속 두드리면 모두 느려질 수 있지만, HTTP API에는 WAF를 붙일 수 없어 비용 상한 쪽을 택했습니다.
 - 설치 파일도 bridge가 직접 줍니다: `/install.sh`, `/install.ps1`, `/dist/kw_mcp-*.whl`, `/dist/kw-klas.mcpb`. 공개 JSON API(`/c/<토큰>/api/...`)도 같은 주소에서 받습니다.
 
 **초대**: 초대 코드는 `kwc_`로 시작하는 문자열 하나(서버 주소 + 토큰)입니다. 토큰을 새로 만들어 해시를 `/kw/mcp/tokens`에 더한 뒤 코드를 만듭니다.

@@ -210,9 +210,11 @@ def test_register_needs_invite_and_unknown_redirects_are_refused(env):
     assert c.post("/device/register", json={"invite": "nope", "public_key": FakeDevice().jwk}).status_code == 403
     for bad in ("http://evil.example/cb", "https://evil.example/cb", "https://claude.ai.evil.example/cb",
                 "https://evil.example\\@claude.ai/api/mcp/auth_callback", "http://evil.example\\@localhost/cb",
-                "http://user@localhost/cb", "https://claude.ai/other"):
+                "http://user@localhost/cb", "https://claude.ai/other",
+                "https://chatgpt.com/connector/oauth/abc/../../evil", "https://chatgpt.com/connector/oauth/a\\@evil.example"):
         assert c.post("/oauth/register", json={"redirect_uris": [bad]}).status_code == 400
-    for good in ("https://chatgpt.com/connector_platform_oauth_redirect", "http://localhost:6274/oauth/callback"):
+    for good in ("https://chatgpt.com/connector_platform_oauth_redirect", "http://localhost:6274/oauth/callback",
+                 "https://chatgpt.com/connector/oauth/abc_DEF-123"):
         assert c.post("/oauth/register", json={"redirect_uris": [good]}).status_code == 201
 
 

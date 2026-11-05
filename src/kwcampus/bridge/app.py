@@ -20,6 +20,7 @@ import hmac
 import html
 import json
 import os
+import re
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
@@ -313,11 +314,14 @@ REDIRECT_URIS = frozenset({
     "https://claude.com/api/mcp/auth_callback",
     "https://chatgpt.com/connector_platform_oauth_redirect",
 })
+# ChatGPT's newer connectors each get their own callback (Apps SDK auth docs). Matched on the raw
+# string with a tight charset, so there is nothing for a URL parser to disagree about.
+CHATGPT_CALLBACK = re.compile(r"https://chatgpt\.com/connector/oauth/[A-Za-z0-9_-]{1,128}")
 MAX_REDIRECT_URIS = 5
 
 
 def _redirect_ok(uri: str) -> bool:
-    if uri in REDIRECT_URIS:
+    if uri in REDIRECT_URIS or CHATGPT_CALLBACK.fullmatch(uri):
         return True
     # Claude Code and MCP Inspector listen on the user's own PC.
     if len(uri) > 300 or any(ch in uri for ch in "\\@ \t\r\n#"):
