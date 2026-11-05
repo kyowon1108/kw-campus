@@ -17,14 +17,17 @@ cp -R src/kwcampus build/lambda/
 cp scripts/run_public_mcp.sh build/lambda/run.sh && chmod +x build/lambda/run.sh
 # The bridge also serves that wheel to PCs installing the agent (/install.sh).
 mkdir -p build/lambda/kwcampus/bridge/static && cp "$WHEEL" build/lambda/kwcampus/bridge/static/
-# Sign it so PC agents can update themselves (key in this machine's keychain, never in AWS).
-(cd "$KW_MCP_DIR" && uv run --quiet python -m kw_mcp.release sign "dist/$(basename "$WHEEL")") \
-  > build/lambda/kwcampus/bridge/static/latest.json
-# ...and the Claude Desktop extension, if it has been packed (`mcpb pack . dist/kw-klas.mcpb` in kw-mcp).
+# Sign it so PC agents can update themselves (key in this machine's keychain, never in AWS), and the
+# Claude Desktop extension if it has been packed (`mcpb pack . dist/kw-klas.mcpb` in kw-mcp) so an
+# installed extension can offer a verified download of the next one.
+MCPB=""
 if [ -f "$KW_MCP_DIR/dist/kw-klas.mcpb" ]; then
+  MCPB="dist/kw-klas.mcpb"
   cp "$KW_MCP_DIR/dist/kw-klas.mcpb" build/lambda/kwcampus/bridge/static/
 else
   echo "warning: $KW_MCP_DIR/dist/kw-klas.mcpb not found; /dist/kw-klas.mcpb will answer 404" >&2
 fi
+(cd "$KW_MCP_DIR" && uv run --quiet python -m kw_mcp.release sign "dist/$(basename "$WHEEL")" $MCPB) \
+  > build/lambda/kwcampus/bridge/static/latest.json
 find build/lambda -name '__pycache__' -prune -exec rm -rf {} +
 du -sh build/lambda

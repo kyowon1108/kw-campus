@@ -137,8 +137,11 @@ _ERRORS = {
 
 
 async def snapshot_for(uid: str, claims: dict | None = None) -> dict:
+    now = time.monotonic()
+    for stale in [k for k, (at, _) in _SNAP.items() if now - at >= SNAPSHOT_CACHE_S]:
+        del _SNAP[stale]  # decrypted personal data: keep it no longer than the cache window
     hit = _SNAP.get(uid)
-    if hit and time.monotonic() - hit[0] < SNAPSHOT_CACHE_S:
+    if hit:
         return hit[1]
     data = await (_password_snapshot(uid, claims or {}) if uid.startswith("p_") else _agent_snapshot(uid))
     _raise_for(data)
@@ -736,6 +739,7 @@ async def device_unlink(request: Request) -> Response:
     if not uid:
         return _json({"error": "invalid_signature"}, 403)
     store.delete_device(store.table(), uid)
+    _SNAP.pop(uid, None)
     return _json({"ok": True})
 
 

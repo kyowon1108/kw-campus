@@ -268,8 +268,13 @@ def test_installer_serves_scripts_and_the_shipped_wheel(env, tmp_path, monkeypat
     assert c.get("/dist/..%2Fapp.py").status_code == 404
     assert "kw-mcp code" in c.get("/setup").text and "/dist/kw-klas.mcpb" in c.get("/setup").text
     assert c.get("/dist/kw-klas.mcpb").status_code == 404
+    assert "(아직 없음)" in c.get("/setup").text and "/privacy" in c.get("/setup").text
+    assert "개인 정보가 오지 않습니다" in c.get("/privacy").text
     (tmp_path / "kw-klas.mcpb").write_bytes(b"PK mcpb")
     assert c.get("/dist/kw-klas.mcpb").content == b"PK mcpb"
+    zipped = c.get("/dist/kw-klas.zip")  # same file for "Install Unpacked Extension"
+    assert zipped.content == b"PK mcpb" and zipped.headers["content-type"] == "application/zip"
+    assert hashlib.sha256(b"PK mcpb").hexdigest() in c.get("/setup").text
     assert c.get("/dist/latest.json").status_code == 404
     (tmp_path / "latest.json").write_text('{"version": "0.2.0"}')
     r = c.get("/dist/latest.json")
