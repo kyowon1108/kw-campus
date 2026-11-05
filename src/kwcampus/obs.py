@@ -13,7 +13,9 @@ NAMESPACE = "KwCampus"
 
 
 def log(event: str, **fields: object) -> None:
-    print(json.dumps({"event": event, **fields}, ensure_ascii=False, default=str))
+    # flush: behind Lambda Web Adapter stdout is a pipe, so unflushed lines sit in the buffer and
+    # are lost when the sandbox is frozen or recycled (security events went missing this way).
+    print(json.dumps({"event": event, **fields}, ensure_ascii=False, default=str), flush=True)
 
 
 def metrics(**values: int) -> None:
@@ -28,5 +30,6 @@ def metrics(**values: int) -> None:
                 },
                 **values,
             }
-        )
+        ),
+        flush=True,
     )
