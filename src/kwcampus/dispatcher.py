@@ -1,6 +1,6 @@
 """Lambda: turn kw-public stream records into Discord jobs on SQS.
 
-- INSERT of a notice → "post" (skipped for seed rows and old pinned posts)
+- INSERT of a notice → "post" (skipped for seed rows, old pinned posts and the FAQ)
 - MODIFY that changed the title → "edit"
 Nothing is sent while the /kw/collector/notify switch is off.
 """
@@ -41,6 +41,8 @@ def jobs_for(records: list[dict], today: date) -> list[dict]:
             continue
         key = {"PK": new["PK"], "SK": new["SK"]}
         channel = channel_for(str(new.get("category_id", "")))
+        if channel is None:  # searchable only (FAQ)
+            continue
         if record["eventName"] == "INSERT":
             if new.get("seed") or _is_old_pinned(new, today):
                 continue
@@ -52,7 +54,7 @@ def jobs_for(records: list[dict], today: date) -> list[dict]:
     return jobs
 
 
-def handler(event, context):  # noqa: ARG001
+def handler(event, context):
     records = event.get("Records", [])
     if not params.is_true(NOTIFY_ENABLED_PARAM):
         log("dispatch_skip", reason="notify_off", records=len(records))

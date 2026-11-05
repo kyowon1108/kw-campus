@@ -1,7 +1,8 @@
-"""Lambda: collect page 1 of the main notice board into kw-public.
+"""Lambda: collect page 1 of the main notice board into kw-public, then the other boards.
 
-Runs on a schedule. Each run makes at most one request to www.kw.ac.kr, and only when
-the kill switch is on and the per-origin gate allows it.
+Runs on a schedule, only when the kill switch is on and each server's gate allows it. The main
+board goes first with one request to www.kw.ac.kr; the department servers get one request each.
+Every couple of hours a second www request reads the 취업게시판 or the FAQ, 61 s after the first.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from datetime import UTC, datetime
 
 import boto3
 
-from kwcampus import aicon, params, politeness, store
+from kwcampus import aicon, deptboards, params, politeness, store, wwwboards
 from kwcampus.config import COLLECTOR_ENABLED_PARAM, NOTICE_SOURCE, PUBLIC_TABLE
 from kwcampus.fetch import fetch_list_page
 from kwcampus.kwnotice.list_parser import parse_list_soup
@@ -34,7 +35,7 @@ def run(now: datetime, table, fetch=fetch_list_page) -> dict[str, object]:
     result = fetch(str(build_list_url(1)))
     records = ()
     if result.html is not None:
-        boundary, boundary_issue = boundary_or_issue(result.html)
+        boundary, _ = boundary_or_issue(result.html)
         if boundary is not None:
             parsed = parse_list_soup(soup_from_boundary(boundary))
             records = parsed.records
@@ -59,14 +60,18 @@ def run(now: datetime, table, fetch=fetch_list_page) -> dict[str, object]:
     return {"status": "ok", "rows": len(records), "seed_run": not seeded, **counts}
 
 
-def handler(event, context):  # noqa: ARG001 - Lambda signature
+def handler(event, context):
     table = boto3.resource("dynamodb").Table(PUBLIC_TABLE)
     now = datetime.now(UTC)
     out = run(now, table)
-    if out.get("status") != "disabled":  # same kill switch; a different host, so its own gate
-        try:
-            out = {**out, "aicon": aicon.collect(now, table)}
-        except Exception as e:  # a department site's trouble must not fail the main board's run
-            log("aicon_error", error=e.__class__.__name__)
-            out = {**out, "aicon": {"status": "error"}}
+    if out.get("status") != "disabled":  # same kill switch; each server keeps its own gate
+        # www's extra boards go last: they may wait out the 60 s gap after the main board's request.
+        time_left = (lambda: context.get_remaining_time_in_millis() / 1000) if context else None
+        for name, source in (("aicon", aicon), ("dept", deptboards), ("www", wwwboards)):
+            try:
+                extra = {"time_left": time_left} if source is wwwboards and time_left else {}
+                out = {**out, name: source.collect(now, table, **extra)}
+            except Exception as e:  # noqa: BLE001 - one site's trouble must not fail the main run or the others
+                log(f"{name}_error", error=e.__class__.__name__)
+                out = {**out, name: {"status": "error"}}
     return out

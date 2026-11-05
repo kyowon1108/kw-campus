@@ -522,3 +522,64 @@ def test_graduation_goes_to_the_agent(env):
     _, tokens = oauth(c, device)
     out = mcp_call(c, tokens["access_token"], "tools/call", {"name": "my_graduation", "arguments": {}}).json()["result"]
     assert out["structuredContent"] == {"op": "graduation_progress"}
+
+
+def test_new_reads_go_to_the_agent(env):
+    c, device = env["client"], FakeDevice()
+    register(c, device)
+    store.add_connection(env["table"], device.uid, "agent", 2)
+    _, tokens = oauth(c, device)
+    for name in ("my_online_tests", "my_surveys", "my_discussions", "my_course_evaluation"):
+        mcp_call(c, tokens["access_token"], "tools/call", {"name": name, "arguments": {}})
+    digest = mcp_call(c, tokens["access_token"], "tools/call",
+                      {"name": "my_academic_deadlines", "arguments": {"days": 30}}).json()["result"]["structuredContent"]
+    assert digest["klas"] == {"op": "application_windows"} and isinstance(digest["calendar"], list)
+    assert [m["op"] for _, m in env["sent"] if m["type"] == "call"] == [
+        "online_tests", "surveys", "discussions", "course_evaluation", "application_windows"]
+
+
+def test_deadlines_come_from_the_agent_and_fall_back_to_the_snapshot(env, monkeypatch):
+    c, device = env["client"], FakeDevice()
+    register(c, device)
+    store.add_connection(env["table"], device.uid, "agent", 2)
+    _, tokens = oauth(c, device)
+    out = mcp_call(c, tokens["access_token"], "tools/call",
+                   {"name": "my_deadlines", "arguments": {"days": 7}}).json()["result"]["structuredContent"]
+    assert out == {"op": "deadlines", "days": "7"}  # the agent's own list
+    assert [m["op"] for _, m in env["sent"] if m["type"] == "call"] == ["deadlines"]
+
+    real = bridge._agent_request
+
+    async def before_0_8(uid, payload, need_version=1):  # an agent that doesn't know "deadlines" yet
+        if payload["type"] == "call":
+            return {"error": "unsupported"}
+        return await real(uid, payload, need_version)
+
+    monkeypatch.setattr(bridge, "_agent_request", before_0_8)
+    out = mcp_call(c, tokens["access_token"], "tools/call",
+                   {"name": "my_deadlines", "arguments": {"days": 7}}).json()["result"]["structuredContent"]
+    assert "items" in out and out["days"] == 7
+
+
+def test_academic_deadlines_still_show_the_calendar_for_an_older_agent(env, monkeypatch):
+    c, device = env["client"], FakeDevice()
+    register(c, device)
+    store.add_connection(env["table"], device.uid, "agent", 2)
+    _, tokens = oauth(c, device)
+
+    async def before_0_8(uid, payload, need_version=1):
+        return {"error": "unsupported"}
+
+    monkeypatch.setattr(bridge, "_agent_request", before_0_8)
+    digest = mcp_call(c, tokens["access_token"], "tools/call",
+                      {"name": "my_academic_deadlines", "arguments": {}}).json()["result"]["structuredContent"]
+    assert "업데이트" in digest["klas"]["error"] and isinstance(digest["calendar"], list)
+
+
+def test_parallel_briefing_requests_share_one_snapshot(env):
+    c, device = env["client"], FakeDevice()
+    register(c, device)
+    store.add_connection(env["table"], device.uid, "conn-1")  # an agent from before calls: snapshot only
+    _, tokens = oauth(c, device)
+    mcp_call(c, tokens["access_token"], "tools/call", {"name": "today_briefing", "arguments": {}})
+    assert [m["type"] for _, m in env["sent"] if m["type"] in ("snapshot", "call")] == ["snapshot"]

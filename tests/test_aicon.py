@@ -3,7 +3,7 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from kwcampus import aicon, collector, dispatcher, public_data
+from kwcampus import aicon, collector, deptboards, dispatcher, public_data, wwwboards
 from kwcampus.discord import handle_job
 from kwcampus.fetch import FetchResult
 
@@ -83,5 +83,8 @@ def test_scheduled_run_survives_a_department_site_failure(aws, monkeypatch):
         raise RuntimeError("aicon down")
 
     monkeypatch.setattr(aicon, "collect", boom)
+    monkeypatch.setattr(deptboards, "collect", lambda now, table: {"status": "ok"})
+    monkeypatch.setattr(wwwboards, "collect", lambda now, table: {"status": "not_due"})
     monkeypatch.setattr(collector.boto3, "resource", lambda name: type("R", (), {"Table": lambda self, n: aws["public"]})())
-    assert collector.handler({}, None) == {"status": "ok", "aicon": {"status": "error"}}
+    assert collector.handler({}, None) == {"status": "ok", "aicon": {"status": "error"}, "dept": {"status": "ok"},
+                                           "www": {"status": "not_due"}}

@@ -40,6 +40,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 from kwcampus import params, public_http
+from kw_mcp.combined import ACADEMIC_DEADLINE_WORDS
 from kw_mcp.service import term_in_session
 
 from kwcampus.bridge import crypto, install, password, shapes, store
@@ -67,6 +68,7 @@ INSTRUCTIONS = """\
 광운대학교 KLAS 개인 정보(과제·퀴즈·온라인강의·팀플·시간표·과목 게시판)와 학교 공개 정보(공지·학식·학사일정)를 조회합니다.
 - 개인 정보는 요청할 때마다 사용자 PC의 KW Campus 에이전트가 사용자 본인의 KLAS 로그인으로 읽어 옵니다. PC가 켜져 있어야 합니다(브라우저는 필요 없음).
 - "이번 주 할 일"은 this_week, "오늘 뭐 있어"는 today_briefing, "새 공지"는 my_notices를 먼저 쓰세요.
+- 수강정정·포기, 장학 신청, 성적 조회, 수업평가 같은 학사 기한은 my_academic_deadlines를 쓰세요.
 - 응답의 data_as_of는 KLAS에서 읽은 시각입니다. 읽기 전용이며 제출·수정은 할 수 없습니다. 비공식 도구입니다.
 """
 
@@ -136,6 +138,9 @@ _ERRORS = {
 }
 
 
+_SNAP_PENDING: dict[str, asyncio.Task] = {}  # one snapshot request per PC at a time
+
+
 async def snapshot_for(uid: str, claims: dict | None = None) -> dict:
     now = time.monotonic()
     for stale in [k for k, (at, _) in _SNAP.items() if now - at >= SNAPSHOT_CACHE_S]:
@@ -143,7 +148,13 @@ async def snapshot_for(uid: str, claims: dict | None = None) -> dict:
     hit = _SNAP.get(uid)
     if hit:
         return hit[1]
-    data = await (_password_snapshot(uid, claims or {}) if uid.startswith("p_") else _agent_snapshot(uid))
+    pending = _SNAP_PENDING.get(uid)
+    if pending is None:
+        pending = asyncio.ensure_future(
+            _password_snapshot(uid, claims or {}) if uid.startswith("p_") else _agent_snapshot(uid))
+        _SNAP_PENDING[uid] = pending
+        pending.add_done_callback(lambda _: _SNAP_PENDING.pop(uid, None))
+    data = await asyncio.shield(pending)
     _raise_for(data)
     _SNAP[uid] = (time.monotonic(), data)
     return data
@@ -264,19 +275,35 @@ async def my_course_notices(course: str | None = None) -> list[dict[str, Any]]:
     return shapes.course_posts(await _snapshot(), course)
 
 
+async def _deadlines(days: int) -> dict:
+    """The PC agent's own deadline list, which also covers online exams, surveys and discussions.
+    Agents from before 0.8 don't know that request, so their snapshot is shaped here instead."""
+    token = get_access_token()
+    uid = token.subject if token is not None else None
+    info = store.latest_connection_info(store.table(), uid) if uid and not uid.startswith("p_") else None
+    if info and info[1] >= CALL_MIN_VERSION:
+        data = await _agent_request(uid, {"type": "call", "op": "deadlines", "args": {"days": str(days)}},
+                                    CALL_MIN_VERSION)
+        if data.get("error") != "unsupported":
+            _raise_for(data)
+            return data.get("result") or {}
+    return shapes.deadlines(await _snapshot(), _now(), days)
+
+
 @mcp.tool(annotations=READ_ONLY)
 async def my_deadlines(days: int = 7) -> dict[str, Any]:
-    """현재 학기에서 앞으로 days일(최대 180) 안에 마감되는 미제출 과제·퀴즈·팀플과 미완료 온라인 강의.
-    마감이 지났지만 지각 제출 기간인 과제·팀플은 late_submission=true로 포함합니다(이때 due는 과거)."""
-    return shapes.deadlines(await _snapshot(), _now(), days)
+    """현재 학기에서 앞으로 days일(최대 180) 안에 마감되는 안 한 일: 과제·퀴즈·온라인시험(재응시 포함)·팀플·설문,
+    진도 100% 미만 온라인 강의, 그 안에 끝나는 토론(참여 여부는 KLAS가 알려 주지 않음).
+    마감이 지났지만 지각 제출 기간인 과제·팀플은 late_submission=true로 포함합니다(이때 due는 과거).
+    incomplete가 있으면 일부 목록을 읽지 못한 것이니 사용자에게 알리세요."""
+    return await _deadlines(days)
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def this_week(days: int = 7) -> dict[str, Any]:
     """이번 주 할 일(현재 학기): 마감 목록(지각 제출 가능 항목은 late_submission=true)과 같은 기간의 학사일정."""
-    snap = await _snapshot()
     now = _now()
-    deadlines = shapes.deadlines(snap, now, days)  # clamps days to 0..180; the calendar follows it
+    deadlines = await _deadlines(days)  # clamps days to 0..180; the calendar follows it
     return {**deadlines,
             "academic_events": public_http.academic_calendar(
                 now.date().isoformat(), (now.date() + timedelta(days=deadlines["days"])).isoformat())}
@@ -285,11 +312,15 @@ async def this_week(days: int = 7) -> dict[str, Any]:
 @mcp.tool(annotations=READ_ONLY)
 async def today_briefing() -> dict[str, Any]:
     """오늘 브리핑: 오늘 수업(교시·강의실), 오늘·내일 마감, 오늘 학식, 최근 과목 게시판 글과 학교 공지."""
-    snap = await _snapshot()
+    # Both asked of the PC at once: one after the other could outlast the Lambda's 30 s.
+    snap, upcoming = await asyncio.gather(_snapshot(), _deadlines(2))
     now = _now()
     end_tomorrow = (now + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
-    soon = [i for i in shapes.deadlines(snap, now, 2)["items"]
-            if (shapes.parse_kst(i.get("late_due") if i.get("late_submission") else i["due"]) or end_tomorrow) <= end_tomorrow]
+
+    def due_of(item: dict) -> str | None:
+        return item.get("late_due") if item.get("late_submission") else item.get("effective_due") or item.get("due")
+
+    soon = [i for i in upcoming.get("items", []) if (shapes.parse_kst(due_of(i)) or end_tomorrow) <= end_tomorrow]
     since = (now - timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
     return {
         "date": now.strftime("%Y-%m-%d"), "weekday": shapes.WEEKDAYS[now.weekday()],
@@ -298,6 +329,7 @@ async def today_briefing() -> dict[str, Any]:
         **({} if term_in_session(snap.get("semester"), now)
            else {"classes_note": f"{snap.get('semester')} 학기 수업 기간이 아니라 시간표를 비웠습니다."}),
         "due_today_or_tomorrow": soon,
+        **({"deadlines_incomplete": upcoming["incomplete"]} if upcoming.get("incomplete") else {}),
         "cafeteria": public_http.cafeteria_menu(now.date().isoformat()),
         "new_course_posts": (new_posts := [p for p in shapes.course_posts(snap) if (p["posted"] or "") >= since]),
         "possible_class_changes": [p for p in new_posts if shapes.CLASS_CHANGE_WORDS.search(p.get("title") or "")],
@@ -378,8 +410,50 @@ async def my_graduation() -> dict[str, Any]:
 @mcp.tool(annotations=READ_ONLY)
 async def my_grades() -> dict[str, Any]:
     """성적·학점: 학기별 과목 성적과 학기 평점(4.5 만점, 계산값), KLAS 평량평균(학적부·성적증명서 기준),
-    전공·교양·기타 신청/취득/삭제 학점, 학과·학년·학적 상태. 이름·학번·이메일·지도교수는 포함하지 않습니다."""
+    전공·교양·기타 신청/취득/삭제 학점, 학과·학년·학적 상태, 학기별 석차·학사경고(standing), 이번 학기 성적 조회 기간,
+    summary(전공·전공 외 평점, F 제외 평점, 재수강하지 않은 F; 계산값). 이름·학번·이메일·지도교수는 포함하지 않습니다."""
     return await agent_call("grades")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_online_tests(course: str | None = None) -> list[dict[str, Any]]:
+    """온라인시험: 응시 기간, 응시 여부(in_progress는 응시 중), 교수가 연 재응시 기간(retry)."""
+    return await agent_call("online_tests", course=course or "")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_surveys(course: str | None = None) -> list[dict[str, Any]]:
+    """과목 설문: 기간과 참여 여부."""
+    return await agent_call("surveys", course=course or "")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_discussions(course: str | None = None) -> list[dict[str, Any]]:
+    """과목 토론 주제: 시작·종료와 글 수. 내가 참여했는지는 KLAS 목록에 없어 토론실에서 확인해야 합니다."""
+    return await agent_call("discussions", course=course or "")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_course_evaluation() -> dict[str, Any]:
+    """수업평가: 지금 평가 기간인지(중간/기말)와 아직 평가하지 않은 과목. 평가는 KLAS에서 직접 해야 합니다."""
+    return await agent_call("course_evaluation")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_academic_deadlines(days: int = 30) -> dict[str, Any]:
+    """학사 기한 모음: KLAS가 알려 주는 장학 신청·취득학점포기·성적 조회·수업평가 기간과, 앞으로 days일(최대 180)
+    학사일정 중 수강신청·정정·포기, 등록, 휴·복학, 성적·이의신청, 계절학기, 졸업 관련 일정."""
+    days = max(1, min(int(days), 180))
+    today = _now().date()
+    end = today + timedelta(days=days)
+    try:
+        windows = await agent_call("application_windows")
+    except ToolError as e:  # an older agent, or the PC is off: the school calendar still answers
+        windows = {"error": str(e)}
+    events = public_http.academic_calendar(today.isoformat(), end.isoformat())
+    return {"from": today.isoformat(), "to": end.isoformat(), "klas": windows,
+            "calendar": [e for e in events if ACADEMIC_DEADLINE_WORDS.search(e.get("title") or "")],
+            "note": "klas는 KLAS가 지금 열려 있는지 직접 알려 준 값, calendar는 학교 학사일정입니다. 학과별 일정은 학과 공지를 확인하세요."}
 
 
 @mcp.tool(annotations=READ_ONLY)

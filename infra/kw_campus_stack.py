@@ -74,7 +74,7 @@ class KwCampusStack(cdk.Stack):
         env = {"KW_PUBLIC_TABLE": public.table_name, "KW_DELIVERY_TABLE": delivery.table_name}
 
         def fn(name: str, handler: str, timeout: int, extra_env: dict | None = None,
-               memory: int = 256, layers: list | None = None) -> lambda_.Function:
+               memory: int = 256, layers: list | None = None, retries: int | None = None) -> lambda_.Function:
             log_group = logs.LogGroup(
                 self, f"{name}Logs",
                 log_group_name=f"/aws/lambda/kw-{name.lower()}",
@@ -93,12 +93,15 @@ class KwCampusStack(cdk.Stack):
                 environment={**env, **(extra_env or {})},
                 log_group=log_group,
                 layers=layers,
+                retry_attempts=retries,
             )
 
-        collector = fn("Collector", "kwcampus.collector.handler", 60)
+        # up to four 15 s fetches plus the 61 s wait before www's second request
+        # retries=0: a failed or slow run must not hit the school's servers again a minute later
+        collector = fn("Collector", "kwcampus.collector.handler", 150, retries=0)
         dispatcher = fn("Dispatcher", "kwcampus.dispatcher.handler", 30, {"KW_DISCORD_QUEUE_URL": queue.queue_url})
         sender = fn("DiscordSender", "kwcampus.discord.handler", 60)
-        campus = fn("Campus", "kwcampus.campus.handler", 150)
+        campus = fn("Campus", "kwcampus.campus.handler", 150, retries=0)
         lwa = lambda_.LayerVersion.from_layer_version_arn(self, "LwaLayer", LWA_LAYER)
         web_env = {"AWS_LAMBDA_EXEC_WRAPPER": "/opt/bootstrap", "AWS_LWA_PORT": "8080",
                    "AWS_LWA_READINESS_CHECK_PATH": "/healthz"}
@@ -229,6 +232,9 @@ class KwCampusStack(cdk.Stack):
             alarm(f"{f.node.id.lower()}-errors", f.metric_errors(period=five_min))
         alarm("collector-blocked", cw.Metric(namespace="KwCampus", metric_name="Blocked",
                                              statistic="Sum", period=cdk.Duration.minutes(20)))
+        # a board that answers but parses to nothing: its layout changed, or a block page we don't recognise
+        alarm("collector-parse-empty", cw.Metric(namespace="KwCampus", metric_name="ParseEmpty",
+                                                 statistic="Sum", period=cdk.Duration.hours(3)), threshold=3)
         alarm("discord-dlq", dlq.metric_approximate_number_of_messages_visible(period=five_min))
 
         cdk.CfnOutput(self, "PublicTableName", value=public.table_name)

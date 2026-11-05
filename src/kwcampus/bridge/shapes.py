@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from kw_mcp.service import CLASS_CHANGE_WORDS as CLASS_CHANGE_WORDS  # re-exported for app.py
-from kw_mcp.service import NOT_LECTURES, schedule_note  # shared with the PC agent: one definition
+from kw_mcp.service import is_lecture, schedule_note  # shared with the PC agent: one definition
 
 from kwcampus.config import KST
 
@@ -98,7 +98,7 @@ def assignments(snap: dict, course: str | None = None, pending_only: bool = Fals
 def online_lectures(snap: dict, course: str | None = None, incomplete_only: bool = False) -> list[dict]:
     out = []
     for c, o in _rows(snap, "online", course):
-        if o.get("evltnSe") in NOT_LECTURES:
+        if not is_lecture(o):
             continue
         progress = _int(o.get("prog"))
         if incomplete_only and progress is not None and progress >= 100:

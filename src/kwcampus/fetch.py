@@ -40,7 +40,7 @@ class FetchResult:
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):  # noqa: ANN002, ANN003
+    def redirect_request(self, *args, **kwargs):
         return None  # a redirect surfaces as an HTTPError (3xx) and is treated as a block
 
 
@@ -54,14 +54,20 @@ def _has_challenge(body: bytes) -> bool:
     return any(marker in head for marker in CHALLENGE_MARKERS)
 
 
-def fetch_list_page(url: str, form: dict[str, str] | None = None) -> FetchResult:
-    """GET the page, or POST a small form (the academic calendar loads its year that way)."""
+def fetch_list_page(url: str, form: dict[str, str] | None = None, encoding: str = "utf-8",
+                    errors: str = "strict") -> FetchResult:
+    """GET the page, or POST a small form (the academic calendar loads its year that way).
+
+    By default the page must be clean UTF-8. Department boards pass errors="replace": some site
+    templates carry stray EUC-KR bytes (elcomm's menu), and EUC-KR boards ("cp949") cut long
+    titles at a byte count, leaving half a character.
+    """
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html", "Accept-Language": "ko"}
     data = None
     if form is not None:
         data = urllib.parse.urlencode(form).encode()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-    request = urllib.request.Request(url, data=data, headers=headers)  # noqa: S310 - fixed allowlisted URLs
+    request = urllib.request.Request(url, data=data, headers=headers)  # fixed allowlisted URLs
     try:
         with _opener.open(request, timeout=TIMEOUT_S) as response:
             status = response.status
@@ -82,6 +88,6 @@ def fetch_list_page(url: str, form: dict[str, str] | None = None) -> FetchResult
     if status != 200 or content_type != "text/html":
         return FetchResult(None, "markup", status)
     try:
-        return FetchResult(body.decode("utf-8", errors="strict"), None, status)
+        return FetchResult(body.decode(encoding, errors=errors), None, status)
     except UnicodeDecodeError:
         return FetchResult(None, "markup", status)
