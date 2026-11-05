@@ -62,7 +62,7 @@ New-Item -ItemType Directory -Path $tmp | Out-Null
 $whl = Join-Path $tmp '__WHEEL__'
 Invoke-WebRequest -UseBasicParsing -Uri '__BASE__/dist/__WHEEL__' -OutFile $whl
 if ((Get-FileHash -Algorithm SHA256 $whl).Hash.ToLower() -ne '__SHA256__') { throw 'The downloaded agent failed its checksum.' }
-uv tool install --force --quiet --python 3.13 ("kw-mcp @ file:///" + ($whl -replace '\\', '/'))
+uv tool install --force --quiet --python 3.13 ("kw-mcp @ file:///" + $whl.Replace('\\', '/'))
 if ($LASTEXITCODE -ne 0) { throw 'uv could not install the agent.' }
 Remove-Item -Recurse -Force $tmp
 kw-mcp link $invite --server '__BASE__'
