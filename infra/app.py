@@ -12,7 +12,7 @@ KwCampusStack(
     asset_path=app.node.try_get_context("assetPath") or "../build/lambda",
     alarm_email=app.node.try_get_context("alarmEmail"),
     env=cdk.Environment(region="ap-northeast-2"),
-    description="kw-campus stage 1: main notice collector, Discord alerts",
+    description="kw-campus: notice alerts, public MCP, personal KLAS bridge",
 )
 cdk.Tags.of(app).add("project", "kw-campus")
 app.synth()

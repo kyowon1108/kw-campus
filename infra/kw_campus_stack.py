@@ -1,4 +1,4 @@
-"""Stage 1 infrastructure: kw-public / kw-delivery tables, collector, dispatcher, Discord sender."""
+"""kw-campus infrastructure: public notices pipeline + public MCP (stages 1-2) and the personal bridge (stage 4)."""
 
 from __future__ import annotations
 
@@ -50,6 +50,17 @@ class KwCampusStack(cdk.Stack):
             time_to_live_attribute="ttl",
             removal_policy=cdk.RemovalPolicy.RETAIN,
         )
+        # Bridge bookkeeping only: device public keys, OAuth clients/codes/refresh tokens, live
+        # WebSocket connections, and 2-minute ciphertext. No KLAS credentials or plaintext data.
+        bridge_table = ddb.Table(
+            self, "BridgeTable",
+            table_name="kw-bridge",
+            partition_key=ddb.Attribute(name="PK", type=ddb.AttributeType.STRING),
+            sort_key=ddb.Attribute(name="SK", type=ddb.AttributeType.STRING),
+            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="ttl",
+            removal_policy=cdk.RemovalPolicy.RETAIN,
+        )
 
         dlq = sqs.Queue(self, "DiscordDlq", queue_name="kw-discord-dlq", retention_period=cdk.Duration.days(14))
         queue = sqs.Queue(
@@ -88,12 +99,10 @@ class KwCampusStack(cdk.Stack):
         dispatcher = fn("Dispatcher", "kwcampus.dispatcher.handler", 30, {"KW_DISCORD_QUEUE_URL": queue.queue_url})
         sender = fn("DiscordSender", "kwcampus.discord.handler", 60)
         campus = fn("Campus", "kwcampus.campus.handler", 150)
-        public_mcp = fn(
-            "PublicMcp", "run.sh", 15, memory=512,
-            layers=[lambda_.LayerVersion.from_layer_version_arn(self, "LwaLayer", LWA_LAYER)],
-            extra_env={"AWS_LAMBDA_EXEC_WRAPPER": "/opt/bootstrap", "AWS_LWA_PORT": "8080",
-                       "AWS_LWA_READINESS_CHECK_PATH": "/healthz"},
-        )
+        lwa = lambda_.LayerVersion.from_layer_version_arn(self, "LwaLayer", LWA_LAYER)
+        web_env = {"AWS_LAMBDA_EXEC_WRAPPER": "/opt/bootstrap", "AWS_LWA_PORT": "8080",
+                   "AWS_LWA_READINESS_CHECK_PATH": "/healthz"}
+        public_mcp = fn("PublicMcp", "run.sh", 15, memory=512, layers=[lwa], extra_env=web_env)
 
         # collector: kw-public only, its own switches, no Discord secrets
         public.grant_read_write_data(collector)
@@ -136,6 +145,35 @@ class KwCampusStack(cdk.Stack):
                             default_integration=apigw_int.HttpLambdaIntegration("PublicMcpIntegration", public_mcp))
         api.add_stage("DefaultStage", stage_name="$default", auto_deploy=True,
                       throttle=apigw.ThrottleSettings(rate_limit=2, burst_limit=5))
+
+        # bridge: WebSocket for PC agents, HTTP for OAuth + personal MCP + installer
+        bridge_env = {"KW_BRIDGE_TABLE": bridge_table.table_name}
+        bridge_ws = fn("BridgeWs", "kwcampus.bridge.ws.handler", 10, extra_env=bridge_env)
+        bridge_table.grant_read_write_data(bridge_ws)
+        ws_integration = apigw_int.WebSocketLambdaIntegration
+        ws_api = apigw.WebSocketApi(
+            self, "BridgeWsApi", api_name="kw-bridge-ws",
+            connect_route_options=apigw.WebSocketRouteOptions(integration=ws_integration("WsConnect", bridge_ws)),
+            disconnect_route_options=apigw.WebSocketRouteOptions(integration=ws_integration("WsDisconnect", bridge_ws)),
+            default_route_options=apigw.WebSocketRouteOptions(integration=ws_integration("WsDefault", bridge_ws)),
+        )
+        ws_stage = apigw.WebSocketStage(self, "BridgeWsStage", web_socket_api=ws_api, stage_name="prod",
+                                        auto_deploy=True, throttle=apigw.ThrottleSettings(rate_limit=5, burst_limit=10))
+        bridge_api = apigw.HttpApi(self, "BridgeApi", api_name="kw-bridge", create_default_stage=False)
+        bridge = fn("Bridge", "run.sh", 30, memory=512, layers=[lwa], extra_env={
+            **web_env, **bridge_env, "KW_APP": "kwcampus.bridge.app:app",
+            "KW_BRIDGE_BASE_URL": bridge_api.api_endpoint,
+            "KW_BRIDGE_WS_URL": ws_stage.url, "KW_BRIDGE_WS_MGMT": ws_stage.callback_url,
+        })
+        bridge_table.grant_read_write_data(bridge)
+        public.grant_read_data(bridge)
+        ws_stage.grant_management_api_access(bridge)
+        bridge.add_to_role_policy(iam.PolicyStatement(
+            actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/bridge/*", f"{ssm_arn}/kw/mcp/*"]))
+        bridge_api.add_routes(path="/{proxy+}", methods=[apigw.HttpMethod.ANY],
+                              integration=apigw_int.HttpLambdaIntegration("BridgeIntegration", bridge))
+        bridge_api.add_stage("BridgeDefaultStage", stage_name="$default", auto_deploy=True,
+                             throttle=apigw.ThrottleSettings(rate_limit=5, burst_limit=10))
 
         # schedules
         schedule_role = iam.Role(self, "ScheduleRole", assumed_by=iam.ServicePrincipal("scheduler.amazonaws.com"))
@@ -185,7 +223,7 @@ class KwCampusStack(cdk.Stack):
             a.add_alarm_action(action)
 
         five_min = cdk.Duration.minutes(5)
-        for f in (collector, dispatcher, sender, campus, public_mcp):
+        for f in (collector, dispatcher, sender, campus, public_mcp, bridge, bridge_ws):
             alarm(f"{f.node.id.lower()}-errors", f.metric_errors(period=five_min))
         alarm("collector-blocked", cw.Metric(namespace="KwCampus", metric_name="Blocked",
                                              statistic="Sum", period=cdk.Duration.minutes(20)))
@@ -194,3 +232,5 @@ class KwCampusStack(cdk.Stack):
         cdk.CfnOutput(self, "PublicTableName", value=public.table_name)
         cdk.CfnOutput(self, "DiscordQueueUrl", value=queue.queue_url)
         cdk.CfnOutput(self, "PublicApiUrl", value=api.api_endpoint)
+        cdk.CfnOutput(self, "BridgeUrl", value=bridge_api.api_endpoint)
+        cdk.CfnOutput(self, "BridgeWsUrl", value=ws_stage.url)

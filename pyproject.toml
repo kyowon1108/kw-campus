@@ -1,7 +1,7 @@
 [project]
 name = "kw-campus"
 version = "0.1.0"
-description = "Kwangwoon University campus notices on AWS: collector, Discord alerts, MCP (stage 1: main notice board)"
+description = "Kwangwoon University campus tools on AWS: notice alerts, public MCP, personal KLAS bridge"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -10,6 +10,9 @@ dependencies = [
     "certifi>=2024.8",
     "mcp>=2.3,<3",
     "uvicorn>=0.30",
+    "cryptography>=43",
+    "httpx>=0.27",
+    "kw-mcp",
 ]
 
 [dependency-groups]
@@ -20,6 +23,7 @@ dev = [
     "aws-cdk-lib>=2.200,<3",
     "constructs>=10,<11",
     "httpx>=0.27",
+    "websockets>=13",
 ]
 
 [build-system]
@@ -29,6 +33,10 @@ build-backend = "uv_build"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra"]
+
+[tool.uv.sources]
+# KLAS login/client and the snapshot builder are shared with the PC agent (../kw-mcp).
+kw-mcp = { path = "../kw-mcp", editable = true }
 
 [tool.uv.build-backend]
 module-name = "kwcampus"

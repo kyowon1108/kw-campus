@@ -17,8 +17,8 @@ def template(tmp_path) -> Template:
 
 def test_functions_and_tables(tmp_path):
     t = template(tmp_path)
-    t.resource_count_is("AWS::Lambda::Function", 5)
-    t.resource_count_is("AWS::DynamoDB::Table", 2)
+    t.resource_count_is("AWS::Lambda::Function", 7)
+    t.resource_count_is("AWS::DynamoDB::Table", 3)
     t.has_resource_properties("AWS::DynamoDB::Table", {
         "TableName": "kw-public",
         "StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"},
@@ -62,3 +62,21 @@ def test_public_mcp_runs_behind_web_adapter_with_throttling(tmp_path):
     policies = t.find_resources("AWS::IAM::Policy")
     mcp_policy = str([p for n, p in policies.items() if n.startswith("PublicMcpServiceRole")][0])
     assert "PutItem" not in mcp_policy and "/kw/mcp/*" in mcp_policy and "/kw/discord" not in mcp_policy
+
+
+def test_bridge_wiring_and_least_privilege(tmp_path):
+    t = template(tmp_path)
+    t.has_resource_properties("AWS::Lambda::Function", {
+        "FunctionName": "kw-bridge", "Handler": "run.sh", "Timeout": 30,
+        "Environment": {"Variables": Match.object_like({"KW_APP": "kwcampus.bridge.app:app",
+                                                         "KW_BRIDGE_TABLE": Match.any_value()})},
+    })
+    t.has_resource_properties("AWS::DynamoDB::Table", {"TableName": "kw-bridge",
+                                                        "TimeToLiveSpecification": {"AttributeName": "ttl", "Enabled": True}})
+    routes = {r["Properties"]["RouteKey"] for r in t.find_resources("AWS::ApiGatewayV2::Route").values()}
+    assert {"$connect", "$disconnect", "$default", "ANY /{proxy+}"} <= routes
+    policies = t.find_resources("AWS::IAM::Policy")
+    bridge = str([p for n, p in policies.items() if n.startswith("BridgeServiceRole")][0])
+    ws = str([p for n, p in policies.items() if n.startswith("BridgeWsServiceRole")][0])
+    assert "execute-api:ManageConnections" in bridge and "/kw/bridge/*" in bridge and "/kw/discord" not in bridge
+    assert "ssm:" not in ws and "ManageConnections" not in ws

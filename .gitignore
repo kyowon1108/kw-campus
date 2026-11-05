@@ -6,3 +6,4 @@ build/
 infra/cdk.out/
 .omc/
 infra/node_modules/
+src/kwcampus/bridge/static/
