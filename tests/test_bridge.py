@@ -443,3 +443,16 @@ def test_ws_connect_records_agent_version(env):
     assert ws.handler({"requestContext": {"routeKey": "$connect", "connectionId": "c2"},
                        "queryStringParameters": q}, None)["statusCode"] == 200
     assert store.latest_connection_info(env["table"], device.uid) == ("c2", 2)
+
+
+def test_grades_and_attachments_go_to_the_agent(env):
+    c, device = env["client"], FakeDevice()
+    register(c, device)
+    store.add_connection(env["table"], device.uid, "agent", 2)
+    _, tokens = oauth(c, device)
+    grades = mcp_call(c, tokens["access_token"], "tools/call", {"name": "my_grades", "arguments": {}}).json()["result"]
+    assert grades["structuredContent"] == {"op": "grades"}
+    att = mcp_call(c, tokens["access_token"], "tools/call", {"name": "my_attachment", "arguments": {
+        "course": "데이터", "title": "10주차 자료", "part": 2}}).json()["result"]
+    assert att["structuredContent"] == {"op": "read_attachment", "course": "데이터", "title": "10주차 자료",
+                                        "file_name": "", "part": "2", "source": "post"}

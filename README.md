@@ -9,7 +9,7 @@
 - 연결 방법
   - **PC 에이전트**: `kw-mcp link`가 등록한 PC가 WebSocket으로 요청을 받아 KLAS에서 읽고, 요청마다 다른 키로 암호화해 올립니다(`../kw-mcp/src/kw_mcp/agent.py`). 승인 페이지에는 에이전트가 낸 1회용 연결 코드를 넣습니다.
   - **간편 연결** (SSM `/kw/bridge/password-mode`가 `true`일 때만, 지금은 꺼 둠): 승인 페이지에서 학번·비밀번호를 받아 봉인한 토큰으로 서버가 KLAS에 로그인합니다(`src/kwcampus/bridge/password.py`). KLAS가 AWS IP 로그인에 2차 인증을 요구해서 쓸 수 없습니다. 끄면 기존 간편 연결도 다음 호출부터 끊깁니다.
-- 도구: `this_week`, `today_briefing`, `my_notices`, `my_courses`, `my_assignments`, `my_quizzes`, `my_online_lectures`, `my_team_projects`, `my_course_notices`, `my_deadlines`, `my_assignment_detail`, `my_syllabus`, `my_course_post` + 공개 도구 5개. 상세 도구 셋은 에이전트에 하나씩 묻는 `call` 요청이라 에이전트 프로토콜 2 이상이 필요합니다.
+- 도구: `this_week`, `today_briefing`, `my_notices`, `my_courses`, `my_assignments`, `my_quizzes`, `my_online_lectures`, `my_team_projects`, `my_course_notices`, `my_deadlines`, `my_assignment_detail`, `my_syllabus`, `my_course_board`, `my_course_post`, `my_attachment`, `my_grades` + 공개 도구 5개. 상세 도구 셋은 에이전트에 하나씩 묻는 `call` 요청이라 에이전트 프로토콜 2 이상이 필요합니다.
 - `kw-bridge` 테이블에는 기기 공개키, OAuth 클라이언트, 코드·토큰 해시, 연결 ID, 2분짜리 암호문, 비밀번호 거부 표시만 둡니다. 학번·비밀번호·개인 데이터는 없습니다.
 - redirect는 Claude·ChatGPT의 콜백 URL 3개(정확히 일치)와 localhost만 받습니다. 다른 사이트로 돌아가는 클라이언트로 승인을 낚는 것을 막기 위해서입니다.
 - 남용 방어: 승인 요청 하나에 실패 5번이면 닫습니다. `/device/result`는 서버가 연 요청 자리에만 한 번 쓸 수 있고 300KB까지입니다. 기기 서명은 한 번만 쓰입니다. 에이전트는 설치한 서버와 초대 코드의 서버가 다르면 연결하지 않습니다. 새 앱이 연결 코드로 붙으면 에이전트 로그에 남습니다. API는 전체 초당 10건(순간 20건)으로 제한합니다. IP별 제한이 아니어서 누가 계속 두드리면 모두 느려질 수 있지만, HTTP API에는 WAF를 붙일 수 없어 비용 상한 쪽을 택했습니다.

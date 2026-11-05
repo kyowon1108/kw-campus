@@ -334,6 +334,23 @@ async def my_course_post(course: str, title: str) -> dict[str, Any]:
     return await agent_call("course_post", course=course, title=title)
 
 
+@mcp.tool(annotations=READ_ONLY)
+async def my_grades() -> dict[str, Any]:
+    """성적·학점: 학기별 과목 성적과 학기 평점(4.5 만점, 계산값), KLAS 평량평균(학적부·성적증명서 기준),
+    전공·교양·기타 신청/취득/삭제 학점, 학과·학년·학적 상태. 이름·학번·이메일·지도교수는 포함하지 않습니다."""
+    return await agent_call("grades")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_attachment(course: str, title: str, file_name: str = "", part: int = 1,
+                        source: str = "post") -> dict[str, Any]:
+    """첨부 파일 내용을 텍스트로 읽기(PDF·PPTX·DOCX·XLSX·HWP·HWPX·ipynb·코드/텍스트, zip은 파일 목록).
+    source="post"면 과목 게시판 글(title=글 제목, my_course_board/my_course_post 결과), "assignment"면 과제의 첨부.
+    file_name은 파일 이름 일부(첨부가 하나면 생략). 길면 part=2, 3…으로 이어서 읽으세요(total_parts 참고)."""
+    return await agent_call("read_attachment", course=course, title=title, file_name=file_name,
+                            part=str(part), source=source)
+
+
 # public tools: same functions as the public MCP, so one connector covers everything
 for _fn in (public_http.latest_notices, public_http.search_notices, public_http.get_notice,
             public_http.cafeteria_menu, public_http.academic_calendar):
