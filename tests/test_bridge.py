@@ -269,6 +269,10 @@ def test_installer_serves_scripts_and_the_shipped_wheel(env, tmp_path, monkeypat
     assert c.get("/dist/kw-klas.mcpb").status_code == 404
     (tmp_path / "kw-klas.mcpb").write_bytes(b"PK mcpb")
     assert c.get("/dist/kw-klas.mcpb").content == b"PK mcpb"
+    assert c.get("/dist/latest.json").status_code == 404
+    (tmp_path / "latest.json").write_text('{"version": "0.2.0"}')
+    r = c.get("/dist/latest.json")
+    assert r.json() == {"version": "0.2.0"} and r.headers["cache-control"] == "no-cache"
 
 
 class FakeKlas:

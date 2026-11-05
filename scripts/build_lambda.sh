@@ -17,6 +17,9 @@ cp -R src/kwcampus build/lambda/
 cp scripts/run_public_mcp.sh build/lambda/run.sh && chmod +x build/lambda/run.sh
 # The bridge also serves that wheel to PCs installing the agent (/install.sh).
 mkdir -p build/lambda/kwcampus/bridge/static && cp "$WHEEL" build/lambda/kwcampus/bridge/static/
+# Sign it so PC agents can update themselves (key in this machine's keychain, never in AWS).
+(cd "$KW_MCP_DIR" && uv run --quiet python -m kw_mcp.release sign "dist/$(basename "$WHEEL")") \
+  > build/lambda/kwcampus/bridge/static/latest.json
 # ...and the Claude Desktop extension, if it has been packed (`mcpb pack . dist/kw-klas.mcpb` in kw-mcp).
 if [ -f "$KW_MCP_DIR/dist/kw-klas.mcpb" ]; then
   cp "$KW_MCP_DIR/dist/kw-klas.mcpb" build/lambda/kwcampus/bridge/static/

@@ -22,6 +22,9 @@ from starlette.responses import FileResponse, HTMLResponse, PlainTextResponse, R
 
 STATIC_DIR = Path(__file__).parent / "static"
 MCPB_NAME = "kw-klas.mcpb"  # Claude Desktop extension, packed in ../kw-mcp with `mcpb pack`
+# Signed release manifest PC agents poll to update themselves (kw_mcp.release). The signature is
+# made on the release machine; this server only passes it along and cannot forge one.
+MANIFEST_NAME = "latest.json"
 _WHEEL_NAME = re.compile(r"^kw_mcp-[\w.]+-py3-none-any\.whl$")
 
 INSTALL_SH = """#!/bin/sh
@@ -153,6 +156,9 @@ def routes(base_url: str):
         w = wheel()
         if w and name == w.name:
             return FileResponse(w, media_type="application/octet-stream")
+        if name == MANIFEST_NAME and (STATIC_DIR / MANIFEST_NAME).is_file():
+            return FileResponse(STATIC_DIR / MANIFEST_NAME, media_type="application/json",
+                                headers={"Cache-Control": "no-cache"})
         if name == MCPB_NAME and (STATIC_DIR / MCPB_NAME).is_file():
             return FileResponse(STATIC_DIR / MCPB_NAME, media_type="application/octet-stream", filename=MCPB_NAME)
         return PlainTextResponse("not found", status_code=404)
