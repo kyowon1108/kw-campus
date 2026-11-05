@@ -1,0 +1,31 @@
+[project]
+name = "kw-campus"
+version = "0.1.0"
+description = "Kwangwoon University campus notices on AWS: collector, Discord alerts, MCP (stage 1: main notice board)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4>=4.13,<5",
+    "pydantic>=2.11,<3",
+    "certifi>=2024.8",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "boto3>=1.35",
+    "moto[dynamodb,sqs,ssm]>=5",
+    "aws-cdk-lib>=2.200,<3",
+    "constructs>=10,<11",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra"]
+
+[tool.uv.build-backend]
+module-name = "kwcampus"
