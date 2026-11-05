@@ -12,7 +12,9 @@ OS keychain.
 
 from __future__ import annotations
 
+import hashlib
 import re
+from functools import cache
 from pathlib import Path
 
 from starlette.requests import Request
@@ -36,7 +38,12 @@ if ! command -v uv >/dev/null 2>&1; then
   curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
 fi
 echo "Installing the KW Campus agent..."
-uv tool install --force --quiet --python 3.13 "kw-mcp @ __BASE__/dist/__WHEEL__"
+# Download first: uv's own download probes the size with HEAD, which API Gateway answers with 0.
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+curl -fsSL -o "$TMP/__WHEEL__" "__BASE__/dist/__WHEEL__"
+echo "__SHA256__  $TMP/__WHEEL__" | shasum -a 256 -c - >/dev/null
+uv tool install --force --quiet --python 3.13 "kw-mcp @ file://$TMP/__WHEEL__"
 kw-mcp link "$INVITE" --server "__BASE__" < /dev/tty
 """
 
@@ -50,7 +57,14 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
   powershell -NoProfile -ExecutionPolicy ByPass -Command "irm https://astral.sh/uv/install.ps1 | iex" | Out-Null
 }
 Write-Host 'Installing the KW Campus agent...'
-uv tool install --force --quiet --python 3.13 "kw-mcp @ __BASE__/dist/__WHEEL__"
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
+New-Item -ItemType Directory -Path $tmp | Out-Null
+$whl = Join-Path $tmp '__WHEEL__'
+Invoke-WebRequest -UseBasicParsing -Uri '__BASE__/dist/__WHEEL__' -OutFile $whl
+if ((Get-FileHash -Algorithm SHA256 $whl).Hash.ToLower() -ne '__SHA256__') { throw 'The downloaded agent failed its checksum.' }
+uv tool install --force --quiet --python 3.13 ("kw-mcp @ file:///" + ($whl -replace '\\', '/'))
+if ($LASTEXITCODE -ne 0) { throw 'uv could not install the agent.' }
+Remove-Item -Recurse -Force $tmp
 kw-mcp link $invite --server '__BASE__'
 """
 
@@ -109,11 +123,17 @@ def wheel() -> Path | None:
     return wheels[-1] if wheels else None
 
 
+@cache
+def _sha256(path: Path, size: int) -> str:  # size in the key: a redeploy with a new wheel gets a new hash
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _script(template: str, base_url: str) -> Response:
     w = wheel()
     if not w:
         return PlainTextResponse("echo 'installer is not available yet'; exit 1\n", status_code=503)
-    body = template.replace("__BASE__", base_url).replace("__WHEEL__", w.name)
+    body = (template.replace("__BASE__", base_url).replace("__WHEEL__", w.name)
+            .replace("__SHA256__", _sha256(w, w.stat().st_size)))
     return PlainTextResponse(body, media_type="text/plain; charset=utf-8", headers={"Cache-Control": "no-cache"})
 
 

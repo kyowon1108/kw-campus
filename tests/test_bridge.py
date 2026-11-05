@@ -250,8 +250,11 @@ def test_installer_serves_scripts_and_the_shipped_wheel(env, tmp_path, monkeypat
     assert c.get("/install.sh").status_code == 503  # nothing shipped yet
     (tmp_path / "kw_mcp-0.1.0-py3-none-any.whl").write_bytes(b"PK fake wheel")
     sh = c.get("/install.sh").text
-    assert "kw-mcp @ http://localhost:8080/dist/kw_mcp-0.1.0-py3-none-any.whl" in sh and 'kw-mcp link "$INVITE"' in sh
-    assert "irm" not in sh and "/dist/kw_mcp-0.1.0-py3-none-any.whl" in c.get("/install.ps1").text
+    digest = hashlib.sha256(b"PK fake wheel").hexdigest()
+    assert 'curl -fsSL -o "$TMP/kw_mcp-0.1.0-py3-none-any.whl" "http://localhost:8080/dist/kw_mcp-0.1.0-py3-none-any.whl"' in sh
+    assert f"{digest}  $TMP/" in sh and '"kw-mcp @ file://$TMP/' in sh and 'kw-mcp link "$INVITE"' in sh
+    ps1 = c.get("/install.ps1").text
+    assert "/dist/kw_mcp-0.1.0-py3-none-any.whl" in ps1 and f"-ne '{digest}'" in ps1
     assert c.get("/dist/kw_mcp-0.1.0-py3-none-any.whl").content == b"PK fake wheel"
     assert c.get("/dist/..%2Fapp.py").status_code == 404
     assert "kw-mcp code" in c.get("/setup").text and "/dist/kw-klas.mcpb" in c.get("/setup").text
