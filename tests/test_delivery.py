@@ -6,6 +6,7 @@ from boto3.dynamodb.types import TypeSerializer
 
 from kwcampus import discord, discordapi, dispatcher
 from kwcampus.config import KST
+from kwcampus.kwnotice.redaction import redact_text
 
 _ser = TypeSerializer()
 
@@ -372,7 +373,8 @@ def test_dispatcher_tells_school_edits_from_our_own_and_spots_reposts():
     today = date(2026, 11, 6)
     jobs = dispatcher.jobs_for([
         # our redaction rules changed the title (norm_v bumped), the site's 수정일 didn't: quiet
-        stream("MODIFY", {**NOTICE, "title": "KLAS 보안 강화 안내(수정)", "norm_v": 2}, old={**NOTICE, "norm_v": 1}),
+        stream("MODIFY", {**NOTICE, "title": redact_text("문의 02-940-5114"), "norm_v": 2},
+               old={**NOTICE, "title": "문의 02-940-5114", "norm_v": 1}),
         # the school moved it from 일반 to 학사: quiet, addressed to where it was posted
         stream("MODIFY", NOTICE, old={**NOTICE, "category_id": "general"}),
         # a department reused UID 631 for a new semester: a repost
@@ -494,3 +496,18 @@ def test_no_scheduled_run_falls_in_quiet_hours():
     # weekdays 09:00-18:40 every 20 minutes, plus 21:00 (infra); quiet hours start at 22:00
     for hour, minute in ((9, 0), (18, 40), (21, 0)):
         assert not discord.is_quiet(datetime(2026, 11, 6, hour, minute, tzinfo=KST))
+
+
+def test_a_school_edit_on_an_item_without_norm_v_is_a_real_edit():
+    today = date(2026, 11, 6)
+    old = {**NOTICE, "updated_date": "2026-10-15"}  # stored before norm_v existed
+    jobs = dispatcher.jobs_for([
+        # the school retitled it; our upsert adds norm_v=2 in the same write
+        stream("MODIFY", {**old, "title": "KLAS 보안 강화 안내 (기간 연장)", "norm_v": 2}, old=old),
+        # norm_v bumped and the title changed beyond what redaction explains, 수정일 unchanged: real
+        stream("MODIFY", {**old, "title": "완전히 다른 제목", "norm_v": 2}, old={**old, "norm_v": 1}),
+        # redaction only, but the site's 수정일 moved too: real
+        stream("MODIFY", {**old, "title": redact_text("문의 02-940-5114"), "updated_date": "2026-11-06", "norm_v": 2},
+               old={**old, "title": "문의 02-940-5114", "norm_v": 1}),
+    ], today)
+    assert [j.get("quiet", False) for j in jobs] == [False, False, False]

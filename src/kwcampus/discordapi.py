@@ -13,7 +13,7 @@ import urllib.request
 from kwcampus.fetch import TLS
 
 API = "https://discord.com/api/v10"
-USER_AGENT = "DiscordBot (https://github.com/kyowon1108/kw-notice-mcp, 0.1)"
+USER_AGENT = "DiscordBot (https://github.com/kyowon1108/kw-campus, 1.0)"
 # Three base64url parts joined by dots. Anything else (a newline, a space, the wrong text pasted)
 # is refused before it can reach an HTTP header, where http.client would echo it into an error.
 _TOKEN = re.compile(r"[A-Za-z0-9_\-]{17,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{20,}")

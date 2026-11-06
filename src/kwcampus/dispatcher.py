@@ -5,8 +5,10 @@
   changed, addressed to the channel the notice was posted to (its old category's channel). The
   main board and the job board have a 수정일; department boards and the aicon widget only carry
   their 등록일 there, so it changes only when a post is reused.
-  - quiet (fix the message, no "수정됨" note): only the category moved, or our own normalization
-    changed (norm_v, the redaction rules' version) while the site's 수정일 stayed the same.
+  - quiet (fix the message, no "수정됨" note): only the category moved, or our own redaction changed
+    the title: norm_v differs, today's rules turn the old title into the new one, and the site's
+    수정일 stayed the same. An item stored before norm_v existed gets it on its first school edit,
+    which therefore still counts as a real edit.
   - "repost": a department board gave an old post (same UID) a new title and a 등록일 more than
     30 days later. The sender edits it if we posted it, else posts it as new.
 Nothing is sent while the /kw/collector/notify switch is off.
@@ -22,6 +24,7 @@ from boto3.dynamodb.types import TypeDeserializer
 
 from kwcampus import params
 from kwcampus.config import DISCORD_QUEUE_URL, KST, NOTIFY_ENABLED_PARAM, PINNED_MAX_AGE
+from kwcampus.kwnotice.redaction import redact_text
 from kwcampus.obs import log, metrics
 from kwcampus.routing import channel_for
 
@@ -73,10 +76,16 @@ def _edit_job(key: dict, old: dict, new: dict, channel: str) -> dict | None:
     posted_in = channel_for(str(old.get("category_id", ""))) or channel
     job = {"action": "edit", "key": key, "channel": posted_in, "changed": changed}
     school = any(field in changed for field in SCHOOL_FIELDS)
-    ours = old.get("norm_v") != new.get("norm_v") and old.get("updated_date") == new.get("updated_date")
-    if not school or ours:
+    if not school or _our_redaction(old, new):
         job["quiet"] = True
     return job
+
+
+def _our_redaction(old: dict, new: dict) -> bool:
+    """The title changed only because our redaction rules did, not because the school edited it."""
+    return (old.get("norm_v") != new.get("norm_v")
+            and old.get("updated_date") == new.get("updated_date")
+            and redact_text(str(old.get("title") or "")) == new.get("title"))
 
 
 def jobs_for(records: list[dict], today: date) -> list[dict]:
