@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from kw_mcp.service import CLASS_CHANGE_WORDS as CLASS_CHANGE_WORDS  # re-exported for app.py
-from kw_mcp.service import is_lecture, schedule_note  # shared with the PC agent: one definition
+from kw_mcp.service import is_lecture, period_time, schedule_note  # shared with the PC agent: one definition
 
 from kwcampus.config import KST
 
@@ -167,6 +167,6 @@ def classes_on(snap: dict, now: datetime) -> list[dict]:
     for c in courses(snap):
         for slot in c["slots"]:
             if slot["weekday"] == weekday:
-                out.append({"course": c["course"], "periods": slot["periods"], "room": slot["room"],
-                            "professor": c["professor"]})
+                out.append({"course": c["course"], "periods": slot["periods"], "time": period_time(slot["periods"]),
+                            "room": slot["room"], "professor": c["professor"]})
     return sorted(out, key=lambda x: x["periods"][0] if x["periods"] else 99)

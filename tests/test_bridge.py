@@ -529,13 +529,13 @@ def test_new_reads_go_to_the_agent(env):
     register(c, device)
     store.add_connection(env["table"], device.uid, "agent", 2)
     _, tokens = oauth(c, device)
-    for name in ("my_online_tests", "my_surveys", "my_discussions", "my_course_evaluation"):
+    for name in ("my_online_tests", "my_surveys", "my_discussions", "my_course_evaluation", "my_course_overview"):
         mcp_call(c, tokens["access_token"], "tools/call", {"name": name, "arguments": {}})
     digest = mcp_call(c, tokens["access_token"], "tools/call",
                       {"name": "my_academic_deadlines", "arguments": {"days": 30}}).json()["result"]["structuredContent"]
     assert digest["klas"] == {"op": "application_windows"} and isinstance(digest["calendar"], list)
     assert [m["op"] for _, m in env["sent"] if m["type"] == "call"] == [
-        "online_tests", "surveys", "discussions", "course_evaluation", "application_windows"]
+        "online_tests", "surveys", "discussions", "course_evaluation", "course_overview", "application_windows"]
 
 
 def test_deadlines_come_from_the_agent_and_fall_back_to_the_snapshot(env, monkeypatch):

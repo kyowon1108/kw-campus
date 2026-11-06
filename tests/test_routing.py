@@ -1,4 +1,4 @@
-from kwcampus import deptboards
+from kwcampus import deptboards, wixfeeds
 from kwcampus.routing import (
     CATEGORY_TO_CHANNEL,
     TOPIC_BY_KEY,
@@ -22,7 +22,18 @@ def test_topics_follow_channels_and_colleges():
     assert topic_for("international-student") == "international"
     assert {topic_for(c) for c in ("general", "student", "volunteer", "military")} == {"general"}
     assert topic_for("dept-aicon") == "aicon"
-    assert {topic_for(b.category_id) for b in deptboards.BOARDS} == {"ei"}
+    assert {topic_for(f"dept-{k}") for k in ("ei", "ee", "semicon")} == {"ei"}
+    assert topic_for("dept-biz") == "biz" and topic_for("dept-media") == topic_for("dept-korean") == "chss"
+    assert topic_for("dept-architecture") == topic_for("dept-chemng") == "eng"
+    assert topic_for("dept-kwgame") == "kwlife" and topic_for("dept-kwpa") == "law"
+
+
+def test_every_department_board_and_feed_belongs_to_a_college():
+    categories = ["dept-aicon", *(b.category_id for b in deptboards.BOARDS), *(f.category_id for f in wixfeeds.FEEDS)]
+    missing = [c for c in categories if not (topic_for(c) and TOPIC_BY_KEY[topic_for(c)].college)]
+    assert missing == [], "add these to routing.COLLEGE_OF"
+    # and no college role is left without a board
+    assert {t.key for t in TOPICS if t.college} == {topic_for(c) for c in categories}
 
 
 def test_topic_keys_and_role_names_are_unique():

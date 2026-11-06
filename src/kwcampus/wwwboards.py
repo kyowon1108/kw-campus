@@ -29,7 +29,7 @@ from kwcampus.kwnotice.source import NOTICE_HOST, NOTICE_ORIGIN, duid_from_href
 from kwcampus.kwnotice.values import SourceURL
 from kwcampus.obs import log, metrics
 
-DAILY_CAP = 40  # www's budget, shared with the main board and the campus Lambda
+DAILY_CAP = 44  # www's budget, shared with the main board and the campus Lambda (collector.DAILY_CAP)
 # The schedule fires every 20 minutes; a few seconds of start jitter must not push a check a slot later.
 SLACK = timedelta(minutes=5)
 

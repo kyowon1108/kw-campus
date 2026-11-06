@@ -127,8 +127,13 @@ def test_handler_wires_ssm_values(params, monkeypatch):
 
 def test_menu_has_a_button_per_topic_in_rows_of_five():
     menu = interactions.menu_message()
-    ids = [c["custom_id"] for row in menu["components"] for c in row["components"]]
-    assert ids == [f"kwsub:{t.key}" for t in TOPICS] + ["kwsub:list"]
-    assert all(len(row["components"]) <= 5 for row in menu["components"])
-    assert all(len(c["label"]) <= 80 for row in menu["components"] for c in row["components"])
+    rows = [[c for c in row["components"]] for row in menu["components"]]
+    ids = [c["custom_id"] for row in rows for c in row]
+    assert sorted(ids) == sorted([f"kwsub:{t.key}" for t in TOPICS] + ["kwsub:list"])
+    assert len(rows) <= 5 and all(len(row) <= 5 for row in rows)  # Discord's limits
+    assert all(len(c["label"]) <= 80 and len(c["custom_id"]) <= 100 for row in rows for c in row)
+    colleges = {f"kwsub:{t.key}" for t in TOPICS if t.college}
+    # college buttons get rows of their own, in grey
+    assert all({c["custom_id"] in colleges for c in row} in ({True}, {False}) for row in rows)
+    assert all(c["style"] == 2 for row in rows for c in row if c["custom_id"] in colleges)
     assert menu["allowed_mentions"] == {"parse": []}

@@ -41,16 +41,25 @@ ROLE_TIMEOUT_S = 2.0  # Discord wants the answer within 3 s
 MENU_CONTENT = (
     "**공지 알림 받기**\n"
     "받고 싶은 주제를 누르면 그 주제의 새 공지가 올라올 때 멘션으로 알려 드립니다. 한 번 더 누르면 꺼집니다.\n"
+    "회색 버튼은 단과대입니다. 그 단과대와 소속 학과 게시판의 공지를 알려 드립니다.\n"
     "밤 10시부터 아침 8시 사이에는 멘션 없이 올라오고, 긴급(휴강·출입 통제·강의실 변경·정전·단수·시스템 장애)만 "
     "밤에도 알려 드립니다."
 )
 
 
+def _rows(buttons: list[dict]) -> list[dict]:
+    return [{"type": 1, "components": buttons[i : i + 5]} for i in range(0, len(buttons), 5)]
+
+
 def menu_message() -> dict:
-    """The one bot message in #알림-설정 (scripts/discord_setup.py posts or updates it)."""
-    buttons = [{"type": 2, "style": 1, "label": t.label, "custom_id": PREFIX + t.key} for t in TOPICS]
-    buttons.append({"type": 2, "style": 2, "label": "내 알림 보기", "custom_id": LIST_ID})
-    rows = [{"type": 1, "components": buttons[i : i + 5]} for i in range(0, len(buttons), 5)]
+    """The one bot message in #알림-설정 (scripts/discord_setup.py posts or updates it).
+    Topics first, then the colleges in rows of their own; Discord allows 5 rows of 5 buttons."""
+    def button(t, style: int) -> dict:
+        return {"type": 2, "style": style, "label": t.label, "custom_id": PREFIX + t.key}
+
+    topics = [button(t, 1) for t in TOPICS if not t.college]
+    topics.append({"type": 2, "style": 3, "label": "내 알림 보기", "custom_id": LIST_ID})
+    rows = _rows(topics) + _rows([button(t, 2) for t in TOPICS if t.college])
     return {"content": MENU_CONTENT, "components": rows, "allowed_mentions": {"parse": []}}
 
 

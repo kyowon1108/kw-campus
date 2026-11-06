@@ -70,6 +70,20 @@ def acquire(table, origin: str, now: datetime, daily_cap: int) -> Permit:
     return Permit(True, "ok")
 
 
+def move(table, old: str, new: str) -> None:
+    """Carry a gate over to a new key once (cool-down, block count, today's count and all), as when
+    aicon's gate went from its host name to its server. A no-op read once moved."""
+    item = table.get_item(Key=_key(old), ConsistentRead=True).get("Item")
+    if not item:
+        return
+    try:
+        table.put_item(Item={**item, **_key(new)}, ConditionExpression="attribute_not_exists(PK)")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+    table.delete_item(Key=_key(old))
+
+
 def record_success(table, origin: str) -> None:
     table.update_item(
         Key=_key(origin),

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import re
 
-from kwcampus import deptboards, wwwboards
+from kwcampus import deptboards, wixfeeds, wwwboards
 from kwcampus.topics import TOPIC_BY_KEY, TOPICS, URGENT, Topic
 
-__all__ = ["CATEGORY_LABEL", "CATEGORY_TO_CHANNEL", "TOPICS", "TOPIC_BY_KEY", "URGENT", "Topic", "channel_for",
+__all__ = ["CATEGORY_LABEL", "CATEGORY_TO_CHANNEL", "COLLEGE_OF", "TOPICS", "TOPIC_BY_KEY", "URGENT", "Topic", "channel_for",
            "is_urgent", "topic_for"]
 
 # channel keys match the keys of the JSON in the /kw/discord/channels parameter
@@ -26,7 +26,7 @@ CATEGORY_TO_CHANNEL: dict[str, str] = {
     "international-exchange": "international",
     "international-student": "international",
     "dept-aicon": "department",  # 인공지능융합대학 (falls back to "notice" until a channel is set)
-    **{b.category_id: "department" for b in deptboards.BOARDS},
+    **{b.category_id: "department" for b in (*deptboards.BOARDS, *wixfeeds.FEEDS)},
     "job": "career",  # 취업게시판
 }
 # Searchable but never announced: FAQ entries are reference pages, not news.
@@ -45,7 +45,7 @@ CATEGORY_LABEL: dict[str, str] = {
     "international-exchange": "국제교류",
     "international-student": "국제학생",
     "dept-aicon": "인공지능융합대학",
-    **{b.category_id: b.name for b in deptboards.BOARDS},
+    **{b.category_id: b.name for b in (*deptboards.BOARDS, *wixfeeds.FEEDS)},
     **{b.category_id: b.name for b in wwwboards.BOARDS},
 }
 
@@ -56,11 +56,18 @@ def channel_for(category_id: str) -> str | None:
         return None
     return CATEGORY_TO_CHANNEL.get(category_id, "notice")
 
-# Colleges get their own topic. Every board in deptboards.BOARDS belongs to 전자정보공과대학;
-# a board of another college needs a new Topic here and an entry below.
-_COLLEGE_TOPIC: dict[str, str] = {
-    "dept-aicon": "aicon",
-    **{b.category_id: "ei" for b in deptboards.BOARDS},
+# Department boards and feeds by college: key (category "dept-<key>") → college topic.
+# A new board or feed needs a line here (tests/test_routing.py fails until it has one).
+COLLEGE_OF: dict[str, str] = {
+    **dict.fromkeys(("ei", "ee", "elcomm", "radiowave", "electric", "snme", "semicon"), "ei"),
+    "aicon": "aicon",  # the college home widget, all four schools
+    **dict.fromkeys(("archi", "chemng", "architecture"), "eng"),  # 건축공학과, 화학공학과, 건축학과
+    "sports": "natsci",  # 스포츠융합과학과
+    **dict.fromkeys(("chss", "korean", "english", "psy", "dnaci", "media"), "chss"),
+    **dict.fromkeys(("law", "kwpa"), "law"),  # 법학부, 행정학과
+    "biz": "biz",
+    **dict.fromkeys(("kwlife", "kwlaw", "kwgame", "kwsports"), "kwlife"),
+    "ingenium": "ingenium",
 }
 # The other topics are the channels themselves; the 학교-공지 channel is the "general" topic.
 _CHANNEL_TOPIC = {"notice": "general", "academic": "academic", "scholarship": "scholarship",
@@ -72,7 +79,9 @@ def topic_for(category_id: str) -> str | None:
     channel = channel_for(category_id)
     if channel is None:
         return None
-    return _COLLEGE_TOPIC.get(category_id) or _CHANNEL_TOPIC.get(channel)
+    if channel == "department":
+        return COLLEGE_OF.get(category_id.removeprefix("dept-"))
+    return _CHANNEL_TOPIC.get(channel)
 
 
 # What students most need to hear at once, from any board: cancelled or moved classes, closed

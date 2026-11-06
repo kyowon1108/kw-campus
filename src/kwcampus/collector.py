@@ -1,7 +1,8 @@
 """Lambda: collect page 1 of the main notice board into kw-public, then the other boards.
 
 Runs on a schedule, only when the kill switch is on and each server's gate allows it. The main
-board goes first with one request to www.kw.ac.kr; the department servers get one request each.
+board goes first with one request to www.kw.ac.kr; the department servers get one request each
+(the 인공지능융합대학 widget shares its server's), and the Wix blog feeds one per host every 2 hours.
 Every couple of hours a second www request reads the 취업게시판 or the FAQ, 61 s after the first.
 """
 
@@ -11,7 +12,7 @@ from datetime import UTC, datetime
 
 import boto3
 
-from kwcampus import aicon, deptboards, params, politeness, store, wwwboards
+from kwcampus import aicon, deptboards, params, politeness, store, wixfeeds, wwwboards
 from kwcampus.config import COLLECTOR_ENABLED_PARAM, NOTICE_SOURCE, PUBLIC_TABLE
 from kwcampus.fetch import fetch_list_page
 from kwcampus.kwnotice.list_parser import parse_list_soup
@@ -19,7 +20,7 @@ from kwcampus.kwnotice.parsing_shared import boundary_or_issue, soup_from_bounda
 from kwcampus.kwnotice.source import NOTICE_HOST, build_list_url
 from kwcampus.obs import log, metrics
 
-DAILY_CAP = 40  # weekday 09:00-18:59 every 20 min = 30 runs
+DAILY_CAP = 44  # weekdays: 30 daytime runs + the 21:00 run; www also serves the job board, FAQ and campus
 
 
 def run(now: datetime, table, fetch=fetch_list_page) -> dict[str, object]:
@@ -67,7 +68,7 @@ def handler(event, context):
     if out.get("status") != "disabled":  # same kill switch; each server keeps its own gate
         # www's extra boards go last: they may wait out the 60 s gap after the main board's request.
         time_left = (lambda: context.get_remaining_time_in_millis() / 1000) if context else None
-        for name, source in (("aicon", aicon), ("dept", deptboards), ("www", wwwboards)):
+        for name, source in (("aicon", aicon), ("dept", deptboards), ("wix", wixfeeds), ("www", wwwboards)):
             try:
                 extra = {"time_left": time_left} if source is wwwboards and time_left else {}
                 out = {**out, name: source.collect(now, table, **extra)}

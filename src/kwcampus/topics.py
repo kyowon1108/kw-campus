@@ -16,6 +16,7 @@ class Topic:
     key: str  # button custom_id suffix and key in /kw/discord/roles
     label: str  # button label
     role: str  # Discord role name (scripts/discord_setup.py creates it)
+    college: bool = False  # a college: its own notices and those of its departments
 
 
 URGENT = "urgent"  # by title keywords (routing.is_urgent), any board; pinged even at night
@@ -26,7 +27,15 @@ TOPICS: tuple[Topic, ...] = (
     Topic("career", "취업", "취업 알림"),
     Topic("international", "국제", "국제 알림"),
     Topic("general", "일반 (봉사·학생 등)", "일반 공지 알림"),
-    Topic("aicon", "인공지능융합대학", "인공지능융합대학 알림"),
-    Topic("ei", "전자정보공과대학", "전자정보공과대학 알림"),
+    # colleges; which board belongs to which is routing.COLLEGE_OF
+    Topic("ei", "전자정보공과대학", "전자정보공과대학 알림", college=True),
+    Topic("aicon", "인공지능융합대학", "인공지능융합대학 알림", college=True),
+    Topic("eng", "공과대학", "공과대학 알림", college=True),
+    Topic("natsci", "자연과학대학", "자연과학대학 알림", college=True),
+    Topic("chss", "인문사회과학대학", "인문사회과학대학 알림", college=True),
+    Topic("law", "정책법학대학", "정책법학대학 알림", college=True),
+    Topic("biz", "경영대학", "경영대학 알림", college=True),
+    Topic("kwlife", "참빛인재대학", "참빛인재대학 알림", college=True),
+    Topic("ingenium", "인제니움학부대학", "인제니움학부대학 알림", college=True),
 )
 TOPIC_BY_KEY: dict[str, Topic] = {t.key: t for t in TOPICS}

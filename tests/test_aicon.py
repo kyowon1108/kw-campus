@@ -3,13 +3,25 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from kwcampus import aicon, collector, deptboards, dispatcher, public_data, wwwboards
+from kwcampus import (
+    aicon,
+    collector,
+    deptboards,
+    dispatcher,
+    politeness,
+    public_data,
+    wixfeeds,
+    wwwboards,
+)
+from kwcampus.config import KST
 from kwcampus.discord import handle_job
 from kwcampus.fetch import FetchResult
 
 # Saved from https://aicon.kw.ac.kr/main/main.php on 2026-11-05 (public page, no personal data).
 WIDGET = (Path(__file__).parent / "fixtures" / "aicon_main.html").read_text()
+BOARD_PAGE = (Path(__file__).parent / "fixtures" / "dept_ee_list.html").read_text()  # same engine as E3's boards
 NOW = datetime(2026, 11, 5, 3, 0, tzinfo=UTC)
+E3 = [b for b in deptboards.BOARDS if b.server == aicon.SERVER]
 
 
 def widget_fetch(url):
@@ -35,18 +47,62 @@ def test_collect_seeds_quietly_then_inserts_new_posts(aws):
     assert len(items) == 5 and all(i["seed"] for i in items)  # baseline: no alerts for what was already there
 
     newer = WIDGET.replace("no=3516", "no=3517").replace("[공지] 2026년 졸업작품", "[공지] 새 공지")
-    second = aicon.collect(NOW + timedelta(minutes=20), table, fetch=lambda url: FetchResult(newer, None, 200))
+    second = aicon.collect(NOW + timedelta(minutes=40), table, fetch=lambda url: FetchResult(newer, None, 200))
     assert second["inserted"] == 1 and second["seed_run"] is False
     new = table.get_item(Key={"PK": "SRC#aicon", "SK": "N#3517"})["Item"]
     assert new["seed"] is False and new["department"] == "컴퓨터정보공학부"
 
 
-def test_collect_respects_the_hosts_gate(aws):
+def test_collect_respects_the_servers_gate(aws):
     table = aws["public"]
     aicon.collect(NOW, table, fetch=widget_fetch)
     calls = []
-    out = aicon.collect(NOW + timedelta(seconds=30), table, fetch=lambda url: calls.append(url))
-    assert out == {"status": "skipped", "reason": "too_soon"} and calls == []
+    assert aicon.collect(NOW + timedelta(minutes=20), table, fetch=lambda url: calls.append(url)) == {"status": "not_due"}
+    # kwlife, kwlaw, ... are on the same server: no second request to it in the same run
+    out = deptboards.collect(NOW + timedelta(seconds=30), table, fetch=lambda url, **kw: FetchResult(None, "transport_failure", 0))
+    assert out[aicon.SERVER] == {"status": "skipped", "reason": "too_soon"} and calls == []
+
+
+def test_widget_and_e3_boards_share_one_request_a_run(aws):
+    table, calls = aws["public"], []
+
+    def fake(url, **kw):
+        calls.append(url)
+        return FetchResult(WIDGET if url == aicon.WIDGET_URL else BOARD_PAGE, None, 200)
+
+    for run in range(6):  # what the collector does: the widget first, then the department servers
+        at = NOW + timedelta(minutes=20 * run, seconds=7 * (run % 2))  # start jitter
+        aicon.collect(at, table, fetch=fake)
+        deptboards.collect(at, table, fetch=fake)
+    e3 = [u for u in calls if u == aicon.WIDGET_URL or u in {b.list_url for b in E3}]
+    assert e3 == [aicon.WIDGET_URL, E3[0].list_url, aicon.WIDGET_URL, E3[1].list_url, aicon.WIDGET_URL, E3[2].list_url]
+    origins = {i["PK"] for i in table.scan()["Items"] if i["PK"].startswith("ORIGIN#")}
+    assert f"ORIGIN#{aicon.SERVER}" in origins and f"ORIGIN#{aicon.HOST}" not in origins
+    assert {b.key for b in E3} == {"kwlife", "kwlaw", "kwgame", "kwsports", "ingenium"}
+
+
+def test_the_old_host_gate_moves_to_the_server(aws):
+    table = aws["public"]
+    today = NOW.astimezone(KST).strftime("%Y-%m-%d")
+    cooling = int((NOW + timedelta(minutes=30)).timestamp())
+    table.put_item(Item={"PK": f"ORIGIN#{aicon.HOST}", "SK": "STATE", "blocks": 1, "cooldown_until": cooling,
+                         "last_block": "rate_limit", "day": today, "day_count": 12, "ver": 13})
+    calls = []
+    assert aicon.collect(NOW, table, fetch=lambda url: calls.append(url)) == {"status": "skipped", "reason": "cooldown"}
+    assert "Item" not in table.get_item(Key={"PK": f"ORIGIN#{aicon.HOST}", "SK": "STATE"})
+    moved = table.get_item(Key={"PK": f"ORIGIN#{aicon.SERVER}", "SK": "STATE"})["Item"]
+    assert (moved["blocks"], moved["cooldown_until"], moved["day_count"]) == (1, cooling, 12)
+    # the cool-down now holds E3's boards too
+    out = deptboards.collect(NOW, table, fetch=lambda url, **kw: calls.append(url) or FetchResult(None, "http_failure", 500))
+    assert out[aicon.SERVER] == {"status": "skipped", "reason": "cooldown"}
+    assert len(calls) == 3 and not set(calls) & {b.list_url for b in E3}  # E1, E2 and E4 only
+
+
+def test_a_changed_widget_does_not_hold_up_the_e3_boards(aws):
+    table = aws["public"]
+    out = aicon.collect(NOW, table, fetch=lambda url: FetchResult("<html><body>새 디자인</body></html>", None, 200))
+    assert out == {"status": "no_rows"}
+    assert politeness.acquire(table, aicon.SERVER, NOW + timedelta(minutes=20), daily_cap=deptboards.DAILY_CAP).granted
 
 
 def test_department_notices_show_in_search_with_distinct_ids(aws):
@@ -84,7 +140,8 @@ def test_scheduled_run_survives_a_department_site_failure(aws, monkeypatch):
 
     monkeypatch.setattr(aicon, "collect", boom)
     monkeypatch.setattr(deptboards, "collect", lambda now, table: {"status": "ok"})
+    monkeypatch.setattr(wixfeeds, "collect", lambda now, table: {"status": "not_due"})
     monkeypatch.setattr(wwwboards, "collect", lambda now, table: {"status": "not_due"})
     monkeypatch.setattr(collector.boto3, "resource", lambda name: type("R", (), {"Table": lambda self, n: aws["public"]})())
     assert collector.handler({}, None) == {"status": "ok", "aicon": {"status": "error"}, "dept": {"status": "ok"},
-                                           "www": {"status": "not_due"}}
+                                           "wix": {"status": "not_due"}, "www": {"status": "not_due"}}
