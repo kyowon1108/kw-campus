@@ -44,12 +44,14 @@ MAX_BODY = 64 * 1024
 MAX_SKEW_S = 60  # a signed request older than this is a replay
 ROLE_TIMEOUT_S = 2.0  # Discord wants the answer within 3 s
 
+# Keep in step with the collector schedule (infra: weekdays 09:00-18:40 every 20 min, plus 21:00).
 MENU_CONTENT = (
     "**공지 알림 받기**\n"
     "받고 싶은 주제를 누르면 그 주제의 새 공지가 올라올 때 멘션으로 알려 드립니다. 한 번 더 누르면 꺼집니다.\n"
     "회색 버튼은 단과대입니다. 그 단과대와 소속 학과 게시판의 공지를 알려 드립니다.\n"
-    "밤 10시부터 아침 8시 사이에는 멘션 없이 올라오고, 긴급(휴강·출입 통제·강의실 변경·정전·단수·시스템 장애)만 "
-    "밤에도 알려 드립니다."
+    "긴급은 학교 전체 공지 가운데 휴강·휴교·출입 통제·정전·단수·시스템 장애 같은 글입니다.\n"
+    "공지는 평일 09:00~18:40에 20분마다, 그리고 21:00에 확인합니다. 밤과 주말에 올라온 글은 다음 확인 때 올라옵니다. "
+    "같은 주제의 멘션은 30분에 한 번까지입니다(긴급은 매번)."
 )
 
 
@@ -73,12 +75,15 @@ def verify(public_key_hex: str | None, signature_hex: str | None, timestamp: str
            body: bytes, now: float) -> bool:
     if not (public_key_hex and signature_hex and timestamp):
         return False
+    # Unix seconds; a 400-digit "timestamp" must not reach int() and float arithmetic
+    if not (timestamp.isascii() and timestamp.isdigit() and len(timestamp) <= 12):
+        return False
     try:
         if abs(now - int(timestamp)) > MAX_SKEW_S:
             return False
         key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex.strip()))
         key.verify(bytes.fromhex(signature_hex), timestamp.encode() + body)
-    except (ValueError, InvalidSignature):
+    except (ValueError, OverflowError, InvalidSignature):
         return False
     return True
 
@@ -87,8 +92,9 @@ def _say(text: str) -> dict:
     return {"type": CHANNEL_MESSAGE, "data": {"content": text, "flags": EPHEMERAL, "allowed_mentions": {"parse": []}}}
 
 
-def handle(payload: dict, cfg: dict, token: str | None, send=_discord) -> tuple[dict, str]:
-    """(interaction response, outcome for the log)."""
+def handle(payload: dict, cfg: dict, token: str | None, send=_discord, reload=None) -> tuple[dict, str]:
+    """(interaction response, outcome for the log). reload() re-reads the role map, bypassing the
+    cache, for a known topic whose role isn't in the cached map yet (setup ran a moment ago)."""
     if payload.get("type") == PING:
         return {"type": PONG}, "pong"
     if payload.get("type") != MESSAGE_COMPONENT:
@@ -109,9 +115,14 @@ def handle(payload: dict, cfg: dict, token: str | None, send=_discord) -> tuple[
         return _say(text), "listed"
 
     topic = TOPIC_BY_KEY.get(custom_id.removeprefix(PREFIX)) if custom_id.startswith(PREFIX) else None
-    role_id = str(roles.get(topic.key) or "") if topic else ""
-    if topic is None or not is_snowflake(role_id) or role_id == guild:  # never @everyone
+    if topic is None:
         return _say("이 버튼은 이제 쓰지 않습니다. 다른 버튼을 눌러 주세요."), "unknown_button"
+    role_id = str(roles.get(topic.key) or "")
+    if not is_snowflake(role_id) and reload is not None:
+        roles = (reload() or {}).get("roles") or {}
+        role_id = str(roles.get(topic.key) or "")
+    if not is_snowflake(role_id) or role_id == guild:  # never @everyone
+        return _say("아직 준비 중인 버튼입니다. 잠시 뒤 다시 눌러 주세요."), "not_ready"
     if token_problem(token):
         return _say("지금은 바꾸지 못했습니다. 잠시 뒤 다시 눌러 주세요."), "no_token"
 
@@ -155,11 +166,12 @@ def handler(event, context):
 
     try:
         cfg = json.loads(values[DISCORD_ROLES_PARAM] or "{}")
-        response, outcome = handle(payload, cfg, clean_token(values[DISCORD_TOKEN_PARAM]))
+        response, outcome = handle(payload, cfg, clean_token(values[DISCORD_TOKEN_PARAM]),
+                                   reload=lambda: json.loads(params.get(DISCORD_ROLES_PARAM, ttl_s=0) or "{}"))
     except Exception as e:  # noqa: BLE001 - a signed click always gets a polite answer, never a 500
         log("interaction_error", error=type(e).__name__)
         response, outcome = _say("지금은 바꾸지 못했습니다. 잠시 뒤 다시 눌러 주세요."), "error"
     log("interaction", outcome=outcome)
-    failed = outcome in ("role_failed", "no_token", "error")
+    failed = outcome in ("role_failed", "no_token", "not_ready", "error")
     metrics(InteractionOk=0 if failed else 1, InteractionFailed=1 if failed else 0)
     return _http(200, response)

@@ -36,21 +36,37 @@ from kwcampus.topics import TOPICS
 
 REGION = "ap-northeast-2"
 
+KICK_MEMBERS = 1 << 1
+BAN_MEMBERS = 1 << 2
 ADMINISTRATOR = 1 << 3
 MANAGE_CHANNELS = 1 << 4
+MANAGE_GUILD = 1 << 5
 VIEW_CHANNEL = 1 << 10
 SEND_MESSAGES = 1 << 11
+MANAGE_MESSAGES = 1 << 13
 EMBED_LINKS = 1 << 14
 READ_MESSAGE_HISTORY = 1 << 16
 MENTION_EVERYONE = 1 << 17  # also "mention any role"; granted to the bot only inside notice channels
+MANAGE_NICKNAMES = 1 << 27
 MANAGE_ROLES = 1 << 28
+MANAGE_WEBHOOKS = 1 << 29
+MANAGE_GUILD_EXPRESSIONS = 1 << 30
 CREATE_PUBLIC_THREADS = 1 << 35
 CREATE_PRIVATE_THREADS = 1 << 36
 SEND_MESSAGES_IN_THREADS = 1 << 38
+MODERATE_MEMBERS = 1 << 40
 
 PERMISSION_NAMES = {
     ADMINISTRATOR: "관리자(Administrator)",
+    KICK_MEMBERS: "멤버 추방(Kick Members)",
+    BAN_MEMBERS: "멤버 차단(Ban Members)",
+    MANAGE_GUILD: "서버 관리(Manage Server)",
     MANAGE_CHANNELS: "채널 관리(Manage Channels)",
+    MANAGE_MESSAGES: "메시지 관리(Manage Messages)",
+    MANAGE_NICKNAMES: "별명 관리(Manage Nicknames)",
+    MANAGE_WEBHOOKS: "웹후크 관리(Manage Webhooks)",
+    MANAGE_GUILD_EXPRESSIONS: "이모지·스티커 관리(Manage Expressions)",
+    MODERATE_MEMBERS: "멤버 타임아웃(Moderate Members)",
     VIEW_CHANNEL: "채널 보기(View Channels)",
     SEND_MESSAGES: "메시지 보내기(Send Messages)",
     EMBED_LINKS: "링크 첨부(Embed Links)",
@@ -61,25 +77,33 @@ PERMISSION_NAMES = {
     CREATE_PRIVATE_THREADS: "비공개 스레드 만들기(Create Private Threads)",
     SEND_MESSAGES_IN_THREADS: "스레드에서 메시지 보내기(Send Messages in Threads)",
 }
+# What a stolen bot token must not be able to do; the bot should never hold these.
+DANGEROUS = (ADMINISTRATOR | KICK_MEMBERS | BAN_MEMBERS | MANAGE_GUILD | MANAGE_MESSAGES | MANAGE_NICKNAMES
+             | MANAGE_WEBHOOKS | MANAGE_GUILD_EXPRESSIONS | MODERATE_MEMBERS)
 
-# Members read notice channels but never write in them.
-EVERYONE_ALLOW = VIEW_CHANNEL | READ_MESSAGE_HISTORY
+# Members read notice channels but never write in them. View is never forced: a channel or category
+# hidden from @everyone (behind a verified role) stays hidden.
+EVERYONE_ALLOW = READ_MESSAGE_HISTORY
 EVERYONE_DENY = SEND_MESSAGES | CREATE_PUBLIC_THREADS | CREATE_PRIVATE_THREADS | SEND_MESSAGES_IN_THREADS
 BOT_ALLOW = VIEW_CHANNEL | SEND_MESSAGES | EMBED_LINKS | READ_MESSAGE_HISTORY
 # What the bot keeps at server level once setup is done (buttons need Manage Roles).
 BOT_RUNTIME = VIEW_CHANNEL | SEND_MESSAGES | EMBED_LINKS | READ_MESSAGE_HISTORY | MANAGE_ROLES
+ONLY_MENTIONS = 1  # guild default_message_notifications: 0 = all messages, 1 = only @mentions
 
 NOTICE_CHANNEL_KEYS = ("notice", "academic", "scholarship", "career", "international")
 MENU_CHANNEL = "알림-설정"
 MENU_TOPIC = "버튼을 눌러 받고 싶은 공지 알림을 고르세요. 이 채널에는 봇만 글을 씁니다."
 DEPARTMENT_CHANNEL = "학과-공지"
-DEPARTMENT_TOPIC = "인공지능융합대학·전자정보공과대학 학과 공지. 봇만 글을 씁니다."
+DEPARTMENT_TOPIC = "단과대·학과 게시판과 학과 블로그 공지. 봇만 글을 씁니다."
 TEXT_CHANNEL = 0
 NEW = "<새로 만듦>"
 
 
 def names(bits: int) -> str:
-    return ", ".join(name for bit, name in PERMISSION_NAMES.items() if bits & bit) or "없음"
+    known = [name for bit, name in PERMISSION_NAMES.items() if bits & bit]
+    if unknown := bits & ~sum(PERMISSION_NAMES):
+        known.append(f"기타 권한 비트 {hex(unknown)}")
+    return ", ".join(known) or "없음"
 
 
 class DiscordAPI:
@@ -150,6 +174,7 @@ class Setup:
         self.api, self.ssm, self.apply, self.department, self.out = api, ssm, apply, department, out
         self.changes = 0
         self.needed = MANAGE_ROLES  # server-level bot permissions this run needs
+        self.ssm_failed = False
 
     def step(self, mark: str, text: str) -> None:
         if mark in "+~":
@@ -182,6 +207,10 @@ class Setup:
         mode = "적용(--apply)" if self.apply else "계획만 보기(dry-run)"
         self.out(f"Discord 서버: {guild.get('name')} ({guild_id}) · 봇: {me.get('username')} ({bot_id}) · {mode}")
 
+        if (everyone | own) & ADMINISTRATOR and self.apply:
+            self._report_permissions(everyone, own, guild)
+            self.out("\n중단: 관리자 권한이 있는 봇으로는 아무것도 바꾸지 않습니다. 봇 역할에서 관리자를 끄고 다시 실행하세요.")
+            return 2
         role_ids = self._roles(guild_id, roles, saved, top)
         if role_ids is None:
             self.out("\n중단: 위 역할 문제를 고치기 전에는 아무것도 바꾸지 않습니다.")
@@ -190,15 +219,52 @@ class Setup:
         targets, menu_channel, dept_channel = self._channels(guild_id, bot_id, notice, channels_cfg, saved, by_id,
                                                              channels)
         self._permissions(guild_id, bot_id, targets, by_id)
+        # The role map goes in before the buttons change, so no button points at a role the Lambda can't see.
+        self.out("\n[SSM]")
+        known_message = (saved.get("menu") or {}).get("message") if (saved.get("menu") or {}).get(
+            "channel") == menu_channel else None
+        roles_value = {**saved, "guild": guild_id, "roles": role_ids,
+                       "menu": {"channel": menu_channel, "message": known_message}}
+        self._put_if_changed(DISCORD_ROLES_PARAM, saved, roles_value, quiet_if_same=False)
         message_id = self._menu(menu_channel, bot_id, saved)
-        self._ssm(guild_id, role_ids, menu_channel, message_id, saved, channels_cfg, dept_channel)
-        self._report_permissions(everyone, own)
+        if message_id != known_message:
+            final = {**roles_value, "menu": {"channel": menu_channel, "message": message_id}}
+            self._put_if_changed(DISCORD_ROLES_PARAM, roles_value, final, label="(버튼 메시지 ID)")
+        if self.department:
+            if channels_cfg.get("department") == dept_channel:
+                self.step("=", f"{DISCORD_CHANNELS_PARAM} department 그대로")
+            else:
+                self._put_if_changed(DISCORD_CHANNELS_PARAM, channels_cfg, {**channels_cfg, "department": dept_channel},
+                                     label="(학과 공지가 #학과-공지로 감)")
+        self._report_permissions(everyone, own, guild)
 
+        if self.ssm_failed:
+            self.out("\n일부 SSM 값을 쓰지 못했습니다. 위의 aws 명령을 직접 실행해 주세요.")
+            return 1
         if self.apply:
             self.out(f"\n완료: {self.changes}건 바꿨습니다." if self.changes else "\n바꿀 것이 없습니다.")
         else:
             self.out(f"\ndry-run: 아무것도 바꾸지 않았습니다. 바뀔 항목 {self.changes}건. 적용하려면 --apply")
         return 0
+
+    def _put_if_changed(self, name: str, before: dict, after: dict, label: str = "", quiet_if_same: bool = True):
+        if after == before:
+            if not quiet_if_same:
+                self.step("=", f"{name} 그대로")
+            return
+        value = json.dumps(after, ensure_ascii=False)
+        self.step("~", f"{name} {label} ← {value}".replace("  ", " "))
+        if not self.apply:
+            return
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            self.ssm.put_parameter(Name=name, Type="String", Overwrite=True, Value=value)
+        except (BotoCoreError, ClientError) as e:
+            self.ssm_failed = True  # no secret in this value, so the command can be shown
+            self.step("!", f"{name}을 쓰지 못했습니다({type(e).__name__}). SSM 쓰기 권한이 있는 자격 증명으로 실행하세요:")
+            self.out(f"    aws ssm put-parameter --region {REGION} --name {name} --type String --overwrite "
+                     f"--value '{value}'")
 
     def _roles(self, guild_id: str, roles: list[dict], saved: dict, top: int) -> dict[str, str] | None:
         """Topic → role id. None (and nothing written) when an existing role is unsafe to hand out:
@@ -224,34 +290,61 @@ class Setup:
                     role = self.api.call("POST", f"/guilds/{guild_id}/roles", {
                         "name": topic.role, "permissions": "0", "mentionable": False, "hoist": False})
                 ids[topic.key] = str(role["id"]) if role else NEW
-            elif role["name"] != topic.role:
+                continue
+            ids[topic.key] = str(role["id"])
+            fix, what = {}, []
+            if role["name"] != topic.role:
                 # a renamed college (2028: 참빛인재대학 → 산업융합대학) is one line in topics.TOPICS
-                ids[topic.key] = str(role["id"])
-                self.step("~", f"'{role['name']}' → '{topic.role}' 이름 바꾸기 ({role['id']})")
+                fix["name"] = topic.role
+                what.append(f"'{role['name']}' → '{topic.role}' 이름 바꾸기")
+            if role.get("mentionable"):
+                # a mentionable role lets any member ping every subscriber
+                fix["mentionable"] = False
+                what.append(f"'{role['name']}' 멤버 멘션 끄기")
+            if fix:
+                self.step("~", f"{', '.join(what)} ({role['id']})")
                 if self.apply:
-                    self.api.call("PATCH", f"/guilds/{guild_id}/roles/{role['id']}", {"name": topic.role})
+                    self.api.call("PATCH", f"/guilds/{guild_id}/roles/{role['id']}", fix)
             else:
-                ids[topic.key] = str(role["id"])
                 self.step("=", f"'{role['name']}' 있음 ({role['id']})")
         return ids
 
-    def _find_or_create(self, guild_id: str, notice: dict, name: str, topic: str, known_id: str | None,
-                        by_id: dict, channels: list[dict], overwrites: list) -> tuple[str, bool]:
+    def _new_overwrites(self, parent: dict | None, guild_id: str, bot_id: str, mention: bool) -> list[dict]:
+        """A new channel starts from its category's overwrites (a verified-role gate stays), plus ours."""
+        base = {str(o["id"]): o for o in (parent or {}).get("permission_overwrites") or []}
+        out = []
+        for oid, kind, allow, deny, _who in _overwrites_for(guild_id, bot_id, mention):
+            new_allow, new_deny = _merge(base.pop(oid, None), allow, deny)
+            out.append({"id": oid, "type": kind, "allow": str(new_allow), "deny": str(new_deny)})
+        out += [{"id": str(o["id"]), "type": o["type"], "allow": str(o["allow"]), "deny": str(o["deny"])}
+                for o in base.values()]
+        for o in out:
+            self.needed |= int(o["allow"]) | int(o["deny"])
+        return out
+
+    def _find_or_create(self, guild_id: str, bot_id: str, notice: dict, name: str, topic: str,
+                        known_id: str | None, by_id: dict, channels: list[dict], mention: bool) -> tuple[str, bool]:
+        parent_id = notice.get("parent_id")
+        # by its saved id, else by name next to #학교-공지 only (never adopt a same-named channel elsewhere)
         channel = by_id.get(str(known_id)) or next(
-            (c for c in channels if c.get("name") == name and c.get("type") == TEXT_CHANNEL), None)
+            (c for c in channels if c.get("name") == name and c.get("type") == TEXT_CHANNEL
+             and c.get("parent_id") == parent_id), None)
         if channel:
             self.step("=", f"#{channel['name']} 있음 ({channel['id']})")
+            if channel.get("topic") != topic:
+                self.needed |= MANAGE_CHANNELS
+                self.step("~", f"#{channel['name']} 채널 주제 고치기: {topic}")
+                if self.apply:
+                    self.api.call("PATCH", f"/channels/{channel['id']}", {"topic": topic})
             return str(channel["id"]), False
         self.needed |= MANAGE_CHANNELS
-        for *_, allow, deny, _who in overwrites:
-            self.needed |= allow | deny
-        self.step("+", f"#{name} 만들기 (#{notice.get('name')} 채널과 같은 분류, 읽기 전용 권한 포함)")
+        overwrites = self._new_overwrites(by_id.get(str(parent_id)), guild_id, bot_id, mention)
+        self.step("+", f"#{name} 만들기 (#{notice.get('name')} 채널과 같은 분류, 그 분류의 권한 + 읽기 전용)")
         if not self.apply:
             return NEW, True
         made = self.api.call("POST", f"/guilds/{guild_id}/channels", {
-            "name": name, "type": TEXT_CHANNEL, "topic": topic, "parent_id": notice.get("parent_id"),
-            "permission_overwrites": [{"id": oid, "type": kind, "allow": str(allow), "deny": str(deny)}
-                                      for oid, kind, allow, deny, _ in overwrites]})
+            "name": name, "type": TEXT_CHANNEL, "topic": topic, "parent_id": parent_id,
+            "permission_overwrites": overwrites})
         by_id[str(made["id"])] = made
         return str(made["id"]), True
 
@@ -266,23 +359,29 @@ class Setup:
                 continue
             self.step("=", f"#{by_id[cid]['name']} ({key})")
             targets.append((by_id[cid]["name"], cid, True, False))
-        menu_id, created = self._find_or_create(
-            guild_id, notice, MENU_CHANNEL, MENU_TOPIC, (saved.get("menu") or {}).get("channel"), by_id, channels,
-            _overwrites_for(guild_id, bot_id, mention=False))
+        menu_id, created = self._find_or_create(guild_id, bot_id, notice, MENU_CHANNEL, MENU_TOPIC,
+                                                (saved.get("menu") or {}).get("channel"), by_id, channels, False)
         targets.append((MENU_CHANNEL, menu_id, False, created))
+        configured = str(channels_cfg.get("department") or "")
         if self.department:
-            dept_id, created = self._find_or_create(
-                guild_id, notice, DEPARTMENT_CHANNEL, DEPARTMENT_TOPIC, channels_cfg.get("department"), by_id,
-                channels, _overwrites_for(guild_id, bot_id, mention=True))
+            dept_id, created = self._find_or_create(guild_id, bot_id, notice, DEPARTMENT_CHANNEL, DEPARTMENT_TOPIC,
+                                                    configured or None, by_id, channels, True)
             targets.append((DEPARTMENT_CHANNEL, dept_id, True, created))
-        elif channels_cfg.get("department"):
-            self.step("=", f"학과 공지 채널 ({channels_cfg['department']})")
+        elif configured in by_id:
+            # set by hand: still read-only, and the bot may mention college roles there
+            dept_id = configured
+            self.step("=", f"#{by_id[configured]['name']} (department)")
+            targets.append((by_id[configured]["name"], configured, True, False))
+        elif configured:
+            self.step("!", f"{DISCORD_CHANNELS_PARAM}의 'department' 채널({configured})을 서버에서 찾지 못했습니다. "
+                           "학과 공지가 가지 않습니다. --department-channel로 다시 만들 수 있습니다.")
         else:
             self.step("=", "학과 공지는 계속 #학교-공지로 갑니다 (--department-channel로 #학과-공지를 만들 수 있음)")
         return targets, menu_id, dept_id
 
     def _permissions(self, guild_id: str, bot_id: str, targets: list, by_id: dict) -> None:
-        self.out("\n[채널 권한] @everyone: 보기·기록 보기 허용, 메시지·스레드 거부 / 봇: 보기·보내기·링크 첨부·기록 보기 허용")
+        self.out("\n[채널 권한] @everyone: 기록 보기 허용, 메시지·스레드 거부(보기는 건드리지 않음) / "
+                 "봇: 보기·보내기·링크 첨부·기록 보기 허용")
         for label, cid, mention, created in targets:
             if created:
                 continue  # made with the right overwrites just now (or in this plan)
@@ -290,8 +389,9 @@ class Setup:
             for oid, kind, allow, deny, who in _overwrites_for(guild_id, bot_id, mention):
                 old = existing.get(oid)
                 if who == "@everyone" and old and int(old["deny"]) & VIEW_CHANNEL:
-                    allow &= ~VIEW_CHANNEL  # a channel hidden on purpose (behind a verified role) stays hidden
-                    self.step("!", f"#{label}: @everyone에게 숨겨진 채널이라 보기 권한은 그대로 둡니다.")
+                    self.step("=", f"#{label}: @everyone에게 숨겨진 채널입니다(그대로 둠).")
+                if who == "봇" and old and (risky := int(old["allow"]) & DANGEROUS & ~allow):
+                    self.step("!", f"#{label}의 봇 덮어쓰기에 필요 없는 권한이 있습니다: {names(risky)}. 채널 설정에서 빼 주세요.")
                 new_allow, new_deny = _merge(old, allow, deny)
                 if old and (int(old["allow"]), int(old["deny"])) == (new_allow, new_deny):
                     self.step("=", f"#{label} {who}: 이미 맞음")
@@ -330,42 +430,28 @@ class Setup:
                 self.api.call("PATCH", f"/channels/{channel_id}/messages/{current['id']}", want)
         return str(current["id"])
 
-    def _ssm(self, guild_id, role_ids, menu_channel, message_id, saved, channels_cfg, dept_id) -> None:
-        self.out("\n[SSM]")
-        new = {"guild": guild_id, "roles": role_ids, "menu": {"channel": menu_channel, "message": message_id}}
-        if new == saved:
-            self.step("=", f"{DISCORD_ROLES_PARAM} 그대로")
-        else:
-            self.step("~", f"{DISCORD_ROLES_PARAM} ← {json.dumps(new, ensure_ascii=False)}")
-            if self.apply:
-                self.ssm.put_parameter(Name=DISCORD_ROLES_PARAM, Type="String", Overwrite=True,
-                                       Value=json.dumps(new, ensure_ascii=False))
-        if self.department:
-            if channels_cfg.get("department") == dept_id:
-                self.step("=", f"{DISCORD_CHANNELS_PARAM} department 그대로")
-            else:
-                self.step("~", f"{DISCORD_CHANNELS_PARAM}에 department={dept_id} 추가 (학과 공지가 #학과-공지로 감)")
-                if self.apply:
-                    self.ssm.put_parameter(Name=DISCORD_CHANNELS_PARAM, Type="String", Overwrite=True,
-                                           Value=json.dumps({**channels_cfg, "department": dept_id}))
-
-    def _report_permissions(self, everyone: int, own: int) -> None:
+    def _report_permissions(self, everyone: int, own: int, guild: dict) -> None:
         """everyone: the @everyone role's server permissions; own: the bot's own roles'."""
         self.out("\n[봇 권한]")
         perms = everyone | own
         if perms & ADMINISTRATOR:
-            self.step("!", "봇에 관리자 권한이 있습니다. 서버 설정 → 역할 → 봇 역할에서 꺼 주세요.")
-            return
+            self.step("!", "봇에 관리자 권한이 있습니다. 서버 설정 → 역할 → 봇 역할에서 꺼 주세요. --apply는 그 전까지 멈춥니다.")
+        if risky := own & DANGEROUS & ~ADMINISTRATOR:
+            self.step("!", f"봇 역할에 필요 없는 위험한 권한이 있습니다: {names(risky)}. 꺼 주세요.")
         if missing := self.needed & ~perms:
             self.step("!", f"--apply 전에 봇 역할에 잠시 켜 둘 권한: {names(missing)}")
         if missing_runtime := BOT_RUNTIME & ~perms:
             self.step("!", f"버튼·알림에 계속 필요한 권한이 없습니다: {names(missing_runtime)}")
-        if extra := own & ~BOT_RUNTIME & sum(PERMISSION_NAMES):
+        if extra := own & ~BOT_RUNTIME & ~DANGEROUS:
             self.step("=", f"설정이 끝나면 봇 역할에서 꺼도 되는 권한: {names(extra)}")
         self.step("=", f"봇 역할에 계속 둘 권한: {names(BOT_RUNTIME)} (값 {BOT_RUNTIME})")
         if everyone & MENTION_EVERYONE:
             self.step("!", "@everyone 역할에 '@everyone·모든 역할 멘션'이 켜져 있어 멤버 누구나 @everyone과 구독 역할을 "
-                           "멘션할 수 있습니다. 서버 설정 → 역할 → @everyone에서 끄는 것을 권합니다(봇은 공지 채널에서 따로 허용됨).")
+                           "멘션할 수 있습니다. --apply 뒤에 서버 설정 → 역할 → @everyone에서 끄는 것을 권합니다"
+                           "(봇은 공지 채널에서 따로 허용됨).")
+        if int(guild.get("default_message_notifications", 0)) != ONLY_MENTIONS:
+            self.step("!", "서버 기본 알림이 '모든 메시지'입니다. 그대로면 멤버가 모든 공지와 수정 답글에 알림을 받습니다. "
+                           "서버 설정 → 개요 → 기본 알림 설정을 '@멘션만'으로 바꿔 주세요.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -391,6 +477,9 @@ def main(argv: list[str] | None = None) -> int:
         return Setup(DiscordAPI(token), ssm, apply=args.apply, department=args.department_channel).run()
     except (RuntimeError, NotFound) as e:
         print(f"! 중단: {e}")
+        return 1
+    except (BotoCoreError, ClientError) as e:
+        print(f"! 중단: SSM 오류 ({type(e).__name__}). 자격 증명과 권한을 확인하세요.")
         return 1
 
 

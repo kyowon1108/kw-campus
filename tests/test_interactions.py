@@ -93,14 +93,22 @@ def test_button_turns_its_role_on_and_off():
 
 def test_buttons_never_touch_any_other_role():
     send = Recorder()
-    for custom_id in ("kwsub:700000000000000009", "kwsub:", "kwsub:scholarship",  # unmapped topic
-                      "admin", "kwsub:academic/../../roles/1", "kwsub:__class__"):
+    for custom_id in ("kwsub:700000000000000009", "kwsub:", "admin", "kwsub:academic/../../roles/1",
+                      "kwsub:__class__"):
         _, outcome = interactions.handle(click(custom_id), CFG, TOKEN, send)
         assert outcome == "unknown_button"
+    # a known topic without a role yet (setup just ran): the map is re-read once, then "not ready"
+    reads = []
+    response, outcome = interactions.handle(click("kwsub:scholarship"), CFG, TOKEN, send,
+                                            reload=lambda: reads.append(1) or CFG)
+    assert outcome == "not_ready" and reads == [1] and "준비 중" in response["data"]["content"]
+    _, outcome = interactions.handle(click("kwsub:scholarship"), CFG, TOKEN, send,
+                                     reload=lambda: {**CFG, "roles": {"scholarship": "700000000000000002"}})
+    assert outcome == "on" and send.calls.pop()[1].endswith("/roles/700000000000000002")
     # a role map pointing at @everyone is ignored
     _, outcome = interactions.handle(click("kwsub:academic"), {"guild": GUILD, "roles": {"academic": GUILD}},
                                      TOKEN, send)
-    assert outcome == "unknown_button"
+    assert outcome == "not_ready"
     # another server, or no member (a DM)
     assert interactions.handle(click("kwsub:academic", guild="42"), CFG, TOKEN, send)[1] == "wrong_guild"
     dm = {**click("kwsub:academic"), "member": None, "user": {"id": USER}}
@@ -125,14 +133,14 @@ def test_discord_trouble_gets_a_polite_ephemeral_answer():
 
 
 def test_handler_wires_ssm_values(params, monkeypatch):
-    monkeypatch.setattr(interactions, "handle", lambda p, cfg, token: (
+    monkeypatch.setattr(interactions, "handle", lambda p, cfg, token, **kw: (
         {"type": 4, "data": {"content": f"{cfg['guild']}:{token}"}}, "x"))
     response = interactions.handler(signed_event(click("kwsub:academic")), None)
     assert json.loads(response["body"])["data"]["content"] == f"{GUILD}:{TOKEN}"
 
 
 def test_handler_answers_politely_whatever_breaks(params, monkeypatch):
-    def boom(payload, cfg, token):
+    def boom(payload, cfg, token, **kw):
         raise ConnectionResetError("peer reset")
 
     monkeypatch.setattr(interactions, "handle", boom)
@@ -153,3 +161,16 @@ def test_menu_has_a_button_per_topic_in_rows_of_five():
     assert all({c["custom_id"] in colleges for c in row} in ({True}, {False}) for row in rows)
     assert all(c["style"] == 2 for row in rows for c in row if c["custom_id"] in colleges)
     assert menu["allowed_mentions"] == {"parse": []}
+
+
+def test_a_huge_timestamp_is_just_rejected(params):
+    event = signed_event({"type": 1})
+    event["headers"]["X-Signature-Timestamp"] = "9" * 400
+    assert interactions.handler(event, None)["statusCode"] == 401
+    assert not interactions.verify(PUBLIC_HEX, "00" * 64, "１２３", b"{}", time.time())  # full-width digits
+
+
+def test_a_public_key_put_in_by_hand_works_at_once(aws):
+    assert interactions.handler(signed_event({"type": 1}), None)["statusCode"] == 401  # not there yet
+    aws["ssm"].put_parameter(Name="/kw/discord/public-key", Value=PUBLIC_HEX, Type="String")
+    assert interactions.handler(signed_event({"type": 1}), None)["statusCode"] == 200  # the miss wasn't cached

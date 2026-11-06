@@ -4,7 +4,9 @@ from kwcampus.routing import (
     TOPIC_BY_KEY,
     TOPICS,
     is_urgent,
+    name_risk,
     topic_for,
+    urgent_source,
 )
 
 
@@ -56,3 +58,26 @@ def test_urgent_titles_and_their_look_alikes():
     ]
     assert [t for t in urgent if not is_urgent(t)] == []
     assert [t for t in calm if is_urgent(t)] == []
+
+
+def test_the_review_probe_titles():
+    noisy = ["[긴급] 근로장학생 추가 모집", "[긴급] 학부연구생 모집", "긴급 안내: 국가장학금 2차 신청 마감 임박",
+             "휴강 및 보강 계획서 제출 안내(교원용)", "추석 연휴 휴강", "개교기념일 휴강", "감염병 통제 지침",
+             "출입통제시스템 교체 공사", "KLAS 서비스 중단(정기점검 11/15 02:00)", "도서관 전산 장애인 지원", "정보통제 보안교육"]
+    real = ["수업 비대면 전환", "중간고사 고사실 변경", "시험 장소 변경", "화재로 새빛관 폐쇄", "셔틀버스 운행 중단",
+            "KLAS 접속 불가", "Wi-Fi 장애", "결강"]
+    assert [t for t in noisy if is_urgent(t)] == []
+    assert [t for t in real if not is_urgent(t)] == []
+
+
+def test_urgent_is_for_school_wide_sources_only():
+    assert urgent_source("general") and urgent_source("academic") and urgent_source("job")
+    assert not urgent_source("dept-ee") and not urgent_source("dept-media") and not urgent_source("dept-aicon")
+    assert not urgent_source("faq")
+
+
+def test_titles_that_may_carry_a_name():
+    assert name_risk("general", "장학생 홍*동 외 3명") and name_risk("dept-ee", "이○○ 동문 특강")
+    assert name_risk("dept-biz", "2026 경영경진대회 수상자 명단") and name_risk("dept-media", "故 교수 부고")
+    assert not name_risk("general", "2026학년도 국가장학금 선발 결과 안내")  # school-wide titles carry no names
+    assert not name_risk("dept-ee", "[필독*] 수강신청 안내") and not name_risk("dept-ee", "제○회 학술제")

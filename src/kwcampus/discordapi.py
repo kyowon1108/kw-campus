@@ -13,7 +13,7 @@ import urllib.request
 from kwcampus.fetch import TLS
 
 API = "https://discord.com/api/v10"
-USER_AGENT = "DiscordBot (https://github.com/kyowon1108/kw-notice-mcp, 0.1)"
+USER_AGENT = "DiscordBot (https://github.com/kyowon1108/kw-campus, 1.0)"
 # Three base64url parts joined by dots. Anything else (a newline, a space, the wrong text pasted)
 # is refused before it can reach an HTTP header, where http.client would echo it into an error.
 _TOKEN = re.compile(r"[A-Za-z0-9_\-]{17,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{20,}")
@@ -21,6 +21,14 @@ _TOKEN = re.compile(r"[A-Za-z0-9_\-]{17,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{20
 
 class RetryLater(Exception):
     """Discord asked us to slow down or failed transiently; let SQS redeliver."""
+
+
+class RateLimited(RetryLater):
+    """429: Discord says how long to wait (seconds)."""
+
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class NotFound(Exception):
@@ -45,6 +53,13 @@ def is_snowflake(value: object) -> bool:
     return text.isascii() and text.isdigit() and 0 < len(text) <= 21
 
 
+def _retry_after(e: urllib.error.HTTPError) -> float:
+    try:
+        return float((json.loads(e.read() or b"{}") or {}).get("retry_after") or e.headers.get("Retry-After") or 1)
+    except (ValueError, TypeError, AttributeError):
+        return 1.0
+
+
 def call(method: str, path: str, token: str, body: dict | None = None, timeout: float = 10) -> dict:
     if body is None and method not in ("GET", "DELETE"):
         body = {}  # PUT/POST/PATCH always carry a JSON body (and a Content-Length)
@@ -60,7 +75,9 @@ def call(method: str, path: str, token: str, body: dict | None = None, timeout: 
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise NotFound(f"discord 404 on {method}") from None
-        if e.code == 429 or e.code >= 500:
+        if e.code == 429:
+            raise RateLimited("discord 429", _retry_after(e)) from None
+        if e.code >= 500:
             raise RetryLater(f"discord {e.code}") from None
         raise RuntimeError(f"discord {e.code} on {method}") from None
     except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
