@@ -15,16 +15,26 @@ def snowflake(when: datetime) -> str:
 
 
 class FakeDiscord:
-    """Records calls; POSTs get message ids made at the given clock time."""
+    """Records calls; POSTs become messages with ids made at the given clock time (GET lists them)."""
 
     def __init__(self, clock):
-        self.clock, self.calls, self.fail = clock, [], None
+        self.clock, self.calls, self.fail, self.messages = clock, [], None, []
+        self.during_post = None  # called inside a POST, before it returns
 
     def __call__(self, method, path, token, body=None, timeout=10):
         if self.fail:
             raise self.fail
+        if method == "GET":
+            return list(reversed(self.messages))
         self.calls.append((method, path, body))
-        return {"id": snowflake(self.clock())} if method == "POST" else {}
+        if method != "POST":
+            return {}
+        message = {"id": str(int(snowflake(self.clock())) + len(self.messages)), **body}
+        self.messages.append(message)
+        if self.during_post:
+            hook, self.during_post = self.during_post, None
+            hook()
+        return {"id": message["id"]}
 
 
 def stream(event, new, old=None):
@@ -182,11 +192,11 @@ def test_post_mentions_only_its_topic_role_and_not_at_night(aws):
     assert body["content"].endswith("\n<@&777>")
     assert body["allowed_mentions"] == {"parse": [], "roles": ["777"]}
 
-    # the edit keeps the role in the text but never pings
+    # the edit keeps the role in the text (and as a mention: edits notify nobody)
     retitle(aws, "제목 수정")
     run(aws, EDIT, fake, DAY + timedelta(minutes=5), ROLES)
     _, _, body = fake.calls[-1]
-    assert body["content"].endswith("\n<@&777>") and body["allowed_mentions"] == {"parse": []}
+    assert body["content"].endswith("\n<@&777>") and body["allowed_mentions"] == {"parse": [], "roles": ["777"]}
 
     for hour in (22, 23, 0, 7):  # 22:00-08:00 KST: no mention
         item = {**NOTICE, "SK": f"N#{hour}"}
@@ -278,3 +288,76 @@ def test_urgent_notices_also_ping_the_urgent_role_even_at_night(aws):
     aws["public"].put_item(Item=quiet_item)
     run(aws, {**JOB, "key": {"PK": item["PK"], "SK": "N#quiet"}}, fake, night, {"academic": "777"})
     assert fake.calls[-1][2]["allowed_mentions"] == {"parse": []}
+
+
+def test_a_duplicate_job_while_the_first_is_posting_does_not_post_again(aws):
+    aws["public"].put_item(Item=NOTICE)
+    fake = FakeDiscord(lambda: DAY)
+    second = []
+    fake.during_post = lambda: second.append(run(aws, JOB, fake, DAY + timedelta(seconds=2), ROLES))
+    assert run(aws, JOB, fake, DAY, ROLES) == "posted"
+    assert second == ["already_posted"]
+    assert [m for m, _, _ in fake.calls] == ["POST"]
+    body = fake.calls[0][2]
+    assert body["enforce_nonce"] is True and len(body["nonce"]) <= 25
+
+
+def test_a_post_that_died_mid_claim_is_taken_over_after_the_stale_window(aws):
+    aws["public"].put_item(Item=NOTICE)
+    dead = FakeDiscord(lambda: DAY)
+    dead.fail = discord.RetryLater("discord unreachable")
+    with pytest.raises(discord.RetryLater):
+        run(aws, JOB, dead, DAY)
+    fake = FakeDiscord(lambda: DAY)
+    assert run(aws, JOB, fake, DAY + timedelta(seconds=30)) == "already_posted"  # maybe still in flight
+    assert run(aws, JOB, fake, DAY + timedelta(minutes=3)) == "posted"  # SQS retry after the timeout
+
+
+def test_a_reply_whose_answer_was_lost_is_not_posted_twice(aws):
+    aws["public"].put_item(Item=NOTICE)
+    clock = [DAY]
+    fake = FakeDiscord(lambda: clock[0])
+    run(aws, JOB, fake, DAY)
+    retitle(aws, "제목 수정")
+
+    when = DAY + timedelta(hours=1)
+    clock[0] = when
+
+    def lose_the_answer():
+        raise discord.RetryLater("discord unreachable")  # Discord made the reply; we never heard back
+
+    fake.during_post = lose_the_answer
+    with pytest.raises(discord.RetryLater):
+        run(aws, EDIT, fake, when)
+    assert run(aws, EDIT, fake, when + timedelta(minutes=3)) == "edited_replied"  # found, not re-posted
+    replies = [m for m in fake.messages if "message_reference" in m]
+    assert len(replies) == 1
+    record = aws["delivery"].get_item(Key={"PK": f"{NOTICE['PK']}|{NOTICE['SK']}", "SK": "CH#academic"})["Item"]
+    assert record["reply_state"] == "sent" and record["reply_message_id"] == replies[0]["id"]
+
+
+def test_tokens_are_checked_strictly_and_never_echoed(monkeypatch):
+    real = "MTIzNDU2Nzg5MDEyMzQ1Njc4.GabcDE.fake_token_value_for_tests_only_xx"
+    assert discordapi.token_problem(discordapi.clean_token(f"\n{real}\n")) is None
+    for bad in (None, "", "토큰 복사 안 됨", f"{real}\nX", "a.b.c", real.replace(".", " ")):
+        assert discordapi.token_problem(bad), bad
+
+    def header_error(request, timeout, context):
+        raise ValueError(f"Invalid header value b'Bot {real}\\n'")
+
+    monkeypatch.setattr(discordapi.urllib.request, "urlopen", header_error)
+    with pytest.raises(RuntimeError) as e:
+        discordapi.call("POST", "/channels/1/messages", real, {"content": "x"})
+    assert real not in str(e.value)
+
+
+def test_handler_never_mentions_the_everyone_role(aws, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(discord, "handle_job", lambda job, p, d, token, channels, roles: seen.update(roles) or "x")
+    token = "MTIzNDU2Nzg5MDEyMzQ1Njc4.GabcDE.fake_token_value_for_tests_only_xx"
+    aws["ssm"].put_parameter(Name="/kw/discord/bot-token", Value=token + "\n", Type="SecureString")
+    aws["ssm"].put_parameter(Name="/kw/discord/roles", Type="String", Value=json.dumps(
+        {"guild": "100", "roles": {"academic": "100", "career": "777", "general": "x1"}}))
+    event = {"Records": [{"messageId": "m1", "body": json.dumps(JOB)}]}
+    assert discord.handler(event, None) == {"batchItemFailures": []}  # trailing newline stripped
+    assert seen == {"career": "777"}

@@ -24,7 +24,13 @@ from kwcampus.config import (
     DISCORD_ROLES_PARAM,
     DISCORD_TOKEN_PARAM,
 )
-from kwcampus.discordapi import NotFound, RetryLater, token_problem
+from kwcampus.discordapi import (
+    NotFound,
+    RetryLater,
+    clean_token,
+    is_snowflake,
+    token_problem,
+)
 from kwcampus.discordapi import call as _discord
 from kwcampus.obs import log, metrics
 from kwcampus.topics import TOPIC_BY_KEY, TOPICS
@@ -35,7 +41,7 @@ EPHEMERAL = 1 << 6
 PREFIX = "kwsub:"  # button custom_id = PREFIX + topic key
 LIST_ID = "kwsub:list"
 MAX_BODY = 64 * 1024
-MAX_SKEW_S = 300  # a signed request older than this is a replay
+MAX_SKEW_S = 60  # a signed request older than this is a replay
 ROLE_TIMEOUT_S = 2.0  # Discord wants the answer within 3 s
 
 MENU_CONTENT = (
@@ -77,10 +83,6 @@ def verify(public_key_hex: str | None, signature_hex: str | None, timestamp: str
     return True
 
 
-def _snowflake(value: str) -> bool:
-    return value.isascii() and value.isdigit() and 0 < len(value) <= 21
-
-
 def _say(text: str) -> dict:
     return {"type": CHANNEL_MESSAGE, "data": {"content": text, "flags": EPHEMERAL, "allowed_mentions": {"parse": []}}}
 
@@ -95,7 +97,7 @@ def handle(payload: dict, cfg: dict, token: str | None, send=_discord) -> tuple[
     guild = str(payload.get("guild_id") or "")
     member = payload.get("member") or {}
     user = str((member.get("user") or {}).get("id") or "")
-    if not cfg.get("guild") or guild != str(cfg["guild"]) or not _snowflake(user):
+    if not cfg.get("guild") or guild != str(cfg["guild"]) or not is_snowflake(user):
         return _say("이 버튼은 공지 서버 안에서만 쓸 수 있습니다."), "wrong_guild"
     roles = cfg.get("roles") or {}
     have = {str(r) for r in member.get("roles") or []}
@@ -108,7 +110,7 @@ def handle(payload: dict, cfg: dict, token: str | None, send=_discord) -> tuple[
 
     topic = TOPIC_BY_KEY.get(custom_id.removeprefix(PREFIX)) if custom_id.startswith(PREFIX) else None
     role_id = str(roles.get(topic.key) or "") if topic else ""
-    if topic is None or not _snowflake(role_id) or role_id == guild:  # never @everyone
+    if topic is None or not is_snowflake(role_id) or role_id == guild:  # never @everyone
         return _say("이 버튼은 이제 쓰지 않습니다. 다른 버튼을 눌러 주세요."), "unknown_button"
     if token_problem(token):
         return _say("지금은 바꾸지 못했습니다. 잠시 뒤 다시 눌러 주세요."), "no_token"
@@ -138,7 +140,9 @@ def handler(event, context):
     except ValueError:
         return _http(400, {"error": "bad body"})
     headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
-    public_key = params.get(DISCORD_PUBLIC_KEY_PARAM, decrypt=True)
+    # one SSM call: the 3-second answer window includes a cold start
+    values = params.get_many([DISCORD_PUBLIC_KEY_PARAM, DISCORD_ROLES_PARAM, DISCORD_TOKEN_PARAM], decrypt=True)
+    public_key = values[DISCORD_PUBLIC_KEY_PARAM]
     if not verify(public_key, headers.get("x-signature-ed25519"), headers.get("x-signature-timestamp"),
                   raw, time.time()):
         log("interaction_rejected", reason="no_public_key" if not public_key else "bad_signature")
@@ -149,11 +153,13 @@ def handler(event, context):
     except ValueError:
         return _http(400, {"error": "bad json"})
 
-    cfg, token = {}, None
-    if payload.get("type") == MESSAGE_COMPONENT:
-        cfg = json.loads(params.get(DISCORD_ROLES_PARAM) or "{}")
-        token = params.get(DISCORD_TOKEN_PARAM, decrypt=True)
-    response, outcome = handle(payload, cfg, token)
+    try:
+        cfg = json.loads(values[DISCORD_ROLES_PARAM] or "{}")
+        response, outcome = handle(payload, cfg, clean_token(values[DISCORD_TOKEN_PARAM]))
+    except Exception as e:  # noqa: BLE001 - a signed click always gets a polite answer, never a 500
+        log("interaction_error", error=type(e).__name__)
+        response, outcome = _say("지금은 바꾸지 못했습니다. 잠시 뒤 다시 눌러 주세요."), "error"
     log("interaction", outcome=outcome)
-    metrics(InteractionOk=1)
+    failed = outcome in ("role_failed", "no_token", "error")
+    metrics(InteractionOk=0 if failed else 1, InteractionFailed=1 if failed else 0)
     return _http(200, response)

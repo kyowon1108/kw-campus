@@ -9,13 +9,13 @@ Nothing is sent while the /kw/collector/notify switch is off.
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 
 import boto3
 from boto3.dynamodb.types import TypeDeserializer
 
 from kwcampus import params
-from kwcampus.config import DISCORD_QUEUE_URL, NOTIFY_ENABLED_PARAM, PINNED_MAX_AGE
+from kwcampus.config import DISCORD_QUEUE_URL, KST, NOTIFY_ENABLED_PARAM, PINNED_MAX_AGE
 from kwcampus.obs import log, metrics
 from kwcampus.routing import channel_for
 
@@ -64,7 +64,7 @@ def handler(event, context):
     if not params.is_true(NOTIFY_ENABLED_PARAM):
         log("dispatch_skip", reason="notify_off", records=len(records))
         return {"batchItemFailures": []}
-    jobs = jobs_for(records, datetime.now(UTC).date())
+    jobs = jobs_for(records, datetime.now(KST).date())  # posted_date is a KST date
     sqs = boto3.client("sqs")
     for start in range(0, len(jobs), 10):
         batch = jobs[start : start + 10]

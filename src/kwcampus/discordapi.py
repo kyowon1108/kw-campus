@@ -6,6 +6,7 @@ No heavy imports: the button Lambda must answer within 3 s, cold start included.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 
@@ -13,6 +14,9 @@ from kwcampus.fetch import TLS
 
 API = "https://discord.com/api/v10"
 USER_AGENT = "DiscordBot (https://github.com/kyowon1108/kw-notice-mcp, 0.1)"
+# Three base64url parts joined by dots. Anything else (a newline, a space, the wrong text pasted)
+# is refused before it can reach an HTTP header, where http.client would echo it into an error.
+_TOKEN = re.compile(r"[A-Za-z0-9_\-]{17,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{20,}")
 
 
 class RetryLater(Exception):
@@ -23,13 +27,22 @@ class NotFound(Exception):
     """Discord answered 404: the message (or member, role, channel) is gone."""
 
 
+def clean_token(raw: str | None) -> str | None:
+    """The token as stored, minus the surrounding whitespace a paste may add."""
+    return raw.strip() if raw else None
+
+
 def token_problem(token: str | None) -> str | None:
-    # Discord tokens are plain ASCII; anything else means the wrong text was pasted into SSM.
     if not token:
         return "bot token not set"
-    if not token.isascii() or " " in token.strip():
-        return "bot token is not a Discord token (non-ASCII or spaces)"
+    if len(token) > 200 or not _TOKEN.fullmatch(token):
+        return "bot token is not a Discord token (expected three dot-separated parts)"
     return None
+
+
+def is_snowflake(value: object) -> bool:
+    text = str(value or "")
+    return text.isascii() and text.isdigit() and 0 < len(text) <= 21
 
 
 def call(method: str, path: str, token: str, body: dict | None = None, timeout: float = 10) -> dict:
@@ -50,7 +63,9 @@ def call(method: str, path: str, token: str, body: dict | None = None, timeout: 
         if e.code == 429 or e.code >= 500:
             raise RetryLater(f"discord {e.code}") from None
         raise RuntimeError(f"discord {e.code} on {method}") from None
-    except (urllib.error.URLError, TimeoutError) as e:
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
         raise RetryLater("discord unreachable") from e
+    except ValueError:  # a bad header value (http.client quotes it, token included) or a bad reply
+        raise RuntimeError(f"invalid request or reply on {method}") from None
 
 

@@ -76,6 +76,10 @@ class FakeDiscord:
             channel = {"id": self._id(), "guild_id": GUILD, **body}
             self.channels.append(channel)
             return channel
+        if method == "PATCH" and (m := re.fullmatch(rf"/guilds/{GUILD}/roles/(\d+)", path)):
+            role = next(r for r in self.roles if r["id"] == m[1])
+            role.update(body)
+            return role
         if m := re.fullmatch(r"/channels/(\d+)/permissions/(\d+)", path):
             channel = self._channel(m[1])
             rest = [o for o in channel["permission_overwrites"] if o["id"] != m[2]]
@@ -206,3 +210,46 @@ def test_missing_channel_config_stops_early(aws):
     lines = []
     assert ds.Setup(FakeDiscord(), aws["ssm"], apply=True, department=False, out=lines.append).run() == 2
     assert "notice 채널 ID가 없습니다" in lines[0]
+
+
+def test_a_renamed_topic_renames_its_role_in_place(ssm):
+    api = FakeDiscord()
+    run(api, ssm, apply=True)
+    topic = next(t for t in TOPICS if t.key == "kwlife")
+    role = next(r for r in api.roles if r["name"] == topic.role)
+    role["name"] = "옛 이름 알림"  # as if topics.TOPICS had just been renamed
+    api.writes.clear()
+    _, out = run(api, ssm, apply=True)
+    assert api.writes == [("PATCH", f"/guilds/{GUILD}/roles/{role['id']}")]
+    assert role["name"] == topic.role and f"'옛 이름 알림' → '{topic.role}'" in out
+
+
+def test_an_unsafe_existing_role_stops_everything(ssm):
+    api = FakeDiscord()
+    api.roles.append({"id": "960", "name": "취업 알림", "permissions": str(ds.MENTION_EVERYONE), "position": 1})
+    api.roles[1]["position"] = 5  # the bot is above it
+    code, out = run(api, ssm, apply=True)
+    assert code == 1 and api.writes == []
+    assert "'취업 알림' (960)은 버튼으로 나눠 줄 수 없습니다" in out
+    with pytest.raises(ssm.exceptions.ParameterNotFound):
+        ssm.get_parameter(Name="/kw/discord/roles")
+
+
+def test_a_channel_hidden_from_everyone_stays_hidden(ssm):
+    api = FakeDiscord()
+    api._channel("202")["permission_overwrites"] = [
+        {"id": GUILD, "type": 0, "allow": "0", "deny": str(ds.VIEW_CHANNEL)},
+        {"id": "950", "type": 0, "allow": str(ds.VIEW_CHANNEL), "deny": "0"},  # a verified role sees it
+    ]
+    _, out = run(api, ssm, apply=True)
+    everyone = overwrite(api, "202", GUILD)
+    assert int(everyone["deny"]) & ds.VIEW_CHANNEL and not int(everyone["allow"]) & ds.VIEW_CHANNEL
+    assert int(everyone["deny"]) & ds.SEND_MESSAGES and int(everyone["allow"]) & ds.READ_MESSAGE_HISTORY
+    assert "#학사: @everyone에게 숨겨진 채널" in out
+
+
+def test_channels_with_the_same_name_are_both_made_read_only(ssm):
+    api = FakeDiscord()
+    api._channel("203")["name"] = "학사"  # same name as 202, another category
+    run(api, ssm, apply=True)
+    assert overwrite(api, "202", GUILD) and overwrite(api, "203", GUILD)

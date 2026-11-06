@@ -95,3 +95,6 @@ def test_discord_interactions_have_their_own_api_and_least_privilege(tmp_path):
     assert all(f"/kw/discord/{name}" in policy for name in ("bot-token", "public-key", "roles"))
     assert "/kw/discord/*" not in policy and "/kw/discord/channels" not in policy
     assert "dynamodb" not in policy and "sqs" not in policy
+    assert "ssm:GetParameters" in policy  # one call for all three
+    t.has_resource_properties("AWS::CloudWatch::Alarm", {"AlarmName": "kw-discord-buttons-failed",
+                                                         "MetricName": "InteractionFailed"})

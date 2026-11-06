@@ -12,6 +12,7 @@ posting so an SQS retry never posts the same notice twice.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -32,7 +33,13 @@ from kwcampus.config import (
     QUIET_FROM_HOUR,
     QUIET_UNTIL_HOUR,
 )
-from kwcampus.discordapi import NotFound, RetryLater, token_problem
+from kwcampus.discordapi import (
+    NotFound,
+    RetryLater,
+    clean_token,
+    is_snowflake,
+    token_problem,
+)
 from kwcampus.discordapi import call as _discord
 from kwcampus.obs import log, metrics
 from kwcampus.routing import CATEGORY_LABEL, URGENT, is_urgent, topic_for
@@ -40,9 +47,10 @@ from kwcampus.routing import CATEGORY_LABEL, URGENT, is_urgent, topic_for
 SUPPRESS_EMBEDS = 1 << 2
 MAX_LEN = 2000
 DISCORD_EPOCH_MS = 1420070400000
-# A reply claim older than this belongs to an invocation that died (the Lambda timeout is 60 s),
-# so an SQS retry may take it over.
+# A claim older than this belongs to an invocation that died (the Lambda timeout is 60 s), so an
+# SQS retry may take it over; a younger one is still in flight and a duplicate job leaves it alone.
 STALE_CLAIM = timedelta(seconds=90)
+EDIT_NOTE_PREFIX = "✏️ 수정됨"
 NO_PINGS = {"parse": []}
 
 _MARKDOWN = re.compile(r"([\\*_~`|>\[\]()#])")
@@ -63,8 +71,12 @@ def mentions_for(item: dict, roles: dict[str, str] | None, now: datetime) -> lis
     wanted = [] if is_quiet(now) else [roles.get(topic_for(str(item.get("category_id", ""))) or "")]
     if is_urgent(str(item.get("title") or "")):
         wanted.append(roles.get(URGENT))
-    ids = [str(r) for r in wanted if r and str(r).isascii() and str(r).isdigit()]
-    return list(dict.fromkeys(ids))
+    return list(dict.fromkeys(str(r) for r in wanted if is_snowflake(r)))
+
+
+def _nonce(*parts: str) -> str:
+    """Discord drops a second message with the same nonce sent within a few minutes (enforce_nonce)."""
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:25]
 
 
 def render(item: dict, mentions: list[str] | None = None) -> str:
@@ -85,21 +97,22 @@ def render_edit_note(item: dict, changed: list[str], now: datetime) -> str:
     """The reply under an edited notice. Boards without a 수정일 show the day the change was seen."""
     posted, updated = str(item.get("posted_date") or ""), str(item.get("updated_date") or "")
     day = updated if updated and updated != posted else now.astimezone(KST).date().isoformat()
-    head = f"✏️ 수정됨 · {day}" + (" · 제목 변경" if "title" in changed else "")
+    head = f"{EDIT_NOTE_PREFIX} · {day}" + (" · 제목 변경" if "title" in changed else "")
     return f"{head}\n<{item['url']}>"
 
 
 def posted_at(message_id: str) -> datetime | None:
     """When Discord created the message (snowflake timestamp)."""
-    if not str(message_id).isdigit():
+    if not is_snowflake(message_id):
         return None
     return datetime.fromtimestamp(((int(message_id) >> 22) + DISCORD_EPOCH_MS) / 1000, UTC)
 
 
-def _claim_reply(delivery, dkey: dict, now: datetime) -> bool:
-    """Take today's reply slot for this notice; False when today's reply is already out or in flight."""
+def _claim_reply(delivery, dkey: dict, today: str, now: datetime) -> str | None:
+    """Take today's reply slot for this notice: "new", "takeover" (an earlier attempt today died,
+    maybe after Discord got its reply), or None when today's reply is out or in flight."""
     try:
-        delivery.update_item(
+        old = delivery.update_item(
             Key=dkey,
             UpdateExpression="SET reply_day = :day, reply_state = :claimed, reply_claimed_at = :now",
             ConditionExpression=(
@@ -107,17 +120,30 @@ def _claim_reply(delivery, dkey: dict, now: datetime) -> bool:
                 "OR (reply_state = :claimed AND reply_claimed_at < :stale)"
             ),
             ExpressionAttributeValues={
-                ":day": now.astimezone(KST).date().isoformat(),
+                ":day": today,
                 ":claimed": "claimed",
                 ":now": int(now.timestamp()),
                 ":stale": int((now - STALE_CLAIM).timestamp()),
             },
-        )
-        return True
+            ReturnValues="ALL_OLD",  # the whole item before, unchanged values included
+        ).get("Attributes") or {}
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            return False
+            return None
         raise
+    return "takeover" if old.get("reply_day") == today and old.get("reply_state") == "claimed" else "new"
+
+
+def _earlier_reply(send, token: str, channel: str, message_id: str, today: str) -> str | None:
+    """Today's edit note under message_id, if a dead attempt already posted it (the latest 50 messages)."""
+    recent = send("GET", f"/channels/{channel}/messages?limit=50", token)
+    for m in recent if isinstance(recent, list) else []:
+        sent = posted_at(str(m.get("id")))
+        if ((m.get("message_reference") or {}).get("message_id") == message_id
+                and str(m.get("content", "")).startswith(EDIT_NOTE_PREFIX)
+                and sent and sent.astimezone(KST).date().isoformat() == today):
+            return str(m["id"])
+    return None
 
 
 def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str],
@@ -127,7 +153,7 @@ def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str]
     channel_id = channels.get(job["channel"]) or (channels.get("notice") if job["channel"] == "department" else None)
     if not channel_id:
         return "no_channel"
-    item = public.get_item(Key=job["key"]).get("Item")
+    item = public.get_item(Key=job["key"], ConsistentRead=True).get("Item")
     if not item:
         return "gone"
     dkey = {"PK": f"{job['key']['PK']}|{job['key']['SK']}", "SK": f"CH#{job['channel']}"}
@@ -135,11 +161,15 @@ def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str]
     if job["action"] == "post":
         try:
             delivery.put_item(
-                Item={**dkey, "status": "claimed", "channel_id": channel_id,
+                Item={**dkey, "status": "claimed", "channel_id": channel_id, "claimed_at": int(now.timestamp()),
                       "ttl": int((now + DELIVERY_TTL).timestamp())},
-                ConditionExpression="attribute_not_exists(PK) OR (#s = :claimed AND attribute_not_exists(message_id))",
+                # a duplicate job while the first is still posting must not post (and ping) again
+                ConditionExpression=(
+                    "attribute_not_exists(PK) OR (#s = :claimed AND attribute_not_exists(message_id) "
+                    "AND (attribute_not_exists(claimed_at) OR claimed_at < :stale))"
+                ),
                 ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={":claimed": "claimed"},
+                ExpressionAttributeValues={":claimed": "claimed", ":stale": int((now - STALE_CLAIM).timestamp())},
             )
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
@@ -148,8 +178,9 @@ def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str]
         mentions = mentions_for(item, roles, now)
         # Only these roles may ping: never @everyone, @here, users or other roles.
         allowed = {"parse": [], "roles": mentions} if mentions else NO_PINGS
-        message = send("POST", f"/channels/{channel_id}/messages", token,
-                       {"content": render(item, mentions), "allowed_mentions": allowed, "flags": SUPPRESS_EMBEDS})
+        message = send("POST", f"/channels/{channel_id}/messages", token, {
+            "content": render(item, mentions), "allowed_mentions": allowed, "flags": SUPPRESS_EMBEDS,
+            "nonce": _nonce(dkey["PK"], dkey["SK"]), "enforce_nonce": True})
         values = {":sent": "sent", ":mid": str(message["id"])}
         update = "SET #s = :sent, message_id = :mid"
         if mentions:  # kept so later edits show the same roles and night posts stay without them
@@ -160,41 +191,51 @@ def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str]
         return "posted"
 
     if job["action"] == "edit":
-        record = delivery.get_item(Key=dkey).get("Item")
+        record = delivery.get_item(Key=dkey, ConsistentRead=True).get("Item")
         if not record or not record.get("message_id"):
             return "nothing_to_edit"
         message_id, record_channel = str(record["message_id"]), str(record["channel_id"])
+        mentions = [str(m) for m in record.get("mentions") or [] if is_snowflake(m)]
         try:
-            # Edits never ping, even though the mention stays in the text.
+            # Edits don't notify anyone; the same roles stay allowed so the message keeps them as mentions.
             send("PATCH", f"/channels/{record_channel}/messages/{message_id}", token,
-                 {"content": render(item, record.get("mentions")), "allowed_mentions": NO_PINGS})
+                 {"content": render(item, mentions),
+                  "allowed_mentions": {"parse": [], "roles": mentions} if mentions else NO_PINGS})
         except NotFound:
             return "message_gone"  # someone deleted it; don't bring it back
         sent_at = posted_at(message_id)
         if sent_at and now - sent_at < EDIT_REPLY_AFTER:
             return "edited"  # a quick fix right after posting needs no note
-        if not _claim_reply(delivery, dkey, now):
+        today = now.astimezone(KST).date().isoformat()
+        claim = _claim_reply(delivery, dkey, today, now)
+        if claim is None:
             return "edited"  # today's note is already there
-        note = send("POST", f"/channels/{record_channel}/messages", token, {
-            "content": render_edit_note(item, job.get("changed") or ["title"], now),
-            "allowed_mentions": {"parse": [], "replied_user": False},
-            "flags": SUPPRESS_EMBEDS,
-            "message_reference": {"message_id": message_id, "channel_id": record_channel,
-                                  "fail_if_not_exists": False},
-        })
+        note_id = _earlier_reply(send, token, record_channel, message_id, today) if claim == "takeover" else None
+        if note_id is None:
+            note_id = str(send("POST", f"/channels/{record_channel}/messages", token, {
+                "content": render_edit_note(item, job.get("changed") or ["title"], now),
+                "allowed_mentions": {"parse": [], "replied_user": False},
+                "flags": SUPPRESS_EMBEDS,
+                "message_reference": {"message_id": message_id, "channel_id": record_channel,
+                                      "fail_if_not_exists": False},
+                "nonce": _nonce(dkey["PK"], dkey["SK"], "edit", today), "enforce_nonce": True,
+            })["id"])
         delivery.update_item(
             Key=dkey,
             UpdateExpression="SET reply_state = :sent, reply_message_id = :mid",
-            ExpressionAttributeValues={":sent": "sent", ":mid": str(note["id"])},
+            ExpressionAttributeValues={":sent": "sent", ":mid": note_id},
         )
         return "edited_replied"
     return "unknown_action"
 
 
 def handler(event, context):
-    token = params.get(DISCORD_TOKEN_PARAM, decrypt=True)
+    token = clean_token(params.get(DISCORD_TOKEN_PARAM, decrypt=True))
     channels = json.loads(params.get(DISCORD_CHANNELS_PARAM) or "{}")
-    roles = json.loads(params.get(DISCORD_ROLES_PARAM) or "{}").get("roles") or {}
+    cfg = json.loads(params.get(DISCORD_ROLES_PARAM) or "{}")
+    # never the @everyone role (its id is the guild's), only real role ids
+    roles = {k: str(v) for k, v in (cfg.get("roles") or {}).items()
+             if is_snowflake(v) and str(v) != str(cfg.get("guild"))}
     dynamodb = boto3.resource("dynamodb")
     public, delivery = dynamodb.Table(PUBLIC_TABLE), dynamodb.Table(DELIVERY_TABLE)
 

@@ -123,7 +123,7 @@ def test_department_alerts_fall_back_to_the_notice_channel():
     assert jobs and jobs[0]["channel"] == "department"
 
     class Public:
-        def get_item(self, Key):
+        def get_item(self, Key, ConsistentRead=False):
             return {}
 
     # with no "department" channel configured, the sender uses "notice" (and here finds nothing to post)

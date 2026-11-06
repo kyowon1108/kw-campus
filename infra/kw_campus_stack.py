@@ -143,14 +143,16 @@ class KwCampusStack(cdk.Stack):
         # 1024 MB for the CPU share: a cold start must still answer well inside those 3 s.
         interactions = fn("DiscordInteractions", "kwcampus.interactions.handler", 5, memory=1024)
         interactions.add_to_role_policy(iam.PolicyStatement(
-            actions=["ssm:GetParameter"],
+            actions=["ssm:GetParameter", "ssm:GetParameters"],
             resources=[f"{ssm_arn}/kw/discord/{name}" for name in ("bot-token", "public-key", "roles")]))
         discord_api = apigw.HttpApi(self, "DiscordApi", api_name="kw-discord", create_default_stage=False)
         discord_api.add_routes(path="/discord/interactions", methods=[apigw.HttpMethod.POST],
                                integration=apigw_int.HttpLambdaIntegration("DiscordInteractionsIntegration",
                                                                            interactions))
+        # Shared by every caller, unsigned junk included (rejected for a fraction of a cent each), so
+        # it is set well above real click rates; Discord doesn't retry a click that got 429.
         discord_api.add_stage("DiscordDefaultStage", stage_name="$default", auto_deploy=True,
-                              throttle=apigw.ThrottleSettings(rate_limit=5, burst_limit=10))
+                              throttle=apigw.ThrottleSettings(rate_limit=20, burst_limit=40))
 
         # campus data: same table and switch as the collector
         public.grant_read_write_data(campus)
@@ -255,6 +257,9 @@ class KwCampusStack(cdk.Stack):
         alarm("collector-parse-empty", cw.Metric(namespace="KwCampus", metric_name="ParseEmpty",
                                                  statistic="Sum", period=cdk.Duration.hours(3)), threshold=3)
         alarm("discord-dlq", dlq.metric_approximate_number_of_messages_visible(period=five_min))
+        # buttons that couldn't change a role (bot role dragged below the subscription roles, token gone)
+        alarm("discord-buttons-failed", cw.Metric(namespace="KwCampus", metric_name="InteractionFailed",
+                                                  statistic="Sum", period=cdk.Duration.hours(1)), threshold=3)
 
         cdk.CfnOutput(self, "PublicTableName", value=public.table_name)
         cdk.CfnOutput(self, "DiscordQueueUrl", value=queue.queue_url)

@@ -30,6 +30,18 @@ def get(name: str, *, decrypt: bool = False, ttl_s: float = _TTL_S) -> str | Non
     return value
 
 
+def get_many(names: list[str], *, decrypt: bool = False, ttl_s: float = _TTL_S) -> dict[str, str | None]:
+    """Several parameters in one GetParameters call (up to 10); missing ones are None."""
+    now = time.monotonic()
+    stale = [n for n in names if not ((hit := _CACHE.get(n)) and now - hit[0] < ttl_s)]
+    if stale:
+        found = {p["Name"]: p["Value"]
+                 for p in _client().get_parameters(Names=stale, WithDecryption=decrypt)["Parameters"]}
+        for name in stale:
+            _CACHE[name] = (time.monotonic(), found.get(name))
+    return {name: _CACHE[name][1] for name in names}
+
+
 def is_true(name: str) -> bool:
     """Switches are on only when explicitly set to "true"; a missing parameter means off."""
     return (get(name, ttl_s=0) or "").strip().lower() == "true"

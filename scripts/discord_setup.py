@@ -29,7 +29,7 @@ from kwcampus.config import (
     DISCORD_ROLES_PARAM,
     DISCORD_TOKEN_PARAM,
 )
-from kwcampus.discordapi import API, USER_AGENT, NotFound, token_problem
+from kwcampus.discordapi import API, USER_AGENT, NotFound, clean_token, token_problem
 from kwcampus.fetch import TLS
 from kwcampus.interactions import PREFIX, menu_message
 from kwcampus.topics import TOPICS
@@ -109,6 +109,8 @@ class DiscordAPI:
                     raise NotFound(f"{method} {path}: 404") from None
                 hint = " (봇 권한이 부족합니다)" if e.code == 403 else ""
                 raise RuntimeError(f"Discord {e.code} on {method} {path}{hint}") from None
+            except ValueError:  # http.client quotes a bad header value, token included
+                raise RuntimeError(f"invalid request or reply on {method} {path}") from None
         raise RuntimeError(f"Discord kept rate-limiting {method} {path}")
 
 
@@ -181,12 +183,15 @@ class Setup:
         self.out(f"Discord 서버: {guild.get('name')} ({guild_id}) · 봇: {me.get('username')} ({bot_id}) · {mode}")
 
         role_ids = self._roles(guild_id, roles, saved, top)
+        if role_ids is None:
+            self.out("\n중단: 위 역할 문제를 고치기 전에는 아무것도 바꾸지 않습니다.")
+            return 1
         by_id = {str(c["id"]): c for c in channels}
-        targets = self._channels(guild_id, bot_id, notice, channels_cfg, saved, by_id, channels)
+        targets, menu_channel, dept_channel = self._channels(guild_id, bot_id, notice, channels_cfg, saved, by_id,
+                                                             channels)
         self._permissions(guild_id, bot_id, targets, by_id)
-        menu_channel = targets[MENU_CHANNEL][0]
         message_id = self._menu(menu_channel, bot_id, saved)
-        self._ssm(guild_id, role_ids, menu_channel, message_id, saved, channels_cfg, targets)
+        self._ssm(guild_id, role_ids, menu_channel, message_id, saved, channels_cfg, dept_channel)
         self._report_permissions(everyone, own)
 
         if self.apply:
@@ -195,26 +200,39 @@ class Setup:
             self.out(f"\ndry-run: 아무것도 바꾸지 않았습니다. 바뀔 항목 {self.changes}건. 적용하려면 --apply")
         return 0
 
-    def _roles(self, guild_id: str, roles: list[dict], saved: dict, top: int) -> dict[str, str]:
+    def _roles(self, guild_id: str, roles: list[dict], saved: dict, top: int) -> dict[str, str] | None:
+        """Topic → role id. None (and nothing written) when an existing role is unsafe to hand out:
+        anyone who clicks its button would get it."""
         self.out("\n[구독 역할]")
         by_id = {str(r["id"]): r for r in roles}
         by_name = {r["name"]: r for r in roles}
+        found = {t.key: by_id.get(str((saved.get("roles") or {}).get(t.key))) or by_name.get(t.role) for t in TOPICS}
+        unsafe = [(t, r) for t in TOPICS if (r := found[t.key]) and (
+            int(r.get("permissions", 0)) or r.get("managed") or str(r["id"]) == guild_id
+            or int(r.get("position", 0)) >= top)]
+        for topic, role in unsafe:
+            self.step("!", f"'{role['name']}' ({role['id']})은 버튼으로 나눠 줄 수 없습니다: 권한이 있거나, 연동 역할이거나, "
+                           f"봇 역할보다 위에 있습니다. 권한을 비우고 봇 역할 아래로 내리거나 이름을 바꾼 뒤 다시 실행하세요.")
+        if unsafe:
+            return None
         ids = {}
         for topic in TOPICS:
-            role = by_id.get(str((saved.get("roles") or {}).get(topic.key))) or by_name.get(topic.role)
+            role = found[topic.key]
             if role is None:
                 self.step("+", f"'{topic.role}' 역할 만들기 (권한 없음, 멤버가 멘션할 수 없음)")
                 if self.apply:
                     role = self.api.call("POST", f"/guilds/{guild_id}/roles", {
                         "name": topic.role, "permissions": "0", "mentionable": False, "hoist": False})
                 ids[topic.key] = str(role["id"]) if role else NEW
-                continue
-            ids[topic.key] = str(role["id"])
-            self.step("=", f"'{role['name']}' 있음 ({role['id']})")
-            if int(role.get("permissions", 0)) or role.get("managed"):
-                self.step("!", f"'{role['name']}'에 권한이 있거나 연동 역할입니다. 구독 역할은 권한 없는 역할이어야 합니다.")
-            if int(role.get("position", 0)) >= top:
-                self.step("!", f"'{role['name']}'이 봇 역할보다 위에 있습니다. 서버 설정 → 역할에서 봇 역할을 위로 끌어 주세요.")
+            elif role["name"] != topic.role:
+                # a renamed college (2028: 참빛인재대학 → 산업융합대학) is one line in topics.TOPICS
+                ids[topic.key] = str(role["id"])
+                self.step("~", f"'{role['name']}' → '{topic.role}' 이름 바꾸기 ({role['id']})")
+                if self.apply:
+                    self.api.call("PATCH", f"/guilds/{guild_id}/roles/{role['id']}", {"name": topic.role})
+            else:
+                ids[topic.key] = str(role["id"])
+                self.step("=", f"'{role['name']}' 있음 ({role['id']})")
         return ids
 
     def _find_or_create(self, guild_id: str, notice: dict, name: str, topic: str, known_id: str | None,
@@ -237,45 +255,49 @@ class Setup:
         by_id[str(made["id"])] = made
         return str(made["id"]), True
 
-    def _channels(self, guild_id, bot_id, notice, channels_cfg, saved, by_id, channels) -> dict:
-        """{label: (channel id, mention allowed, created now)} of every channel made read-only."""
+    def _channels(self, guild_id, bot_id, notice, channels_cfg, saved, by_id, channels) -> tuple:
+        """([(label, channel id, mention allowed, created now)], menu channel id, department channel id)."""
         self.out("\n[채널]")
-        targets = {}
+        targets, dept_id = [], None
         for key in NOTICE_CHANNEL_KEYS:
             cid = str(channels_cfg.get(key) or "")
             if cid not in by_id:
                 self.step("!", f"{DISCORD_CHANNELS_PARAM}의 '{key}' 채널을 서버에서 찾지 못했습니다. 건너뜁니다.")
                 continue
             self.step("=", f"#{by_id[cid]['name']} ({key})")
-            targets[by_id[cid]["name"]] = (cid, True, False)
+            targets.append((by_id[cid]["name"], cid, True, False))
         menu_id, created = self._find_or_create(
             guild_id, notice, MENU_CHANNEL, MENU_TOPIC, (saved.get("menu") or {}).get("channel"), by_id, channels,
             _overwrites_for(guild_id, bot_id, mention=False))
-        targets[MENU_CHANNEL] = (menu_id, False, created)
+        targets.append((MENU_CHANNEL, menu_id, False, created))
         if self.department:
             dept_id, created = self._find_or_create(
                 guild_id, notice, DEPARTMENT_CHANNEL, DEPARTMENT_TOPIC, channels_cfg.get("department"), by_id,
                 channels, _overwrites_for(guild_id, bot_id, mention=True))
-            targets[DEPARTMENT_CHANNEL] = (dept_id, True, created)
+            targets.append((DEPARTMENT_CHANNEL, dept_id, True, created))
         elif channels_cfg.get("department"):
             self.step("=", f"학과 공지 채널 ({channels_cfg['department']})")
         else:
             self.step("=", "학과 공지는 계속 #학교-공지로 갑니다 (--department-channel로 #학과-공지를 만들 수 있음)")
-        return targets
+        return targets, menu_id, dept_id
 
-    def _permissions(self, guild_id: str, bot_id: str, targets: dict, by_id: dict) -> None:
+    def _permissions(self, guild_id: str, bot_id: str, targets: list, by_id: dict) -> None:
         self.out("\n[채널 권한] @everyone: 보기·기록 보기 허용, 메시지·스레드 거부 / 봇: 보기·보내기·링크 첨부·기록 보기 허용")
-        for label, (cid, mention, created) in targets.items():
+        for label, cid, mention, created in targets:
             if created:
                 continue  # made with the right overwrites just now (or in this plan)
             existing = {str(o["id"]): o for o in (by_id.get(cid) or {}).get("permission_overwrites") or []}
             for oid, kind, allow, deny, who in _overwrites_for(guild_id, bot_id, mention):
                 old = existing.get(oid)
+                if who == "@everyone" and old and int(old["deny"]) & VIEW_CHANNEL:
+                    allow &= ~VIEW_CHANNEL  # a channel hidden on purpose (behind a verified role) stays hidden
+                    self.step("!", f"#{label}: @everyone에게 숨겨진 채널이라 보기 권한은 그대로 둡니다.")
                 new_allow, new_deny = _merge(old, allow, deny)
                 if old and (int(old["allow"]), int(old["deny"])) == (new_allow, new_deny):
                     self.step("=", f"#{label} {who}: 이미 맞음")
                     continue
-                self.needed |= allow | deny
+                # Discord may check every bit sent, so the bits kept from before count too
+                self.needed |= new_allow | new_deny
                 extra = " + 역할 멘션" if who == "봇" and mention else ""
                 self.step("~", f"#{label} {who}: 권한 덮어쓰기 설정{extra}")
                 if self.apply:
@@ -308,7 +330,7 @@ class Setup:
                 self.api.call("PATCH", f"/channels/{channel_id}/messages/{current['id']}", want)
         return str(current["id"])
 
-    def _ssm(self, guild_id, role_ids, menu_channel, message_id, saved, channels_cfg, targets) -> None:
+    def _ssm(self, guild_id, role_ids, menu_channel, message_id, saved, channels_cfg, dept_id) -> None:
         self.out("\n[SSM]")
         new = {"guild": guild_id, "roles": role_ids, "menu": {"channel": menu_channel, "message": message_id}}
         if new == saved:
@@ -319,7 +341,6 @@ class Setup:
                 self.ssm.put_parameter(Name=DISCORD_ROLES_PARAM, Type="String", Overwrite=True,
                                        Value=json.dumps(new, ensure_ascii=False))
         if self.department:
-            dept_id = targets[DEPARTMENT_CHANNEL][0]
             if channels_cfg.get("department") == dept_id:
                 self.step("=", f"{DISCORD_CHANNELS_PARAM} department 그대로")
             else:
@@ -359,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ssm = boto3.client("ssm", region_name=args.region)
     try:
-        token = _get_param(ssm, DISCORD_TOKEN_PARAM, decrypt=True)
+        token = clean_token(_get_param(ssm, DISCORD_TOKEN_PARAM, decrypt=True))
     except (BotoCoreError, ClientError) as e:
         print(f"! SSM을 읽지 못했습니다 ({type(e).__name__}). `aws login` 후 다시 실행하세요.")
         return 2
