@@ -12,7 +12,7 @@ from datetime import date
 
 from boto3.dynamodb.conditions import Key
 
-from kwcampus import deptboards, wwwboards
+from kwcampus import deptboards, wixfeeds, wwwboards
 from kwcampus.config import NOTICE_SOURCE
 from kwcampus.routing import CATEGORY_LABEL
 
@@ -24,9 +24,10 @@ _LABEL_TO_ID = {label: cid for cid, label in CATEGORY_LABEL.items()}
 _ALIASES = {"장학": "registration-scholarship", "등록": "registration-scholarship",
             "대외활동": "external", "국제": "international-exchange", "채용": "job",
             "인융대": "dept-aicon", "인공지능융합": "dept-aicon", "학과": "dept-aicon",
-            "전정대": "dept-ei", "전자정보공대": "dept-ei"}
-# Every collected board: the main notice board, department boards, the 취업게시판 and the FAQ.
-SOURCES = (NOTICE_SOURCE, "aicon", *(b.source for b in deptboards.BOARDS), *(b.source for b in wwwboards.BOARDS))
+            "전정대": "dept-ei", "전자정보공대": "dept-ei", "인사대": "dept-chss", "경영대": "dept-biz",
+            "참빛": "dept-kwlife", "인제니움": "dept-ingenium", "미컴": "dept-media"}
+# Every collected board: the main notice board, department boards and feeds, the 취업게시판 and the FAQ.
+SOURCES = (NOTICE_SOURCE, "aicon", *(b.source for b in (*deptboards.BOARDS, *wixfeeds.FEEDS, *wwwboards.BOARDS)))
 
 
 def category_id(value: str | None) -> str | None:

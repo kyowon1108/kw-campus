@@ -28,7 +28,7 @@ from kwcampus.obs import log, metrics
 CAFETERIA_URL = "https://www.kw.ac.kr/ko/life/facility11.jsp"
 CALENDAR_URL = "https://www.kw.ac.kr/KWBoard/list5_detail.jsp"
 CALENDAR_MAX_AGE = timedelta(days=7)
-DAILY_CAP = 40  # shared origin budget with the notice collector
+DAILY_CAP = 44  # shared origin budget with the notice collector (collector.DAILY_CAP)
 
 _DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 _MD = re.compile(r"(\d{1,2})\.(\d{1,2})")

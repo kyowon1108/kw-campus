@@ -50,19 +50,20 @@ _opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(c
 
 
 def _has_challenge(body: bytes) -> bool:
-    head = body[:4096].lower()
+    # A stylesheet from the public cdnjs CDN is not a challenge (ingenium.kw.ac.kr loads Font Awesome there).
+    head = body[:4096].lower().replace(b"cdnjs.cloudflare.com", b"")
     return any(marker in head for marker in CHALLENGE_MARKERS)
 
 
 def fetch_list_page(url: str, form: dict[str, str] | None = None, encoding: str = "utf-8",
-                    errors: str = "strict") -> FetchResult:
+                    errors: str = "strict", types: tuple[str, ...] = ("text/html",)) -> FetchResult:
     """GET the page, or POST a small form (the academic calendar loads its year that way).
 
     By default the page must be clean UTF-8. Department boards pass errors="replace": some site
     templates carry stray EUC-KR bytes (elcomm's menu), and EUC-KR boards ("cp949") cut long
-    titles at a byte count, leaving half a character.
+    titles at a byte count, leaving half a character. RSS feeds pass their own content types.
     """
-    headers = {"User-Agent": USER_AGENT, "Accept": "text/html", "Accept-Language": "ko"}
+    headers = {"User-Agent": USER_AGENT, "Accept": ", ".join(types), "Accept-Language": "ko"}
     data = None
     if form is not None:
         data = urllib.parse.urlencode(form).encode()
@@ -85,7 +86,7 @@ def fetch_list_page(url: str, form: dict[str, str] | None = None, encoding: str 
         return FetchResult(None, "oversized", status)
     if _has_challenge(body):
         return FetchResult(None, "captcha", status)
-    if status != 200 or content_type != "text/html":
+    if status != 200 or content_type not in types:
         return FetchResult(None, "markup", status)
     try:
         return FetchResult(body.decode(encoding, errors=errors), None, status)

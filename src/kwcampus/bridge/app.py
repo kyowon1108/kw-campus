@@ -40,7 +40,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 from kwcampus import params, public_http
-from kw_mcp.combined import ACADEMIC_DEADLINE_WORDS
+from kw_mcp.combined import ACADEMIC_DEADLINE_WORDS, CAMPUS_ALERT_WORDS, HOLIDAY_WORDS
 from kw_mcp.service import term_in_session
 
 from kwcampus.bridge import crypto, install, password, shapes, store
@@ -334,8 +334,17 @@ async def today_briefing() -> dict[str, Any]:
         "new_course_posts": (new_posts := [p for p in shapes.course_posts(snap) if (p["posted"] or "") >= since]),
         "possible_class_changes": [p for p in new_posts if shapes.CLASS_CHANGE_WORDS.search(p.get("title") or "")],
         "new_school_notices": public_http.search_notices("", None, (now.date() - timedelta(days=1)).isoformat(), 10),
+        **({"campus_alerts": alerts} if (alerts := _campus_alerts(now))["notices"] or alerts["today"] else {}),
         "data_as_of": snap.get("fetched_at"),
     }
+
+
+def _campus_alerts(now: datetime) -> dict:
+    """Same rule as kw_mcp.combined.campus_alerts: recent closures/outages/holidays and today's days off."""
+    today = now.date().isoformat()
+    recent = public_http.search_notices("", None, (now.date() - timedelta(days=3)).isoformat(), 30)
+    return {"notices": [n for n in recent if CAMPUS_ALERT_WORDS.search(n.get("title") or "")],
+            "today": [e for e in public_http.academic_calendar(today, today) if HOLIDAY_WORDS.search(e.get("title") or "")]}
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -403,7 +412,8 @@ async def my_class_changes(days: int = 14) -> dict[str, Any]:
 @mcp.tool(annotations=READ_ONLY)
 async def my_graduation() -> dict[str, Any]:
     """졸업 이수 현황: 취득 학점(전공·교양·기타), 필수교양(광운인되기)과 균형교양 8개 영역별 이수 학점,
-    입학 연도에 맞는 교양 규칙 충족 여부. "균형교양 더 들어야 해?", "졸업까지 교양 몇 학점?"에 쓰세요."""
+    입학 연도에 맞는 교양 규칙 충족 여부, 학교 졸업 사정 결과(official_check: 명단에 오른 경우 졸업 가능 여부와 불가 사유).
+    "균형교양 더 들어야 해?", "졸업 가능해?"에 쓰세요."""
     return await agent_call("graduation_progress")
 
 
@@ -431,6 +441,13 @@ async def my_surveys(course: str | None = None) -> list[dict[str, Any]]:
 async def my_discussions(course: str | None = None) -> list[dict[str, Any]]:
     """과목 토론 주제: 시작·종료와 글 수. 내가 참여했는지는 KLAS 목록에 없어 토론실에서 확인해야 합니다."""
     return await agent_call("discussions", course=course or "")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_course_overview(course: str | None = None) -> list[dict[str, Any]]:
+    """과목별 한눈에 보기(KLAS 과목 홈과 같은 숫자): 온라인강의 완료/전체, 과제·퀴즈·온라인시험·팀플·설문 제출/전체,
+    토론 참여/전체, 새 글 수, 자료실 글 수, 출석·결석·지각·조퇴·공결 횟수. "이 과목 뭐 남았어?"에 먼저 쓰세요."""
+    return await agent_call("course_overview", course=course or "")
 
 
 @mcp.tool(annotations=READ_ONLY)

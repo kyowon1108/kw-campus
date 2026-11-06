@@ -20,6 +20,10 @@ from constructs import Construct
 
 # Weekdays 09:00-18:59 KST, every 20 minutes (30 runs a day).
 COLLECT_SCHEDULE = "cron(0/20 9-18 ? * MON-FRI *)"
+# One more look on weekday evenings and weekend noons: closures and class cancellations are often
+# posted the evening before (에브리타임, 2026-11), and a Friday-evening notice otherwise waits until Monday.
+EXTRA_COLLECT_SCHEDULES = {"CollectEveningSchedule": ("kw-collector-evening", "cron(0 21 ? * MON-FRI *)"),
+                           "CollectWeekendSchedule": ("kw-collector-weekend", "cron(0 12 ? * SAT,SUN *)")}
 # Weekdays 07:30 KST: cafeteria menu / academic calendar refresh (0-2 requests).
 CAMPUS_SCHEDULE = "cron(30 7 ? * MON-FRI *)"
 # Lambda Web Adapter (arm64) in ap-northeast-2; serves uvicorn behind Lambda.
@@ -196,18 +200,20 @@ class KwCampusStack(cdk.Stack):
                 retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
             ),
         )
-        scheduler.CfnSchedule(
-            self, "CollectSchedule",
-            name="kw-collector-tick",
-            schedule_expression=COLLECT_SCHEDULE,
-            schedule_expression_timezone="Asia/Seoul",
-            flexible_time_window=scheduler.CfnSchedule.FlexibleTimeWindowProperty(mode="OFF"),
-            target=scheduler.CfnSchedule.TargetProperty(
-                arn=collector.function_arn,
-                role_arn=schedule_role.role_arn,
-                retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
-            ),
-        )
+        for construct_id, (name, expression) in {"CollectSchedule": ("kw-collector-tick", COLLECT_SCHEDULE),
+                                                 **EXTRA_COLLECT_SCHEDULES}.items():
+            scheduler.CfnSchedule(
+                self, construct_id,
+                name=name,
+                schedule_expression=expression,
+                schedule_expression_timezone="Asia/Seoul",
+                flexible_time_window=scheduler.CfnSchedule.FlexibleTimeWindowProperty(mode="OFF"),
+                target=scheduler.CfnSchedule.TargetProperty(
+                    arn=collector.function_arn,
+                    role_arn=schedule_role.role_arn,
+                    retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
+                ),
+            )
 
         # alarms
         topic = sns.Topic(self, "Alarms", topic_name="kw-alarms")
