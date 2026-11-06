@@ -409,6 +409,16 @@ def test_malformed_input_gets_400_not_500(env):
     assert c.post("/device/result", json=["r1"]).status_code == 400
     assert c.post("/oauth/token", data={"grant_type": "refresh_token", "client_id": "nope"}).status_code == 401
     assert c.post("/oauth/token", data={"grant_type": "password"}).json()["error"] == "unsupported_grant_type"
+    # small enough, but nested too deep for json (RecursionError), on every JSON route
+    for path in ("/oauth/register", "/oauth/approve", "/device/register", "/device/result", "/device/pair"):
+        deep = c.post(path, content=b"[" * 16_000, headers={"Content-Type": "application/json"})
+        assert deep.status_code in (400, 403), path
+    # a bearer token with non-ASCII characters (compare_digest refuses such str)
+    bad_bearer = c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                        headers={"Authorization": "Bearer x.y.\xe9".encode("latin-1")})
+    assert bad_bearer.status_code == 401
+    # a redirect URI urlparse can't read
+    assert c.post("/oauth/register", json={"redirect_uris": ["http://[::1"]}).status_code == 400
 
 
 def test_authorize_checks_pkce_and_resource_and_reports_to_the_client(env):
@@ -826,8 +836,10 @@ def test_briefing_answers_with_what_arrived(env, monkeypatch):
     bridge._SNAP.clear()
     items = [{"kind": "online_test", "title": "중간", "due": "2099-11-07 10:00"},
              {"kind": "survey", "title": "날짜 없음", "due": "언젠가"}]  # an unparseable due is left out
+    # the shape KlasService.deadlines() really answers with: no data_as_of, the time it read in "now"
     _briefing_agent(monkeypatch, snapshot=ToolError("KLAS에서 데이터를 읽지 못했습니다."),
-                    deadlines={"result": {"items": items, "data_as_of": "2099-11-06T08:00:00+09:00"}})
+                    deadlines={"result": {"semester": "2099,2", "now": "2099-11-06 08:00", "until": "2099-11-07 23:59",
+                                          "days": 2, "items": items}})
     result = tool(c, tokens["access_token"], "today_briefing")["structuredContent"]
     assert result["incomplete"] == {"missing": ["classes", "new_course_posts"], "message": "KLAS에서 데이터를 읽지 못했습니다."}
     assert [i["title"] for i in result["due_today_or_tomorrow"]] == ["중간"] and result["classes"] == []
@@ -862,14 +874,15 @@ def test_campus_alerts_use_the_main_board_and_filter_before_the_limit(env, monke
         _notice(pub, "dept-ee", 900 + i, f"[휴강] 전자공학과 과목 {i} 점검", "2026-11-06", "dept-ee")
     _notice(pub, "kw-job", 1, "기상청 채용 안내", "2026-11-06", "job")
     _notice(pub, "kw-notice", 55001, "11/7 새빛관 정전 안내", "2026-11-04", "general")
+    _notice(pub, "kw-notice", 55002, "2학기 수강 철회 안내", "2026-11-05", "academic")  # yesterday, under the 40 newer posts
     # these two would sort first (newest date, highest id) if they weren't left out
     _notice(pub, "kw-notice", 99998, "고정 공지", "2026-11-06", "academic", pinned=True)
     _notice(pub, "kw-faq", 99999, "휴학 FAQ", "2026-11-06", "faq")
     public_data.clear_cache()
     result = tool(c, tokens["access_token"], "today_briefing")["structuredContent"]
     assert [n["title"] for n in result["campus_alerts"]["notices"]] == ["11/7 새빛관 정전 안내"]
-    school = [n["title"] for n in result["new_school_notices"]]
-    assert len(school) == 10 and "휴학 FAQ" not in school and "고정 공지" not in school
+    # 학교 공지 is the main board, as in kw-mcp: department and job posts don't push it out
+    assert [n["title"] for n in result["new_school_notices"]] == ["2학기 수강 철회 안내"]
 
 
 def test_my_notices_clamps_days_and_takes_the_students_department(env):

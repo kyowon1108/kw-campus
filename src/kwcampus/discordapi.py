@@ -6,6 +6,7 @@ No heavy imports: the button Lambda must answer within 3 s, cold start included.
 from __future__ import annotations
 
 import json
+import math
 import re
 import urllib.error
 import urllib.request
@@ -53,11 +54,30 @@ def is_snowflake(value: object) -> bool:
     return text.isascii() and text.isdigit() and 0 < len(text) <= 21
 
 
-def _retry_after(e: urllib.error.HTTPError) -> float:
+def _seconds(value) -> float | None:
     try:
-        return float((json.loads(e.read() or b"{}") or {}).get("retry_after") or e.headers.get("Retry-After") or 1)
-    except (ValueError, TypeError, AttributeError):
-        return 1.0
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+def _retry_after(e: urllib.error.HTTPError) -> float:
+    """Seconds to wait after a 429: the JSON body's retry_after, else the Retry-After header (a 429
+    from Cloudflare in front of Discord has an HTML body), else X-RateLimit-Reset-After, else 1."""
+    try:
+        body = json.loads(e.read() or b"{}")
+    except (ValueError, TypeError, OSError):
+        body = None
+    candidates = [body.get("retry_after") if isinstance(body, dict) else None]
+    headers = e.headers
+    if headers is not None:
+        candidates += [headers.get("Retry-After"), headers.get("X-RateLimit-Reset-After")]
+    for value in candidates:
+        seconds = _seconds(value)
+        if seconds is not None:
+            return seconds
+    return 1.0
 
 
 def call(method: str, path: str, token: str, body: dict | None = None, timeout: float = 10) -> dict:

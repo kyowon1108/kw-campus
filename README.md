@@ -10,7 +10,7 @@
 - 도구: `this_week`, `today_briefing`, `my_notices`, `my_courses`, `my_assignments`, `my_quizzes`, `my_online_lectures`, `my_team_projects`, `my_course_notices`, `my_deadlines`, `my_assignment_detail`, `my_syllabus`, `my_course_board`, `my_course_post`, `my_attachment`, `my_grades`, `my_attendance`, `my_exams`, `my_class_changes`, `my_graduation` + 공개 도구 5개. 상세 도구 셋은 에이전트에 하나씩 묻는 `call` 요청이라 에이전트 프로토콜 2 이상이 필요합니다.
 - `kw-bridge` 테이블에는 기기 공개키, OAuth 클라이언트, 코드·토큰 해시, 연결 ID, 2분짜리 암호문만 둡니다. 학번·비밀번호·개인 데이터는 없습니다.
 - redirect는 Claude·ChatGPT의 콜백 URL 3개(정확히 일치)와 localhost만 받습니다. 다른 사이트로 돌아가는 클라이언트로 승인을 낚는 것을 막기 위해서입니다.
-- 남용 방어: 승인 요청 하나에 실패 5번이면 닫습니다. `/device/result`는 서버가 연 요청 자리에만 한 번 쓸 수 있고 300KB까지입니다. 기기 서명은 한 번만 쓰입니다. 에이전트는 설치한 서버와 초대 코드의 서버가 다르면 연결하지 않습니다. 새 앱이 연결 코드로 붙으면 에이전트 로그에 남습니다. API는 경로별로 제한합니다: 클라이언트 등록·기기 등록 초당 1건, 승인·연결 코드·연결 관리 2건, 토큰 5건, 에이전트 결과 20건, 나머지(`/mcp`, 설치 파일) 10건(순간 20건). IP별 제한이 아니어서 누가 계속 두드리면 그 경로를 쓰는 모두가 느려질 수 있지만, 가입성 경로가 막혀도 에이전트 응답은 영향을 받지 않습니다. HTTP API에는 WAF를 붙일 수 없어 비용 상한 쪽을 택했습니다(bridge Lambda 동시 실행 20개, 월 5달러 예산 알림).
+- 남용 방어: 승인 요청 하나에 실패 5번이면 닫습니다. `/device/result`는 서버가 연 요청 자리에만 한 번 쓸 수 있고 300KB까지입니다. 기기 서명은 한 번만 쓰입니다. 에이전트는 설치한 서버와 초대 코드의 서버가 다르면 연결하지 않습니다. 새 앱이 연결 코드로 붙으면 에이전트 로그에 남습니다. API는 경로별로 제한합니다: 클라이언트 등록·기기 등록 초당 1건, 승인·연결 코드·연결 관리 2건, 토큰 5건, `/mcp` 5건(순간 10건), 에이전트 결과 20건, 나머지(설치 파일 등) 10건(순간 20건). IP별 제한이 아니어서 누가 계속 두드리면 그 경로를 쓰는 모두가 느려질 수 있지만, 가입성 경로가 막혀도 에이전트 응답은 영향을 받지 않습니다. HTTP API에는 WAF를 붙일 수 없어 비용 상한 쪽을 택했습니다: bridge Lambda 동시 실행 20개, 에이전트 결과를 받는 Lambda는 따로 5개(답을 기다리는 `/mcp` 요청이 20개를 다 써도 결과는 들어옴), 월 5달러 예산 알림(크레딧·환불은 빼고 셈), 4xx 응답이 5분에 100건 이상이면 알림.
 - 설치 파일도 bridge가 직접 줍니다: `/install.sh`, `/install.ps1`, `/dist/kw_mcp-*.whl`, `/dist/kw-klas.mcpb`. 공개 JSON API(`/c/<토큰>/api/...`)도 같은 주소에서 받습니다.
 
 **초대**: 초대 코드는 `kwc_`로 시작하는 문자열 하나(서버 주소 + 토큰)입니다. 토큰을 새로 만들어 해시를 `/kw/mcp/tokens`에 더한 뒤 코드를 만듭니다.
@@ -90,7 +90,7 @@ EventBridge Scheduler (평일 09:00~18:59 KST, 20분마다)
 ```
 
 - **학교 서버 예절**
-  - 한 번 실행할 때 서버마다 요청은 1회입니다. 예외로 www만 2시간에 한 번쯤 61초 간격으로 1회 더 요청합니다(취업게시판·FAQ).
+  - 한 번 실행할 때 서버마다 요청은 1회입니다. 예외는 www뿐입니다: 수집 실행이 2시간에 한 번쯤 61초 뒤에 1회 더 요청하고(취업게시판·FAQ, 한 실행에 둘 중 하나), 평일 07:30 `kw-campus` Lambda가 학식과 학사일정을 61초 간격으로 최대 2회 받습니다. 처리방침 3항(`/privacy`)도 이렇게 적어 두었으니 바꾸면 같이 고칩니다.
   - 같은 서버(origin)에는 60초 간격을 두고(요청하는 그 시각 기준), 하루 44회(학과 게시판 서버는 32회, Wix 피드 호스트는 7회)로 제한합니다. 수집 Lambda는 동시에 하나만 돌아서(reserved concurrency 1) 손으로 돌린 실행이 예약 실행과 겹치지 않습니다.
   - 수집 시각: 평일 09:00~18:40 20분마다와 평일 21:00(KST). 휴강·통제 공지가 전날 저녁에 올라오는 경우가 많아 저녁에 한 번 더 봅니다. 주말은 공지가 없어(첫 309건 중 0건) 보지 않습니다.
   - 강한 차단(403·429·보안문자/챌린지 화면): 그 서버가 30분 → 60분 → 2시간 … 최대 24시간 쉽니다. 429·503의 Retry-After가 더 길면 그 값(최대 7일)을 따릅니다. 3번 연속이면 그 origin을 끄고, 끈 origin을 건너뛸 때마다 OriginDisabled 지표를 남겨 `kw-collector-origin-disabled` 알람이 계속 울립니다. 다시 켜는 건 사람이 합니다: `uv run python scripts/collector_admin.py reenable --origin <서버>`(기본은 보기만, `--apply`로 차단 횟수·쿨다운·꺼짐을 한꺼번에 되돌림).
@@ -99,9 +99,14 @@ EventBridge Scheduler (평일 09:00~18:59 KST, 20분마다)
   - 보안문자 판정은 목록을 못 읽은 화면에서만 합니다. 정상 목록 화면에 Cloudflare 분석 스크립트나 CDN 주소가 있어도 차단으로 보지 않습니다.
   - 요청 하나는 소켓 단계마다 15초, 본문 전체 30초를 넘기면 끊고(`slow`), Lambda 남은 시간이 요청 하나의 최악 시간보다 적으면 그 서버는 건너뜁니다.
   - robots.txt: 수집하는 호스트마다 2026-11-06에 손으로 한 번씩 확인하고 결과를 `politeness.ROBOTS`에 적었습니다. 기록이 없는 호스트와 Disallow 경로는 요청하지 않습니다(NeedsHuman). 지금 수집하는 경로는 모두 허용입니다. 같은 E1 서버의 job.kw.ac.kr은 `/recommend/`, `/internship/`, `/job/`, `/notice/news.php` 등을 막아서 수집하지 않습니다.
-  - User-Agent: `kw-campus/1.0 (+https://github.com/kyowon1108/kw-campus; contact <bridge>/privacy; …)`. AWS 공용 IP에서 나가므로 학교 관리자가 이 프로젝트와 연락처를 찾을 수 있게 했습니다.
-- **저장하는 것**: 제목, 분류, 부서, 날짜, 링크뿐입니다. 제목과 부서는 저장 전에 마스킹합니다(redaction v2, 항목의 `norm_v`=2): 연락처(점·괄호로 쓴 전화번호, `[at]` 메일 포함), 학번·계좌 같은 번호, 사람 이름(님·씨·학생·교수·선생님 앞의 이름, 합격자·명단·수상·학위논문 같은 명단 제목과 부고 제목의 이름, `홍*동` 같은 일부 가린 이름). 본문과 첨부는 가져오지 않습니다. 120일이 지나면 자동으로 지웁니다.
-- **내리기**: 학교가 글을 지웠거나 삭제 요청이 오면 `uv run python scripts/collector_admin.py takedown <글 번호>`로 확인하고 `--apply`로 Discord 메시지(수정됨 답글 포함), 전달 기록, kw-public 항목을 지웁니다. 항목은 빈 표시(removed)로 남아 다음 수집이 되살리지 않습니다. 전달 기록은 150일 보관해 공지가 남아 있는 동안은 메시지를 찾을 수 있습니다.
+  - User-Agent: `kw-campus/1.0 (+<bridge>/privacy; student non-commercial notice alerts)`(`config.USER_AGENT`). AWS 공용 IP에서 나가므로 학교 관리자가 무엇을 하는 프로젝트인지와 연락처·수집 거부 방법(처리방침 3항)을 찾을 수 있게 했습니다. 저장소는 비공개라 링크하지 않습니다(관리자가 받는 건 404뿐). 개인 이메일 주소도 넣지 않습니다.
+- **저장하는 것**: 제목, 분류, 부서, 날짜, 링크뿐입니다. 제목과 부서는 저장 전에 마스킹합니다(redaction v3, 항목의 `norm_v`=3, 규칙 전체는 `kwnotice/redaction.py` 첫머리):
+  - 연락처: 메일(`[at]`·`(at)`·`골뱅이`로 쓴 것 포함), 휴대폰·지역번호·대표번호·국제 전화번호(점·괄호·유니코드 대시로 쓴 것, `02)940-5114`처럼 괄호를 하나만 쓴 것 포함).
+  - 번호: 주민등록번호, 학번·사번·수험번호·계좌처럼 이름표가 붙은 번호, 10~14자리 숫자, `2021****56`처럼 일부 가린 학번. 공지 자체의 번호(`공지번호 …`)만 남깁니다.
+  - 사람 이름: 님·씨·학생·교수·선생님·조교·동문·박사·석사·학우나 `외 N명` 앞의 이름(사이에 소속 괄호가 있거나 쉼표로 늘어놓은 이름도), `외`·상·합격 앞의 전체 이름, 가린 번호 옆의 이름, 합격자·명단·선발 결과·수상·장학생·대상자·학위논문·공개발표·심사·졸업생·인터뷰·우승·○○상 같은 명단·수상 제목의 이름(`대상` 한 단어는 뒤에 수상·받·차지·영예가 오거나, 대회·공모전 같은 말 바로 뒤이거나, 제목에 다른 상이 있을 때만 상으로 보고, `재학생 대상 …`의 '대상'은 그대로 둠), 부고 제목의 이름, `홍*동`·`김○수`·`김OO` 같은 일부 가린 이름. 이름처럼 보는 말은 흔한 성으로 시작하는 한글 2~4음절이고, 과·팀·센터·학·생 같은 끝이나 제목에 흔한 말이면 이름으로 보지 않습니다(`교수학습센터 안내`, `국가장학금 대상자 안내`는 그대로).
+  - 이미 가린 표시는 다시 건드리지 않아서 두 번 돌려도 결과가 같습니다. 규칙이 바뀌어 `norm_v`만 오르는 변경은 조용한 재정규화로 봅니다(아래 '수정 공지').
+  - 본문과 첨부는 가져오지 않습니다. 마지막으로 바뀐 날부터 120일이 지나면 자동으로 지웁니다.
+- **내리기**: 학교가 글을 지웠거나 삭제 요청이 오면 `uv run python scripts/collector_admin.py takedown <글 번호>`로 확인하고 `--apply`로 Discord 메시지(수정됨 답글 포함), 전달 기록, kw-public 항목을 지웁니다. 항목은 빈 표시(removed)로 남아 다음 수집이 되살리지 않습니다. 전달 기록은 올린 날부터 150일, 공지가 바뀔 때마다 그날부터 다시 150일 보관해(공지보다 30일 더, `discord.RECORD_GRACE`) 공지가 남아 있는 동안은 메시지를 찾을 수 있습니다. 메시지에 보이지 않는 변경(고정·학과)이나 알림이 꺼져 있을 때의 변경도 dispatcher가 keep 작업으로 기록 보관 기간만 늘립니다.
 - **첫 수집**: 알림 없이 기준점으로만 저장합니다. 그 뒤 새 글만 알립니다. 오래된 고정 글은 알리지 않습니다.
 - **채널 배정**
 
@@ -123,7 +128,7 @@ EventBridge Scheduler (평일 09:00~18:59 KST, 20분마다)
   - 누가 원래 메시지를 지웠으면 다시 만들지 않습니다. 같은 작업이 SQS에서 두 번 와도 한 번만 올리고(90초 안의 다른 시도는 건드리지 않고, 메시지마다 nonce), 답글을 올린 뒤 응답을 못 받고 죽은 시도는 채널의 최근 메시지에서 그 답글을 찾아 다시 올리지 않습니다. Discord가 429를 주면 그 배치의 나머지는 SQS가 다시 줄 때까지 보내지 않습니다.
 - **구독 역할**: 주제마다 역할 하나(`긴급 알림`, `학사 알림`, `장학 알림`, `취업 알림`, `국제 알림`, `일반 공지 알림`, 단과대 9개, 목록과 이름은 `topics.TOPICS` 한 곳). #알림-설정의 버튼을 누르면 그 역할이 켜지거나 꺼지고, 누른 사람에게만 보이는 답이 옵니다. 새 공지는 자기 주제 역할만 멘션합니다(`allowed_mentions`에 그 역할만, @everyone·@here 없음). 같은 역할은 30분에 한 번만 멘션합니다(학과 사이트 다섯 곳에 같은 취업박람회 글이 올라오는 경우). 공지를 고쳐도 다시 울리지 않습니다.
 - **긴급**: 학교 전체 공지(메인 게시판, 취업게시판)의 제목에 휴강·결강·휴교·강의실/시험 장소 변경·비대면 전환·출입 통제·폐쇄·정전·단수·시스템 장애·운행 중단 같은 말이 있으면(`routing.is_urgent`) `긴급 알림`도 멘션합니다. 긴급은 30분 제한 없이 매번 울립니다. 학과 게시판의 과목 휴강·강의실 변경은 그 단과대 역할만 멘션합니다. 모집·신청·제출·계획서·교원용·연휴·개교기념일·정기점검이 든 제목과 출입국·장애인·내부통제·출입통제시스템 같은 비슷한 말은 뺍니다.
-- **이름이 들어갈 수 있는 제목**: 제목의 연락처·학번은 가리지만 사람 이름은 아직 가리지 않습니다(가림 규칙 v2 예정). 그때까지 학과 게시판·피드의 수상·명단·합격·부고·조의·당선·선발 결과·축하 글과, 어느 게시판이든 `홍*동`·`김○○`처럼 가린 이름이 보이는 제목은 Discord에 `[학과] 새 글 (제목은 링크에서 확인)`과 링크만, 멘션 없이 올립니다(`routing.name_risk`).
+- **이름이 들어갈 수 있는 제목**: 제목의 연락처·학번·사람 이름은 저장 전에 가리지만(redaction v3) 모든 이름을 잡는 규칙은 없습니다. 그래서 학과 게시판·피드의 수상·명단·합격·부고·조의·당선·선발 결과·축하·학위논문·공개발표·심사·졸업생·인터뷰·입상·우승·○○상 글과, 어느 게시판이든 명단·수상·합격 제목에 아직 전체 이름처럼 보이는 말이 남은 제목(`redaction.may_name_someone`), `홍*동`·`김○○`처럼 가린 이름이 보이는 제목은 Discord에 `[분류] 새 글 (제목은 링크에서 확인)`과 링크만, 멘션 없이 올립니다(`routing.name_risk`).
 - **버튼 처리**: `kw-discordinteractions` Lambda(`POST /discord/interactions`, API `kw-discord`). Discord 서명(Ed25519)을 확인하고, 버튼 ID에 맞는 역할을 `/kw/discord/roles`에서만 찾아 그 역할 하나만 붙이거나 뗍니다. 요청에 든 역할 ID는 쓰지 않습니다. 서명 시각이 60초보다 오래되었거나 숫자 12자리를 넘는 요청은 거절합니다. 이 함수는 SSM 세 값(`bot-token`, `public-key`, `roles`)을 한 번에 읽고 테이블 권한은 없습니다. 아직 역할이 없는 주제 버튼은 역할 목록을 한 번 더 읽어 보고, 그래도 없으면 "준비 중"이라고 답합니다. 역할을 못 바꾼 클릭이 한 시간에 3번이면 `kw-discord-buttons-failed` 알람이 옵니다(봇 역할이 구독 역할 아래로 내려갔을 때, setup 순서가 틀렸을 때 등). 공개키가 없다는 결과는 캐시하지 않아서, 넣은 즉시 포털 저장이 됩니다.
 - **읽기 전용 채널**: 공지 채널, #알림-설정, #학과-공지는 @everyone에게 기록 보기를 허용하고 메시지·스레드 만들기·스레드 메시지를 막습니다. 보기 권한은 건드리지 않아서 숨긴 채널·분류는 숨긴 채로 남습니다. 봇에는 그 채널에서 보기·보내기·링크 첨부·기록 보기와 역할 멘션만 줍니다.
 
@@ -133,7 +138,7 @@ EventBridge Scheduler (평일 09:00~18:59 KST, 20분마다)
 - 채널에 원래 있던 다른 권한 설정은 그대로 둡니다. 새로 만드는 채널은 #학교-공지가 있는 분류의 권한을 물려받고, 같은 이름의 채널은 그 분류 안에 있을 때만 씁니다.
 - 손으로 넣은 `department` 채널도 플래그 없이 늘 읽기 전용·봇 멘션 허용을 맞춥니다. 서버에 없는 ID면 경고합니다.
 - 멈추는 경우(아무것도 바꾸지 않음): 봇에 관리자 권한이 있을 때(exit 2), 같은 이름의 기존 역할에 권한이 있거나 연동 역할이거나 봇 역할보다 위에 있을 때(exit 1).
-- 고치는 경우: 기존 구독 역할이 '누구나 멘션 가능'이면 끄고, `topics.TOPICS`에서 이름이 바뀌었으면(2028년 단과대 개편 등) 이름만 바꿉니다. #알림-설정·#학과-공지의 채널 주제 문구가 다르면 고칩니다.
+- 고치는 경우: 기존 구독 역할이 '누구나 멘션 가능'이면 끄고, `topics.TOPICS`에서 이름이 바뀌었으면(2028년 단과대 개편 등) 이름만 바꿉니다. #알림-설정의 채널 주제 문구가 다르면 고칩니다. #학과-공지의 주제는 `--department-channel`을 붙여 돌릴 때만 고칩니다(플래그 없이는 권한만 맞춤).
 - 알려 주는 것: 봇 역할의 위험한 권한(추방·차단·서버 관리·메시지 관리·웹후크 등, 이름 없는 비트는 16진수), @everyone의 '모든 역할 멘션', 서버 기본 알림이 '모든 메시지'인지.
 - 역할 목록(`/kw/discord/roles`)은 버튼 메시지를 고치기 전에 씁니다. SSM 쓰기가 실패하면 그대로 실행할 `aws ssm put-parameter` 명령을 보여 주고 exit 1로 끝납니다(값에 비밀은 없음).
 - 실행하는 AWS 자격 증명에는 `/kw/discord/bot-token` 읽기(GetParameter, 복호화)와 `/kw/discord/roles`·`/kw/discord/channels` 쓰기(PutParameter)가 둘 다 있어야 합니다. 아래 '배포 권한'의 두 권한 세트 중 하나만으로는 끝까지 못 돕니다. 루트나 두 권한을 다 가진 프로필로 돌리거나, 쓰기 단계에서 출력된 명령을 쓰기 권한 프로필로 실행합니다.
@@ -155,6 +160,8 @@ uv run --with 'botocore[crt]' python scripts/discord_setup.py --department-chann
 4. 서버 설정 → 역할 → 봇 역할(KW Campus)에 `역할 관리`와 `채널 관리`를 켭니다. 봇 역할이 구독 역할보다 위에 있어야 합니다(새로 만드는 역할은 맨 아래에 생김). 관리자 권한은 주지 않습니다.
 5. 계획을 보고 `--apply`로 적용합니다.
 6. 적용이 끝나면 봇 역할에서 `채널 관리`를 끕니다. 봇 역할에 남길 권한은 채널 보기·메시지 보내기·링크 첨부·메시지 기록 보기·역할 관리(권한 값 268520448)입니다.
+
+`topics.TOPICS`에 주제를 더하거나 키를 바꾼 뒤에는 `cdk deploy`를 먼저 하고 `--apply`를 돌립니다. 순서가 바뀌면 새 버튼 메시지가 먼저 올라가고, 아직 예전 목록을 쓰는 `kw-discordinteractions`는 그 버튼에 "이 버튼은 이제 쓰지 않습니다"라고만 답합니다. 이 답은 `InteractionFailed`에 세지 않아 `kw-discord-buttons-failed` 알람도 울리지 않습니다.
 
 서버 설정 → 개요 → 기본 알림 설정은 '@멘션만'으로 둡니다. '모든 메시지'면 멤버가 공지와 수정 답글마다 알림을 받아 구독 역할이 의미가 없습니다. 학사·장학·긴급을 기본으로 켜 두려면 봇이 붙이지 말고 Discord 온보딩 질문에서 미리 골라 둡니다.
 
@@ -212,6 +219,40 @@ cd infra
 
 알람 메일을 빼고 배포하면 SNS 구독이 지워집니다. 처음 구독하면 AWS가 확인 메일을 보내고, 그 링크를 눌러야 알람이 옵니다.
 
+### 1.0.0 배포 순서와 사전 점검
+
+1.0.0을 처음 올릴 때 한 번 합니다. 1.0 에이전트와 확장은 bridge의 `?source` 필터와 `department` 요청을 쓰고, bridge는 kw-mcp 릴리스를 그대로 싣기 때문에 순서가 중요합니다.
+
+사전 점검:
+1. **AWS 계정**: root로 배포한다면 root에 MFA가 켜져 있는지 확인합니다(콘솔 오른쪽 위 계정 이름 → 보안 자격 증명). 더 나은 방법은 아래 '배포 권한'의 배포용 역할로 옮기는 것입니다. 계정을 빼앗기면 `/kw/bridge/jwt-secret`으로 친구들의 PC 에이전트를 거쳐 KLAS 데이터를 읽을 수 있습니다.
+2. **Lambda 동시 실행 한도**: 예약 동시 실행 합계(`infra/kw_campus_stack.py`의 `BRIDGE_CONCURRENCY` + `BRIDGE_RESULT_CONCURRENCY` + 수집기 1, 지금 20 + 5 + 1 = 26)를 빼고도 계정에 100이 남아야 배포됩니다. 아래 값이 126 이상인지 봅니다. 모자라면 Service Quotas → AWS Lambda → Concurrent executions를 늘려 승인된 뒤 배포합니다.
+   ```bash
+   aws lambda get-account-settings --region ap-northeast-2 --query AccountLimit.ConcurrentExecutions
+   ```
+3. **1.0 전에 등록한 PC**: `invite_hash`가 생기기 전에 등록한 기기(운영자 PC 등)는 초대를 회수해도 끊기지 않고, 그 기기의 예전 갱신 토큰(`REFRESH#`)은 `kw-mcp connections`에 보이지 않습니다. 아래 명령으로 찾아 각 PC의 `kw-mcp status`에 나오는 기기 ID와 맞춰 봅니다. 배포가 끝난 뒤 그 PC에 1.0을 설치하고 `kw-mcp unlink` → `kw-mcp link <초대코드>`로 다시 연결합니다(커넥터는 새 연결 코드로 다시 승인). 더 쓰지 않는 PC면 `kw-mcp unlink`만 합니다. unlink하면 서버의 기기 기록이 지워지므로 남은 `REFRESH#` 토큰도 더는 쓰이지 않습니다.
+   ```bash
+   aws dynamodb scan --region ap-northeast-2 --table-name kw-bridge \
+     --filter-expression 'SK = :m AND begins_with(PK, :d) AND attribute_not_exists(invite_hash)' \
+     --expression-attribute-values '{":m": {"S": "META"}, ":d": {"S": "DEV#"}}' --projection-expression 'PK, created_at, last_seen'
+   ```
+4. **릴리스 키 백업**: 서명 키는 이 Mac 키체인(서비스 `kw-campus-release`, 계정 `signing-key`)에만 있습니다. 잃으면 이미 설치된 에이전트에 새 버전을 보낼 수 없습니다(키를 바꾸면 모든 PC에서 다시 설치해야 함). 암호화한 사본을 오프라인 저장소(USB 등)에 둡니다. 키는 화면에 나오지 않고 바로 암호화되며, openssl이 터미널에서 암호를 묻습니다. 그 암호는 키와 따로(비밀번호 관리자 등) 보관합니다.
+   ```bash
+   security find-generic-password -s kw-campus-release -a signing-key -w \
+     | openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -out /Volumes/<USB>/kw-release-key.enc
+   # 되살리기 (kw-mcp 폴더에서)
+   openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /Volumes/<USB>/kw-release-key.enc \
+     | uv run python -c "import keyring, sys; keyring.set_password('kw-campus-release', 'signing-key', sys.stdin.read().strip())"
+   ```
+
+배포 순서:
+1. kw-mcp: `pyproject.toml`과 `manifest.json`의 version을 `1.0.0`으로 올리고 `uv lock`을 돌립니다.
+2. kw-mcp: 커밋하고 `git tag v1.0.0`.
+3. kw-mcp: `scripts/release.sh` (위 1번). `dist/release/`에 서명된 1.0.0이 생깁니다.
+4. kw-campus: `uv lock`으로 kw-mcp 1.0.0을 다시 읽고 커밋합니다. 안 하면 `build_lambda.sh`의 `uv export --locked`가 멈춥니다. Lambda는 kw-mcp의 의존성을 이 잠금 파일에서 받으므로 `git diff uv.lock`으로 다른 버전이 바뀌었는지도 봅니다.
+5. kw-campus: `./scripts/build_lambda.sh`. 릴리스 버전이 kw-mcp 폴더의 version과 다르거나, wheel의 `kw_mcp/*.py`가 `src/kw_mcp/*.py`와 한 바이트라도 다르면 멈춥니다(테스트는 kw-mcp 폴더의 코드로 돌았으니 Lambda에도 같은 코드가 들어가야 함).
+6. `cdk deploy`.
+7. 배포가 끝난 뒤에 초대 링크를 보냅니다. 이미 설치된 에이전트는 `latest.json`을 보고 스스로 1.0.0으로 올라갑니다.
+
 ### 배포 권한 (root 대신)
 
 지금은 root 로그인으로 배포하고 있습니다. 바꾸는 순서는 이렇습니다(계정 보안 설정이라 직접 합니다).
@@ -225,3 +266,62 @@ cd infra
 1. `/kw/collector/enabled=true`로 켜고, 첫 수집(기준점 저장)이 끝났는지 확인합니다.
 2. 집 PC의 kw-notice-mcp launchd 수집기를 끕니다. 두 곳이 같은 서버를 동시에 긁지 않게 하려는 것입니다.
 3. Discord 채널 ID와 봇 토큰을 넣은 뒤 `/kw/collector/notify=true`로 알림을 켭니다.
+
+## 알람 대응: 스트림 DLQ (`kw-stream-dlq`)
+
+dispatcher가 재시도(3번, 배치 나누기)로도 처리하지 못한 kw-public 스트림 배치는 건너뛰고, `kw-stream-dlq`에는 그 배치를 가리키는 메시지만 남습니다(스트림 ARN, 샤드 ID, 시퀀스 번호 범위. 공지 내용은 없음). 레코드 자체는 DynamoDB 스트림에 24시간만 남습니다. 공지는 kw-public에 그대로 있고 알림만 빠진 상태입니다.
+
+1. 원인(`kw-dispatcher` 로그의 오류, SQS 권한 등)을 먼저 고칩니다. `/kw/collector/notify`가 꺼져 있으면 dispatcher는 Discord로 가는 작업을 만들지 않고(전달 기록의 ttl만 옮기는 keep 작업만 보냄) 성공으로 끝나므로, 다시 보내기 전에 켜져 있는지 봅니다.
+2. 24시간 안이면 스트림에서 그 범위를 읽어 dispatcher에 다시 넣습니다. dispatcher가 받아 준 메시지만 큐에서 지웁니다(실패하면 그대로 남음). 이미 올라간 공지는 sender의 전달 기록 때문에 다시 올라가지 않습니다. 한 번에 메시지 10개까지 처리하니, 큐가 빌 때까지 되풀이합니다.
+   ```bash
+   uv run python - <<'EOF'
+   import json
+   import boto3
+
+   sqs, streams, lam = (boto3.client(s, region_name="ap-northeast-2") for s in ("sqs", "dynamodbstreams", "lambda"))
+   url = sqs.get_queue_url(QueueName="kw-stream-dlq")["QueueUrl"]
+   for msg in sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, VisibilityTimeout=600).get("Messages", []):
+       info = json.loads(msg["Body"])["DDBStreamBatchInfo"]
+       end = int(info["endSequenceNumber"])
+       it = streams.get_shard_iterator(StreamArn=info["streamArn"], ShardId=info["shardId"],
+                                       ShardIteratorType="AT_SEQUENCE_NUMBER",
+                                       SequenceNumber=info["startSequenceNumber"])["ShardIterator"]
+       records = []
+       for _ in range(100):
+           page = streams.get_records(ShardIterator=it, Limit=100)
+           records += [r for r in page["Records"] if int(r["dynamodb"]["SequenceNumber"]) <= end]
+           it = page.get("NextShardIterator")
+           if not it or any(int(r["dynamodb"]["SequenceNumber"]) >= end for r in page["Records"]):
+               break
+       out = lam.invoke(FunctionName="kw-dispatcher", Payload=json.dumps({"Records": records}, default=str))
+       if "FunctionError" in out:
+           print(info["shardId"], "dispatcher failed again; the message stays in the queue")
+           continue
+       sqs.delete_message(QueueUrl=url, ReceiptHandle=msg["ReceiptHandle"])
+       print(info["shardId"], len(records), "records dispatched again")
+   EOF
+   ```
+3. 24시간이 지났으면(`get-shard-iterator`가 `TrimmedDataAccessException`) 스트림 레코드는 없습니다. 알람 시각 즈음 새로 저장된 공지의 글 번호(`kw-public`의 `first_seen`으로 찾음, `collector_admin.py takedown`과 같은 형식)를 골라 새 글로 다시 보냅니다. dispatcher의 규칙(첫 수집분·오래된 고정 글·FAQ는 빼기, 채널 고르기)을 그대로 쓰고, 이미 올라간 공지는 sender가 건너뜁니다. 놓친 수정 알림은 다시 만들 수 없고, 학교가 그 글을 다시 고치면 그때 반영됩니다. 다 보냈으면 `aws sqs purge-queue --region ap-northeast-2 --queue-url <kw-stream-dlq URL>`로 큐를 비웁니다.
+   ```bash
+   uv run python - <글 번호> <글 번호> ... <<'EOF'
+   import json
+   import sys
+
+   import boto3
+   from boto3.dynamodb.types import TypeSerializer
+
+   sys.path.insert(0, "scripts")
+   from collector_admin import notice_key
+
+   table = boto3.resource("dynamodb", region_name="ap-northeast-2").Table("kw-public")
+   records = []
+   for post_id in sys.argv[1:]:
+       item = table.get_item(Key=notice_key(post_id), ConsistentRead=True).get("Item")
+       if item and not item.get("removed"):
+           image = {k: TypeSerializer().serialize(v) for k, v in item.items()}
+           records.append({"eventName": "INSERT", "dynamodb": {"NewImage": image}})
+   out = boto3.client("lambda", region_name="ap-northeast-2").invoke(
+       FunctionName="kw-dispatcher", Payload=json.dumps({"Records": records}))
+   print(len(records), "notices", "failed" if "FunctionError" in out else "dispatched again")
+   EOF
+   ```

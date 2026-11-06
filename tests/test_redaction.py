@@ -94,7 +94,7 @@ def test_ordinary_titles_stay_as_they_are(title):
 
 
 def test_version_and_level():
-    assert REDACTION_VERSION == "v2" and REDACTION_LEVEL == 2
+    assert REDACTION_VERSION == "v3" and REDACTION_LEVEL == 3
 
 
 def test_departments_and_human_fields_go_through_the_same_pass():

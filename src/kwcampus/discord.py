@@ -13,13 +13,27 @@ posting so an SQS retry never posts the same notice twice.
   goes under it, at most once per notice per KST day. Our own changes (new redaction rules, a
   recategorised notice) are quiet: the message is fixed, nobody is told.
 - repost: a department board reused an old post for a new one; edit it if we posted it, else post.
+- keep: the notice changed in a way the message doesn't show (pinned, department), or while
+  notifications were off; only the delivery record's ttl moves, Discord isn't called (so neither a
+  missing bot token nor a 429 holds it up).
+A notice taken down by hand (removed=true) is never posted or edited again, whatever job comes late.
+
+The delivery record lives 30 days longer than its notice: each edit, repost and keep moves its ttl
+along with the notice's, so a late takedown or edit still finds the message. Messages themselves
+stay in Discord until a takedown deletes them.
+
+After a 429 a record waits in this invocation when Discord asks for 5 s or less and there is time
+left, and goes again; otherwise it and the rest of the batch go back to SQS, visible again once
+Discord's wait is over (not after the queue's 180 s), so a redrive drains at Discord's pace.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
+import time
 from datetime import UTC, datetime, timedelta
 
 import boto3
@@ -35,6 +49,7 @@ from kwcampus.config import (
     DISCORD_TOKEN_PARAM,
     EDIT_REPLY_AFTER,
     KST,
+    NOTICE_TTL,
     PUBLIC_TABLE,
     QUIET_FROM_HOUR,
     QUIET_UNTIL_HOUR,
@@ -70,6 +85,14 @@ MENTION_EVERY = timedelta(minutes=30)
 EDIT_NOTE_PREFIX = "✏️ 수정됨"
 SAFE_TITLE = "새 글 (제목은 링크에서 확인)"
 NO_PINGS = {"parse": []}
+# A delivery record outlives its notice (kw-public ttl) by this much.
+RECORD_GRACE = DELIVERY_TTL - NOTICE_TTL
+# A 429 asking for at most this long is waited out in the invocation (Lambda timeout 60 s) ...
+RATE_LIMIT_WAIT_MAX = 5.0
+# ... when this much time is left after the wait: one job makes up to three Discord calls of 10 s
+RATE_LIMIT_MARGIN = 20.0
+RATE_LIMIT_TRIES = 3  # tries per record within one invocation
+VISIBILITY_MAX = 43200  # SQS's limit (12 h)
 
 _MARKDOWN = re.compile(r"([\\*_~`|>\[\]()#])")
 
@@ -211,11 +234,45 @@ def _earlier_reply(send, token: str, channel: str, message_id: str, today: str) 
     return None
 
 
+def _record_ttl(item: dict, now: datetime) -> int:
+    """When a delivery record may go: 150 days from now, and never before its notice's ttl + 30 days
+    (store.upsert moves that one to 120 days after each change)."""
+    try:
+        notice_ttl = int(item.get("ttl") or 0)
+    except (TypeError, ValueError):
+        notice_ttl = 0
+    return max(int((now + DELIVERY_TTL).timestamp()), notice_ttl + int(RECORD_GRACE.total_seconds()))
+
+
+def _keep_record(delivery, dkey: dict, item: dict, now: datetime) -> None:
+    """Move the record's ttl forward with its notice's; a record deleted meanwhile (a takedown) stays gone."""
+    try:
+        delivery.update_item(
+            Key=dkey, UpdateExpression="SET #ttl = :ttl",
+            ConditionExpression="attribute_exists(PK) AND (attribute_not_exists(#ttl) OR #ttl < :ttl)",
+            ExpressionAttributeNames={"#ttl": "ttl"}, ExpressionAttributeValues={":ttl": _record_ttl(item, now)},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+
+
+def _release(delivery, dkey: dict, update: str, condition: str, values: dict, names: dict | None = None) -> None:
+    """Give up a claim this attempt still holds (after a 429); someone else's is left alone."""
+    try:
+        delivery.update_item(Key=dkey, UpdateExpression=update, ConditionExpression=condition,
+                             ExpressionAttributeValues=values, **({"ExpressionAttributeNames": names} if names else {}))
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+
+
 def _post(item, dkey, channel_id, delivery, token, roles, send, now) -> str:
+    claimed_at = int(now.timestamp())
     try:
         delivery.put_item(
-            Item={**dkey, "status": "claimed", "channel_id": channel_id, "claimed_at": int(now.timestamp()),
-                  "ttl": int((now + DELIVERY_TTL).timestamp())},
+            Item={**dkey, "status": "claimed", "channel_id": channel_id, "claimed_at": claimed_at,
+                  "ttl": _record_ttl(item, now)},
             # a duplicate job while the first is still posting must not post (and ping) again
             ConditionExpression=(
                 "attribute_not_exists(PK) OR (#s = :claimed AND attribute_not_exists(message_id) "
@@ -232,9 +289,17 @@ def _post(item, dkey, channel_id, delivery, token, roles, send, now) -> str:
     mentions = _throttle(delivery, mentions_for(item, roles, now), urgent_role, dkey["PK"], now)
     # Only these roles may ping: never @everyone, @here, users or other roles.
     allowed = {"parse": [], "roles": mentions} if mentions else NO_PINGS
-    message = send("POST", f"/channels/{channel_id}/messages", token, {
-        "content": render(item, mentions), "allowed_mentions": allowed, "flags": SUPPRESS_EMBEDS,
-        "nonce": _nonce(dkey["PK"], dkey["SK"]), "enforce_nonce": True})
+    try:
+        message = send("POST", f"/channels/{channel_id}/messages", token, {
+            "content": render(item, mentions), "allowed_mentions": allowed, "flags": SUPPRESS_EMBEDS,
+            "nonce": _nonce(dkey["PK"], dkey["SK"]), "enforce_nonce": True})
+    except RateLimited:
+        # Discord refused it, so nothing was posted: free the claim, or the retry a few seconds from
+        # now would take it for a post still in flight and skip the notice ("already_posted").
+        _release(delivery, dkey, "SET claimed_at = :zero",
+                 "#s = :claimed AND attribute_not_exists(message_id) AND claimed_at = :mine",
+                 {":zero": 0, ":claimed": "claimed", ":mine": claimed_at}, {"#s": "status"})
+        raise
     values = {":sent": "sent", ":mid": str(message["id"])}
     update = "SET #s = :sent, message_id = :mid"
     if mentions:  # kept so later edits show the same roles and night posts stay without them
@@ -257,6 +322,7 @@ def _edit(job, item, dkey, record, delivery, token, send, now) -> str:
               "allowed_mentions": {"parse": [], "roles": mentions} if mentions else NO_PINGS})
     except NotFound:
         return "message_gone"  # someone deleted it; don't bring it back
+    _keep_record(delivery, dkey, item, now)  # the notice's ttl moved with this change; the record follows
     if job.get("quiet"):
         return "edited_quietly"  # our own change (redaction rules, category): nothing to tell readers
     sent_at = posted_at(message_id)
@@ -266,16 +332,24 @@ def _edit(job, item, dkey, record, delivery, token, send, now) -> str:
     claim = _claim_reply(delivery, dkey, today, now)
     if claim is None:
         return "edited"  # today's note is already there
-    note_id = _earlier_reply(send, token, record_channel, message_id, today) if claim == "takeover" else None
-    if note_id is None:
-        note_id = str(send("POST", f"/channels/{record_channel}/messages", token, {
-            "content": render_edit_note(item, job.get("changed") or ["title"], now),
-            "allowed_mentions": {"parse": [], "replied_user": False},
-            "flags": SUPPRESS_EMBEDS,
-            "message_reference": {"message_id": message_id, "channel_id": record_channel,
-                                  "fail_if_not_exists": False},
-            "nonce": _nonce(dkey["PK"], dkey["SK"], "edit", today), "enforce_nonce": True,
-        })["id"])
+    try:
+        note_id = _earlier_reply(send, token, record_channel, message_id, today) if claim == "takeover" else None
+        if note_id is None:
+            note_id = str(send("POST", f"/channels/{record_channel}/messages", token, {
+                "content": render_edit_note(item, job.get("changed") or ["title"], now),
+                "allowed_mentions": {"parse": [], "replied_user": False},
+                "flags": SUPPRESS_EMBEDS,
+                "message_reference": {"message_id": message_id, "channel_id": record_channel,
+                                      "fail_if_not_exists": False},
+                "nonce": _nonce(dkey["PK"], dkey["SK"], "edit", today), "enforce_nonce": True,
+            })["id"])
+    except RateLimited:
+        # Discord refused this call: mark today's reply slot stale so the retry takes it over (it looks
+        # for a note an earlier attempt may have posted, then posts) instead of skipping the note.
+        _release(delivery, dkey, "SET reply_claimed_at = :zero",
+                 "reply_day = :day AND reply_state = :claimed AND reply_claimed_at = :mine",
+                 {":zero": 0, ":day": today, ":claimed": "claimed", ":mine": int(now.timestamp())})
+        raise
     delivery.update_item(
         Key=dkey,
         UpdateExpression="SET reply_state = :sent, reply_message_id = :mid",
@@ -295,7 +369,17 @@ def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str]
     item = public.get_item(Key=job["key"], ConsistentRead=True).get("Item")
     if not item:
         return "gone"
+    if item.get("removed"):
+        # taken down (collector_admin takedown): a late or redriven job must not post it again
+        return "removed"
     dkey = {"PK": f"{job['key']['PK']}|{job['key']['SK']}", "SK": f"CH#{job['channel']}"}
+
+    if action == "keep":  # the notice's ttl moved with nothing the message shows: no Discord call
+        found_key, record = _find_record(delivery, dkey)
+        if not record:
+            return "nothing_to_keep"  # never posted, or taken down: a missing record stays missing
+        _keep_record(delivery, found_key, item, now)
+        return "kept"
 
     if action in ("edit", "repost"):
         found_key, record = _find_record(delivery, dkey)
@@ -312,7 +396,57 @@ def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str]
     return "unknown_action"
 
 
-def handler(event, context):
+def _waiting_out_429s(run_job, time_left, sleep) -> str:
+    """run_job(), waiting in place when Discord asks for RATE_LIMIT_WAIT_MAX seconds or less and the
+    invocation has the time; any other 429 goes up to the caller."""
+    attempt = 1
+    while True:
+        try:
+            return run_job()
+        except RateLimited as e:
+            wait = max(0.0, e.retry_after)
+            if (attempt >= RATE_LIMIT_TRIES or wait > RATE_LIMIT_WAIT_MAX
+                    or time_left() < wait + RATE_LIMIT_MARGIN):
+                raise
+            log("discord_rate_limited_wait", retry_after=wait, attempt=attempt)
+            sleep(wait)
+            attempt += 1
+
+
+def _queue_url(arn: str) -> str | None:
+    """arn:aws:sqs:<region>:<account>:<name> -> https://sqs.<region>.amazonaws.com/<account>/<name>"""
+    parts = arn.split(":")
+    if len(parts) != 6 or parts[:3] != ["arn", "aws", "sqs"]:
+        return None
+    return f"https://sqs.{parts[3]}.amazonaws.com/{parts[4]}/{parts[5]}"
+
+
+def _come_back_after(records: list[dict], seconds: float) -> None:
+    """Make these SQS messages visible again once Discord's wait is over instead of after the queue's
+    180 s visibility timeout. Best effort: if this fails, they come back after the 180 s."""
+    timeout = min(VISIBILITY_MAX, max(1, math.ceil(seconds)))
+    by_queue: dict[str, list[dict]] = {}
+    for record in records:
+        url = _queue_url(str(record.get("eventSourceARN") or ""))
+        if url and record.get("receiptHandle"):
+            by_queue.setdefault(url, []).append(record)
+    if not by_queue:
+        return
+    sqs = boto3.client("sqs")
+    for url, rows in by_queue.items():
+        for start in range(0, len(rows), 10):
+            entries = [{"Id": str(i), "ReceiptHandle": r["receiptHandle"], "VisibilityTimeout": timeout}
+                       for i, r in enumerate(rows[start:start + 10])]
+            try:
+                failed = sqs.change_message_visibility_batch(QueueUrl=url, Entries=entries).get("Failed") or []
+            except Exception as e:  # noqa: BLE001 - the 180 s default still brings them back
+                log("discord_visibility_failed", error=type(e).__name__, records=len(entries))
+                continue
+            if failed:
+                log("discord_visibility_failed", error="partial", records=len(failed))
+
+
+def handler(event, context, sleep=time.sleep):
     token = clean_token(params.get(DISCORD_TOKEN_PARAM, decrypt=True))
     channels = json.loads(params.get(DISCORD_CHANNELS_PARAM) or "{}")
     cfg = json.loads(params.get(DISCORD_ROLES_PARAM) or "{}")
@@ -321,20 +455,28 @@ def handler(event, context):
              if is_snowflake(v) and str(v) != str(cfg.get("guild"))}
     dynamodb = boto3.resource("dynamodb")
     public, delivery = dynamodb.Table(PUBLIC_TABLE), dynamodb.Table(DELIVERY_TABLE)
+    # without a Lambda context (a test, a manual call) there is no time to wait in
+    time_left = (lambda: context.get_remaining_time_in_millis() / 1000) if context else (lambda: 0.0)
 
     failures, outcomes = [], {}
     problem = token_problem(token)
-    limited = None  # after a 429, the rest of the batch waits for SQS instead of hitting Discord again
+    limited = None  # after a 429 we could not wait out, the rest of the batch waits for SQS too
+    postponed: list[dict] = []  # those records, to come back when Discord's wait is over
     for record in event.get("Records", []):
         try:
-            if problem:
-                raise RetryLater(problem)
-            if limited:
-                raise RetryLater(limited)
-            outcome = handle_job(json.loads(record["body"]), public, delivery, token, channels, roles)
+            job = json.loads(record["body"])
+            if job.get("action") != "keep":  # a keep job never calls Discord: no token or 429 holds it up
+                if problem:
+                    raise RetryLater(problem)
+                if limited is not None:
+                    postponed.append(record)
+                    raise RetryLater("discord 429 earlier in this batch")
+            outcome = _waiting_out_429s(
+                lambda job=job: handle_job(job, public, delivery, token, channels, roles), time_left, sleep)
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
         except RateLimited as e:
-            limited = str(e)
+            limited = max(0.0, e.retry_after)
+            postponed.append(record)
             log("discord_rate_limited", retry_after=e.retry_after)
             failures.append({"itemIdentifier": record["messageId"]})
         except RetryLater as e:
@@ -343,6 +485,8 @@ def handler(event, context):
         except Exception as e:  # noqa: BLE001 - one bad job must not fail the batch; DLQ after retries
             log("discord_error", error=type(e).__name__, detail=str(e)[:120])
             failures.append({"itemIdentifier": record["messageId"]})
+    if limited is not None and postponed:
+        _come_back_after(postponed, limited)
     log("discord_done", **outcomes, retries=len(failures))
     metrics(DiscordPosted=outcomes.get("posted", 0), DiscordEditNotes=outcomes.get("edited_replied", 0),
             DiscordRetries=len(failures))

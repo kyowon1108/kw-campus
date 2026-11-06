@@ -15,7 +15,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from kwcampus.bridge import install
+from kwcampus.bridge import install, store
 
 BASE = "https://bridge.example"
 CUTOFF = "2026-11-01T00:00:00Z"
@@ -116,12 +116,15 @@ def test_setup_page_and_extension_downloads(client, static, key):
     assert r.json() == {"version": "0.2.0"} and r.headers["cache-control"] == "no-cache"
 
 
-def test_privacy_page_has_the_article_30_items():
-    page = install.PRIVACY_PAGE
+def test_privacy_page_has_the_article_30_items(client):
+    page = client.get("/privacy").text
+    assert page == install.privacy_page()
+    grant_days = f"{store.GRANT_TTL // 86400}일"  # the grant lifetime the code enforces, not a copy of it
     for needed in ("처리 목적", "보유 기간", "위탁", "국외", "AWS", "서울", "Anthropic", "OpenAI", "권리", "안전성 확보",
                    "보호책임자", "kyowon1108@gmail.com", "72시간", "Discord", "kw-mcp unlink", "kw-mcp revoke",
-                   "동의하는 것으로 봅니다", "180일", "2주"):
+                   "동의하는 것으로 봅니다", grant_days, "2주"):
         assert needed in page, needed
+    assert "180일" not in page and "__" not in page  # every period marker filled in
     assert "간편 연결" not in page and "비밀번호를 승인 페이지" not in page  # that mode is gone
     assert "따로 저장하지 않습니다" in page  # Discord roles live only in Discord
     assert "초대해 준 사람에게" not in page  # a named contact instead

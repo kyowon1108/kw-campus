@@ -22,13 +22,11 @@ DISCORD_PUBLIC_KEY_PARAM = "/kw/discord/public-key"  # the app's Ed25519 public 
 DISCORD_ROLES_PARAM = "/kw/discord/roles"
 
 # Lambda requests leave from shared AWS addresses, so this is how a school admin finds us: what the
-# project is and a page with the contact and opt-out. Never a personal e-mail address here.
+# project is and a page with the contact and opt-out. Never a personal e-mail address here, and no
+# link to the source repository: it is private, so a school admin would only get a 404 there.
 COLLECTOR_VERSION = "1.0"
 CONTACT_URL = "https://l9doaodgw6.execute-api.ap-northeast-2.amazonaws.com/privacy"
-USER_AGENT = (
-    f"kw-campus/{COLLECTOR_VERSION} (+https://github.com/kyowon1108/kw-campus; contact {CONTACT_URL}; "
-    "student non-commercial notice alerts)"
-)
+USER_AGENT = f"kw-campus/{COLLECTOR_VERSION} (+{CONTACT_URL}; student non-commercial notice alerts)"
 
 NOTICE_SOURCE = "kw-notice"  # the www.kw.ac.kr main notice board
 NOTICE_TTL = timedelta(days=120)

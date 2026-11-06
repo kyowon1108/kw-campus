@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from kw_mcp.service import (  # shared with the PC agent: one definition
+    KIND_NAMES,
     PATH_KIND,
     SNAPSHOT_KIND,
     _percent,  # KLAS progress as a whole percent: 100, "100" and "100.0" are all done
@@ -26,7 +27,7 @@ from kw_mcp.service import (  # shared with the PC agent: one definition
     period_time,
     schedule_note,
 )
-from kw_mcp.text import html_to_text
+from kw_mcp.text import clean, html_to_text
 from mcp.server.mcpserver.exceptions import ToolError
 
 from kwcampus.config import KST
@@ -73,6 +74,12 @@ def _int(value: Any) -> int | None:
         return None
 
 
+def _t(value: Any) -> Any:
+    """Text from a KLAS row as kw-mcp gives it (kw_mcp.text.clean: invisible format and control
+    characters, a known way to hide instructions, are dropped); other values as they are."""
+    return clean(value) if isinstance(value, str) else value
+
+
 def _norm(text: str | None) -> str:
     return re.sub(r"\s+", "", text or "").casefold()
 
@@ -88,7 +95,7 @@ def _courses(snap: dict, course: str | None) -> list[dict]:
     all_courses = snap.get("courses", [])
     found = [c for c in all_courses if _matches(c.get("subjNm"), course)]
     if course and not found:
-        names = ", ".join(c.get("subjNm") or "?" for c in all_courses)
+        names = ", ".join(_t(c.get("subjNm")) or "?" for c in all_courses)
         raise ToolError(f"'{course}'와 일치하는 과목이 없습니다. 이 학기 과목: {names}")
     return found
 
@@ -115,7 +122,7 @@ def _rows(snap: dict, key: str, course: str | None, partial: bool = False):
         names = {c.get("subjNm") for c in found}
         failed = [str(m.get("course")) for m in courses if m.get("kind") == key and m.get("course") in names]
         if key in lists or failed:
-            where = f"{', '.join(failed)} 과목의 " if failed and key not in lists else ""
+            where = f"{', '.join(_t(name) for name in failed)} 과목의 " if failed and key not in lists else ""
             raise ToolError(f"PC 에이전트가 KLAS에서 {where}{_LIST_NAME.get(key, key)} 목록을 읽지 못했습니다. "
                             "잠시 뒤 다시 시도해 주세요.")
     for c in found:
@@ -126,8 +133,8 @@ def _rows(snap: dict, key: str, course: str | None, partial: bool = False):
 def courses(snap: dict) -> list[dict]:
     out = []
     for c in snap.get("courses", []):
-        schedule = c.get("lctrumSchdulInfo")
-        row = {"course": c.get("subjNm"), "professor": c.get("profNm"), "schedule": schedule,
+        schedule = _t(c.get("lctrumSchdulInfo"))
+        row = {"course": _t(c.get("subjNm")), "professor": _t(c.get("profNm")), "schedule": schedule,
                "slots": parse_schedule(schedule), "semester": c.get("yearhakgi")}
         if note := schedule_note(schedule):
             row["note"] = note
@@ -142,7 +149,7 @@ def assignments(snap: dict, course: str | None = None, pending_only: bool = Fals
         submitted = t.get("submityn") == "Y"
         if pending_only and submitted:
             continue
-        out.append({"course": c.get("subjNm"), "title": t.get("title"), "opens": fmt_kst(t.get("startdate")),
+        out.append({"course": _t(c.get("subjNm")), "title": clean(t.get("title")), "opens": fmt_kst(t.get("startdate")),
                     "due": fmt_kst(t.get("expiredate")), "late_due": fmt_kst(t.get("reexpiredate")),
                     "submitted": submitted, "score": t.get("score")})
     return sorted(out, key=lambda a: a["due"] or "9999")
@@ -157,15 +164,15 @@ def online_lectures(snap: dict, course: str | None = None, incomplete_only: bool
         progress = _percent(o.get("prog"))
         if incomplete_only and progress is not None and progress >= 100:
             continue
-        out.append({"course": c.get("subjNm"), "week": o.get("weekNo") or o.get("weeklyseq"),
-                    "module": o.get("moduletitle"), "title": o.get("sbjt"), "opens": fmt_kst(o.get("startDate")),
+        out.append({"course": _t(c.get("subjNm")), "week": o.get("weekNo") or o.get("weeklyseq"),
+                    "module": _t(o.get("moduletitle")), "title": _t(o.get("sbjt")), "opens": fmt_kst(o.get("startDate")),
                     "due": fmt_kst(o.get("endDate")), "progress_percent": progress,
                     "required_time": o.get("rcognTime"), "achieved_time": o.get("achivTime")})
     return sorted(out, key=lambda a: a["due"] or "9999")
 
 
 def projects(snap: dict, course: str | None = None, partial: bool = False) -> list[dict]:
-    out = [{"course": c.get("subjNm"), "title": p.get("title"), "purpose": p.get("purpose"),
+    out = [{"course": _t(c.get("subjNm")), "title": _t(p.get("title")), "purpose": _t(p.get("purpose")),
             "opens": fmt_kst(p.get("startdate")), "due": fmt_kst(p.get("expiredate")),
             "late_due": fmt_kst(p.get("reexpiredate")), "submitted": p.get("submityn") == "Y",
             "score": p.get("score"), "team_no": p.get("teamno")} for c, p in _rows(snap, "projects", course, partial)]
@@ -179,7 +186,7 @@ def quizzes(snap: dict, course: str | None = None, pending_only: bool = False,
         submitted = q.get("issubmit") == "Y"
         if pending_only and submitted:
             continue
-        out.append({"course": c.get("subjNm"), "title": q.get("papernm"), "type": q.get("examtypenm"),
+        out.append({"course": _t(c.get("subjNm")), "title": _t(q.get("papernm")), "type": _t(q.get("examtypenm")),
                     "opens": fmt_kst(q.get("sdt")), "due": fmt_kst(q.get("edt")), "submitted": submitted,
                     "time_limit_minutes": _int(q.get("examtime")), "questions": q.get("examcnt"),
                     "total_score": q.get("totalscore")})
@@ -188,7 +195,7 @@ def quizzes(snap: dict, course: str | None = None, pending_only: bool = False,
 
 def course_posts(snap: dict, course: str | None = None) -> list[dict]:
     _courses(snap, course)  # an unknown course is an error; a known one with no posts is just []
-    return [{"course": n.get("subjNm"), "board": n.get("typeNm"), "title": html_to_text(n.get("title")),
+    return [{"course": _t(n.get("subjNm")), "board": _t(n.get("typeNm")), "title": html_to_text(n.get("title")),
              "posted": fmt_kst(n.get("registDt"))}
             for n in snap.get("course_posts", []) if _matches(n.get("subjNm"), course)]
 
@@ -199,31 +206,45 @@ def deadlines(snap: dict, now: datetime, days: int = 7) -> dict:
     days = max(0, min(days, 180))
     # KLAS deadlines cluster at 23:59:59: the window ends at the end of the target day.
     until = (now + timedelta(days=days)).replace(hour=23, minute=59, second=59, microsecond=0)
+    every = {"assignment": assignments(snap, partial=True), "online_lecture": online_lectures(snap, partial=True),
+             "quiz": quizzes(snap, partial=True), "team_project": projects(snap, partial=True)}
+    open_rows = {
+        "assignment": [a for a in every["assignment"] if not a["submitted"]],
+        "online_lecture": [o for o in every["online_lecture"]
+                           if o["progress_percent"] is None or o["progress_percent"] < 100],
+        "quiz": [q for q in every["quiz"] if not q["submitted"]],
+        "team_project": [p for p in every["team_project"] if not p["submitted"]],
+    }
     items = []
-    for a in assignments(snap, pending_only=True, partial=True):
-        due, late_due = parse_due(a["due"]), parse_due(a["late_due"])
-        if due and now <= due <= until:
-            items.append({"kind": "assignment", **a})
-        elif due and late_due and due < now <= late_due:
-            items.append({"kind": "assignment", "late_submission": True, **a})
-    for kind, rows in (("online_lecture", online_lectures(snap, incomplete_only=True, partial=True)),
-                       ("quiz", quizzes(snap, pending_only=True, partial=True)),
-                       ("team_project", [p for p in projects(snap, partial=True) if not p["submitted"]])):
+    for kind, rows in open_rows.items():
         for row in rows:
             due, late_due = parse_due(row["due"]), parse_due(row.get("late_due"))
             if due and now <= due <= until:
                 items.append({"kind": kind, **row})
-            elif due and late_due and due < now <= late_due:  # team projects have late windows too
+            elif due and late_due and due < now <= late_due:  # assignments and team projects have late windows
                 items.append({"kind": kind, "late_submission": True, **row})
     items.sort(key=lambda i: i["late_due"] if i.get("late_submission") else i["due"])
     out = {"semester": snap.get("semester"), "now": now.strftime("%Y-%m-%d %H:%M"),
            "until": until.strftime("%Y-%m-%d %H:%M"), "days": days, "data_as_of": snap.get("fetched_at"),
            "items": items}
     lists, courses = _missing(snap)
-    if lists or courses:  # kw-mcp's shape: whole kinds in missing, single courses in missing_courses
-        misses = [{"kind": _KIND.get(m.get("kind"), m.get("kind")), "course": m.get("course")} for m in courses]
-        out["incomplete"] = {"missing": [_KIND.get(k, k) for k in lists], **({"missing_courses": misses} if misses else {}),
-                             "message": "KLAS에서 일부 목록을 읽지 못해 빠진 마감이 있을 수 있습니다."}
+    # kw_mcp.service.KlasService.deadlines' rule, on the lists it reads (pending assignments and quizzes,
+    # unfinished lectures, every team project): rows, but not one due or late due that parses, means
+    # KLAS renamed the field or changed its date format, and "nothing due" would be wrong.
+    judged = {**open_rows, "team_project": every["team_project"]}
+    unreadable = [kind for kind, rows in judged.items()
+                  if rows and not any(parse_due(r["due"]) or parse_due(r.get("late_due")) for r in rows)]
+    # kw-mcp's shape: whole kinds in missing, single courses in missing_courses
+    misses = [{"kind": _KIND.get(m.get("kind"), m.get("kind")), "course": m.get("course")} for m in courses]
+    missing = [_KIND.get(k, k) for k in lists]
+    missing += [k for k in unreadable if k not in missing]
+    if missing or misses:
+        message = "KLAS에서 일부 목록을 읽지 못해 빠진 마감이 있을 수 있습니다."
+        if unreadable:
+            message += (f" {'·'.join(KIND_NAMES[k] for k in unreadable)} 목록은 마감 시각을 읽지 못했습니다"
+                        "(KLAS 형식이 바뀐 것 같습니다). KLAS에서 직접 확인하세요.")
+        out["incomplete"] = {"missing": missing, **({"missing_courses": misses} if misses else {}),
+                             **({"unreadable_due": unreadable} if unreadable else {}), "message": message}
     return out
 
 

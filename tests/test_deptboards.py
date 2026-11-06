@@ -17,8 +17,9 @@ from kwcampus import (
 )
 from kwcampus.config import KST
 from kwcampus.fetch import FetchResult
+from kwcampus.kwnotice.redaction import REDACTION_LEVEL
 
-FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURES =Path(__file__).parent / "fixtures"
 # Saved from ee.kw.ac.kr/HTML/department/undergrad_info.php and law.kw.ac.kr/bulletin/notice.php on
 # 2026-11-05 (public pages), cut down to a few real rows each.
 EE_PAGE = (FIXTURES / "dept_ee_list.html").read_text()
@@ -409,14 +410,14 @@ def test_a_reposted_pinned_post_refreshes_its_date_and_ttl(aws, monkeypatch):
     table = aws["public"]
     deptboards.collect(NOW, table, fetch=page(EE_PAGE))
     before = notices(table, "dept-ee")["631"]
-    assert before["norm_v"] == 2 and before["title_key"]
+    assert before["norm_v"] == REDACTION_LEVEL and before["title_key"]
     reposted = EE_PAGE.replace("2026-2학기", "2027-1학기").replace("2026-09-04", "2026-11-09")
     later = NOW + timedelta(days=10)
     out = deptboards.collect(later, table, fetch=page(reposted))[deptboards.SERVER_E1]
     assert out["updated"] == 1
     after = notices(table, "dept-ee")["631"]
     assert after["posted_date"] == after["updated_date"] == "2026-11-09" and int(after["ttl"]) > int(before["ttl"])
-    assert after["title"] != before["title"] and after["norm_v"] == 2
+    assert after["title"] != before["title"] and after["norm_v"] == REDACTION_LEVEL
 
 
 def test_one_servers_error_does_not_cost_the_others_their_turn(aws, monkeypatch):

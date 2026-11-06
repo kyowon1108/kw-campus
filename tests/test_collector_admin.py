@@ -78,5 +78,6 @@ def test_redaction_report_counts_without_writing(aws):
         table.put_item(Item={"PK": "SRC#kw-notice", "SK": f"N#{n}", "title": title, "department": "총무팀"})
     table.put_item(Item={"PK": "SRC#kw-notice", "SK": "N#9", "title": "새 공지", "department": "총무팀",
                          "norm_v": store.REDACTION_LEVEL})
-    assert admin.redaction_report(table) == {"notices": 4, "would_change": 2, "names": 1, "already_v2": 1}
+    assert admin.redaction_report(table) == {"notices": 4, "would_change": 2, "names": 1,
+                                             f"already_v{store.REDACTION_LEVEL}": 1}
     assert table.get_item(Key={"PK": "SRC#kw-notice", "SK": "N#0"})["Item"]["title"].startswith("[부고] 전자공학과 김철수")

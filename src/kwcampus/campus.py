@@ -5,6 +5,8 @@ cafeteria page until this week's menu is stored (a week counts only with at leas
 it, so last week's page fetched early on Monday is tried again the next morning), and the
 calendar only when the stored copy is older than a week, so most days make 0-1 requests and a
 run never makes more than two. A week is stored under the Monday of the dates it shows.
+A page that robots.txt disallows is skipped with NeedsHuman (politeness.robots_skip), and each run
+raises NeedsHuman while any collector's robots.txt record is older than 180 days.
 
 Items in kw-public:
   PK "CAMPUS#cafeteria"  SK "W#<monday>"   {days: [{date, weekday, meals: [{name, price, time, menu}]}]}
@@ -157,9 +159,15 @@ def run(now: datetime, table, clock: Callable[[], datetime] | None = None,
     monday = _monday(today)
     out: dict[str, object] = {"status": "ok"}
     www = _Www(table, clock, sleep, time_left)
+    # once a weekday morning: are the robots.txt records (every collector's, not only www's) recent?
+    if stale := politeness.robots_age_check(now):
+        out["robots_stale"] = stale
 
     have_week = table.get_item(Key={"PK": "CAMPUS#cafeteria", "SK": f"W#{monday}"}).get("Item")
-    if not _has_meals(have_week) and politeness.robots_allows(CAFETERIA_URL):
+    if not _has_meals(have_week) and not politeness.robots_allows(CAFETERIA_URL):
+        politeness.robots_skip("campus-cafeteria", CAFETERIA_URL)
+        out["cafeteria"] = "robots"
+    elif not _has_meals(have_week):
         html, reason = www.fetch(CAFETERIA_URL)
         days = parse_cafeteria(html) if html else []
         week = _monday(date.fromisoformat(days[0]["date"])) if days else None
@@ -180,12 +188,14 @@ def run(now: datetime, table, clock: Callable[[], datetime] | None = None,
     # two refreshes drift apart: next year's waits when this year's was read in the same run.
     years = [today.year] + ([today.year + 1] if today.month == 12 else [])
     for year in years:
-        if not politeness.robots_allows(CALENDAR_URL):
-            break
         stored = table.get_item(Key={"PK": "CAMPUS#calendar", "SK": f"Y#{year}"}).get("Item")
         if not _calendar_due(stored, now):
             continue
         key = "calendar" if year == today.year else "calendar_next_year"
+        if not politeness.robots_allows(CALENDAR_URL):
+            politeness.robots_skip("campus-calendar", CALENDAR_URL)
+            out[key] = "robots"
+            break
         if year != today.year and "calendar" in out:
             out[key] = "next_run"
             continue

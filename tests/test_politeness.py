@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from kwcampus import fetch, politeness
-from kwcampus.config import USER_AGENT
+from kwcampus.config import CONTACT_URL, USER_AGENT
 
 NOW = datetime(2026, 11, 5, 3, 0, tzinfo=UTC)
 ORIGIN = "61.111.8.4"
@@ -192,5 +192,8 @@ def test_challenge_signatures(body, challenge):
 
 
 def test_user_agent_is_honest_and_has_no_e_mail():
-    assert USER_AGENT.startswith("kw-campus/") and "https://github.com/kyowon1108/kw-campus" in USER_AGENT
-    assert "/privacy" in USER_AGENT and "@" not in USER_AGENT and "kw-notice-mcp" not in USER_AGENT
+    # The contact is the public /privacy page (what is collected, contact, opt-out), not the source
+    # repository: that one is private and answers outsiders with a 404.
+    assert USER_AGENT.startswith("kw-campus/") and f"+{CONTACT_URL}" in USER_AGENT
+    assert CONTACT_URL.startswith("https://") and CONTACT_URL.endswith("/privacy")
+    assert "github.com" not in USER_AGENT and "@" not in USER_AGENT and "kw-notice-mcp" not in USER_AGENT

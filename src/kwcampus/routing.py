@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from kwcampus import deptboards, wixfeeds, wwwboards
+from kwcampus.kwnotice.redaction import may_name_someone
 from kwcampus.topics import TOPIC_BY_KEY, TOPICS, URGENT, Topic
 
 __all__ = ["CATEGORY_LABEL", "CATEGORY_TO_CHANNEL", "COLLEGE_OF", "TOPICS", "TOPIC_BY_KEY", "URGENT", "Topic", "channel_for",
@@ -87,10 +88,11 @@ def topic_for(category_id: str) -> str | None:
 # What students most need to hear at once: cancelled or moved classes and exams, closed buildings,
 # outages. Only school-wide sources ring 긴급 (urgent_source); a department's 휴강 or room change rings
 # that college's role only. Look-alikes stay out: 출입국, 장애인/장애학생, 내부통제·정보통제·감염병 통제,
-# 출입통제시스템, 긴급생활비 (a grant), 단수전공, 정전기, and planned or paperwork posts (모집, 신청, 제출,
-# 계획서, 교원용, 연휴, 개교기념일, 정기점검).
+# 출입통제시스템, 긴급생활비 (a grant), 단수전공, 정전기, 폐쇄회로 (CCTV)·폐쇄몰·폐쇄형, and planned or
+# paperwork posts (모집, 신청, 제출, 계획서, 교원용, 연휴, 개교기념일, 정기점검).
 _URGENT = re.compile(
-    r"\[긴급\]|긴급\s*(?:공지|안내|알림)|휴강|결강|휴교|폐쇄|비대면\s*(?:수업\s*)?전환|정전(?!기)|단수(?!\s*전공)"
+    r"\[긴급\]|긴급\s*(?:공지|안내|알림)|휴강|결강|휴교|폐쇄(?!\s*회로|몰|형)|비대면\s*(?:수업\s*)?전환|정전(?!기)"
+    r"|단수(?!\s*전공)"
     r"|(?:강의|수업)\s*(?:실|요일|시간|장소)\s*변경|(?:시험|고사)\s*(?:실|장소|시간|일정)\s*변경|고사실\s*변경"
     r"|(?:출입|차량|교통|도로|통행)\s*(?:통제|제한|금지)(?!\s*시스템)"
     r"|(?:시스템|서비스|전산|네트워크|인터넷|와이파이|wi-?fi|접속)\s*(?:장애(?!인|학생)|중단|불가|오류)"
@@ -104,21 +106,35 @@ def is_urgent(title: str) -> bool:
     return bool(_URGENT.search(title)) and not _NOT_URGENT.search(title)
 
 
+# The main board's 외부 category carries outside organisations' notices (a certificate exam moved to
+# another hall, a closed exhibition): they are not about our campus, so they never ring 긴급.
+_NOT_URGENT_SOURCES = frozenset({"external"})
+
+
 def urgent_source(category_id: str) -> bool:
-    """긴급 is for school-wide notices (the main board, the job board), not department boards or feeds."""
+    """긴급 is for school-wide notices about our campus (the main board but its 외부 category, the job
+    board), not department boards or feeds."""
     channel = channel_for(category_id)
-    return channel is not None and channel != "department"
+    return channel is not None and channel != "department" and category_id not in _NOT_URGENT_SOURCES
 
 
-# Until names in titles are masked (redaction v2), a title that may carry a person's name goes to Discord
-# without the title and without a mention: award, roster, obituary, pass and selection lists from
-# department boards and feeds, and any title with a masked name like 홍*동 or 김○○.
-_NAME_LIST = re.compile(r"수상|명단|합격|부고|조의|당선|선발\s*결과|축하")
+# Titles are masked before they are stored (redaction v3: names next to roles, in rosters, award lists,
+# thesis schedules and obituaries), but no rule set catches every name. So a title that may still carry
+# one goes to Discord without the title and without a mention ("새 글", link only):
+# - on department boards and feeds, every award, roster, obituary, pass, selection, thesis and
+#   profile title (they are mostly about people);
+# - on any board, a roster, prize or pass title that still has a word looking like a full name
+#   (redaction.may_name_someone), and any title with a partly hidden name like 홍*동 or 김○○.
+_NAME_LIST = re.compile(
+    r"수상|명단|합격|부고|조의|당선|선발\s*결과|축하|학위\s*논문|공개\s*발표|심사|졸업생|인터뷰|입상|입선|우승"
+    r"|(?:금|은|동|장려|우수|최우수|특별|공로|총장|학장|논문|봉사|감사|신인|교육감)상"
+    r"|(?:대회|공모전|경연)\s*대상(?!자)"
+)
 # a syllable starting a word, then one or two masks: 홍*동, 김**, 이○○ (not 필독*, not 제○회)
 _MASKED_NAME = re.compile(r"(?<![가-힣])[가-힣][*＊○◯●]{1,2}(?![회차기호])")
 
 
 def name_risk(category_id: str, title: str) -> bool:
-    if _MASKED_NAME.search(title):
+    if _MASKED_NAME.search(title) or may_name_someone(title):
         return True
     return channel_for(category_id) == "department" and bool(_NAME_LIST.search(title))

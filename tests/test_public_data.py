@@ -76,10 +76,11 @@ def test_cross_posts_fold_into_one(table):
     title = "[대학혁신지원사업] 2026 광운대학교 취업박람회 개최 안내"
     put(table, "kw-job", 53606, title, "job", "2026-11-04", first_seen=3)
     put(table, "dept-ee", 646, title, "dept-ee", "2026-11-04", first_seen=2)
-    put(table, "dept-law", 519, "[학부공지] 2026 광운대학교 취업박람회 개최 안내", "dept-law", "2026-11-03")
+    put(table, "dept-law", 519, "[대학혁신지원사업] 2026 광운대학교 취업박람회 개최 안내!", "dept-law", "2026-11-03")
     put(table, "kw-notice", 1, "도서관 휴관 안내", "general", "2026-11-02")
     rows = public_data.latest(table, None, 10)
     assert ids(rows) == ["kw-job-53606", "1"] and rows[0]["also"] == ["dept-ee-646", "dept-law-519"]
+    assert [b["category"] for b in rows[0]["also_boards"]] == ["전자공학과", "법학부"]  # each copy's board
     assert ids(public_data.latest(table, "학과", 10)) == ["dept-ee-646"]
     assert ids(public_data.latest(table, "법학부", 10)) == ["dept-law-519"]  # each department still finds its own
 

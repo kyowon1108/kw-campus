@@ -14,7 +14,8 @@ under config.WWW_DAILY_CAP (44).
 Each board keeps its own failure count, so a main-board success can't hide that one path keeps
 failing: its own trouble (404, a redirect, a changed page) backs off only that board (its `every`,
 doubling up to 24 h); a 403/429/challenge also cools www down, and three in a row on the same
-path switch that board off for a human while the main board goes on.
+path switch that board off for a human while the main board goes on. A board whose path robots.txt
+disallows is never fetched and raises NeedsHuman every run (politeness.robots_skip).
 """
 
 from __future__ import annotations
@@ -99,11 +100,16 @@ def collect(now: datetime, table, fetch=fetch_list_page, clock: Callable[[], dat
     lets a run that is already late skip the 60 s wait instead of being cut off mid-request."""
     clock = clock or (lambda: datetime.now(UTC))
     states = {b.source: table.get_item(Key=_state_key(b), ConsistentRead=True).get("Item") or {} for b in BOARDS}
+    allowed = []
     for b in BOARDS:
         if states[b.source].get("disabled"):
             politeness.source_skipped(b.source, states[b.source])
-    board = next((b for b in BOARDS if now.timestamp() - int(states[b.source].get("checked_at", 0))
-                  >= (b.every - SLACK).total_seconds() and politeness.robots_allows(b.list_url)
+        if politeness.robots_allows(b.list_url):
+            allowed.append(b)
+        else:  # never fetched, and a human hears about it every run until the board is removed
+            politeness.robots_skip(b.source, b.list_url)
+    board = next((b for b in allowed if now.timestamp() - int(states[b.source].get("checked_at", 0))
+                  >= (b.every - SLACK).total_seconds()
                   and not politeness.source_waiting(states[b.source], now)), None)
     if board is None:
         return {"status": "not_due"}

@@ -12,14 +12,19 @@ What a failed request does depends on what it says about the server:
   30 min doubling up to 6 h; an empty page that may be a block page we don't recognise starts at
   30 min. Neither ever switches the origin off; six in a row raise NeedsHuman;
 - anything about one page only (404, a redirect, an unexpected page or content type, an oversized
-  page) leaves the origin alone: that source backs off by itself (source_failed).
+  page) leaves the origin alone: that source backs off by itself (source_failed), and from its
+  third failure in a row on it raises NeedsHuman each time (a board that moved for good answers
+  404 or a redirect forever; at 2 h, 4 h, 8 h ... it would never reach the SourceFailed alarm).
+
+robots.txt is checked by hand and recorded in ROBOTS; once a record is older than ROBOTS_MAX_AGE
+the daily campus run raises NeedsHuman (robots_stale) until someone looks again and updates it.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from urllib.parse import urlsplit
 
 from botocore.exceptions import ClientError
@@ -37,6 +42,10 @@ SOURCE_BACKOFF_MAX = timedelta(hours=24)
 MAX_CONSECUTIVE_BLOCKS = 3
 # Transient failures in a row before a human should look (the origin stays on).
 SOFT_NEEDS_HUMAN = 6
+# One source's own failures in a row (404, a redirect, a changed page) before a human should look.
+SOURCE_NEEDS_HUMAN = 3
+# A robots.txt record older than this needs a fresh look by hand.
+ROBOTS_MAX_AGE = timedelta(days=180)
 
 HARD = frozenset({"forbidden", "rate_limit", "captcha"})
 EMPTY = frozenset({"no_rows", "no_rows_everywhere"})
@@ -183,7 +192,9 @@ def source_waiting(source_state: dict, now: datetime) -> bool:
 def source_failed(table, key: dict[str, str], source_state: dict, now: datetime, reason: str,
                   base: timedelta) -> dict[str, object]:
     """Back one source off: base, 2 x base, ... up to 24 h. Three hard blocks on the same source in
-    a row (its path blocked while the rest of the server answers) switch it off for a human."""
+    a row (its path blocked while the rest of the server answers) switch it off for a human. Its own
+    trouble (404, a redirect, a changed page) keeps it on, but from the third failure in a row each
+    one raises NeedsHuman: the page may have moved for good."""
     fails = int(source_state.get("fails", 0)) + 1
     hard = int(source_state.get("hard_blocks", 0)) + (1 if reason in HARD else 0)
     wait = min(base * (2 ** (fails - 1)), SOURCE_BACKOFF_MAX)
@@ -195,6 +206,9 @@ def source_failed(table, key: dict[str, str], source_state: dict, now: datetime,
     )
     if reason not in HARD:
         metrics(SourceFailed=1)
+        if fails >= SOURCE_NEEDS_HUMAN and not disabled:
+            log("source_failing", source=str(key.get("PK", "")), fails=fails, reason=reason)
+            metrics(NeedsHuman=1)
     if disabled:
         metrics(NeedsHuman=1)
     return {"fails": fails, "wait_minutes": int(wait.total_seconds() // 60), "source_disabled": disabled}
@@ -225,7 +239,9 @@ class RobotsCheck:
 
 _NO_FILE = "no robots.txt (404)"
 # Every host a collector reads, checked by hand. A new board's host needs a line here first
-# (tests/test_robots.py fails without one), and a path its robots.txt disallows is never fetched.
+# (tests/test_robots.py fails without one), and a path its robots.txt disallows is never fetched
+# (robots_skip: NeedsHuman). Look again within ROBOTS_MAX_AGE (180 days) and update the date;
+# robots_age_check raises NeedsHuman every weekday morning until then.
 ROBOTS: dict[str, RobotsCheck] = {
     "www.kw.ac.kr": RobotsCheck("2026-11-06", "no robots.txt (200 with the site's HTML error page, no rules)"),
     "aicon.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
@@ -287,3 +303,22 @@ def robots_skip(source: str, url: str) -> dict[str, object]:
     log("robots_skip", source=source, host=urlsplit(url).hostname)
     metrics(NeedsHuman=1, RobotsSkipped=1)
     return {"status": "skipped", "reason": "robots"}
+
+
+def stale_robots(now: datetime) -> list[str]:
+    """Hosts whose robots.txt record is older than ROBOTS_MAX_AGE (KST dates), oldest first."""
+    today = now.astimezone(KST).date()
+    old = [(date.fromisoformat(check.checked), host) for host, check in ROBOTS.items()
+           if today - date.fromisoformat(check.checked) > ROBOTS_MAX_AGE]
+    return [host for _, host in sorted(old)]
+
+
+def robots_age_check(now: datetime) -> int:
+    """NeedsHuman while any record is too old: look at those hosts' /robots.txt again by hand and
+    update ROBOTS (the date, the result, the Disallow rules). Returns how many are too old."""
+    hosts = stale_robots(now)
+    if hosts:
+        oldest = ROBOTS[hosts[0]].checked
+        log("robots_stale", hosts=len(hosts), oldest=oldest, first=hosts[0])
+        metrics(NeedsHuman=1, RobotsStale=len(hosts))
+    return len(hosts)

@@ -8,7 +8,13 @@
 The scripts install uv (Astral's Python tool runner) if missing, then the kw-mcp release in this
 Lambda bundle: the wheel and its dependency pins (constraints exported from kw-mcp's uv.lock), both
 named and hashed in the signed latest.json, installed with nothing newer than the release and no
-source builds. Then `kw-mcp link` asks for the KLAS login and stores it in the OS keychain.
+source builds. `uv tool install` takes only the versions from the pins, so the scripts then install
+every dependency again with `uv pip install --require-hashes` against the same file; on a mismatch
+they remove the agent instead of leaving unchecked code to start at login. On Windows the running
+agent is stopped first (agent.lock held, process id in agent.pid; agents up to 0.9.0 listen on a
+localhost port instead), because uv rebuilds the tool environment and Windows can't replace files
+an agent holds open. Then `kw-mcp link` asks for the KLAS login, stores it in the OS keychain and
+starts the agent again.
 
 What the scripts check comes from this server, so a first install trusts it (over TLS). Background
 updates are different: agents verify latest.json against the release key they carry.
@@ -25,6 +31,10 @@ from typing import Any
 from kw_mcp import release
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
+
+from kwcampus import deptboards, politeness, wixfeeds
+from kwcampus.bridge import signing, store
+from kwcampus.config import DELIVERY_TTL, NOTICE_TTL, WWW_DAILY_CAP
 
 STATIC_DIR = Path(__file__).parent / "static"
 MCPB_NAME = release.MCPB_NAME  # Claude Desktop extension, packed and signed by kw-mcp's scripts/release.sh
@@ -59,6 +69,16 @@ echo "__CONSTRAINTS_SHA256__  $TMP/__CONSTRAINTS__" | shasum -a 256 -c - >/dev/n
 # Every dependency at the version this release was tested with, nothing uploaded later, no source builds.
 uv tool install --force --quiet --python 3.13 --no-build --constraints "$TMP/__CONSTRAINTS__" \\
   --exclude-newer "__EXCLUDE_NEWER__" "kw-mcp @ file://$TMP/__WHEEL__"
+# uv tool install reads only the versions from the pins. Put every dependency in again, each checked
+# against its hash in the signed pins; on a mismatch remove the agent so nothing unchecked starts at login.
+TOOL_PY="$(uv tool dir)/kw-mcp/bin/python"
+if ! uv pip install --quiet --python "$TOOL_PY" --require-hashes --no-deps --reinstall --no-build -r "$TMP/__CONSTRAINTS__"; then
+  launchctl bootout "gui/$(id -u)/kr.kwcampus.agent" >/dev/null 2>&1 || true
+  rm -f "$HOME/Library/LaunchAgents/kr.kwcampus.agent.plist"
+  uv tool uninstall kw-mcp >/dev/null 2>&1 || true
+  echo "A dependency did not match its pinned hash, so the agent was removed. Run this command again later." >&2
+  exit 1
+fi
 # Keep this release: the agent goes back to it if a later update fails to start.
 mkdir -p "$HOME/.config/kw-campus/releases" && chmod 700 "$HOME/.config/kw-campus"
 cp "$TMP/__WHEEL__" "$TMP/__CONSTRAINTS__" "$HOME/.config/kw-campus/releases/"
@@ -67,6 +87,9 @@ kw-mcp link "$INVITE" --server "__BASE__" < /dev/tty
 
 INSTALL_PS1 = """# KW Campus PC agent installer (Windows). Usage: $env:KWC='kwc_...'; irm __BASE__/install.ps1 | iex
 $ErrorActionPreference = 'Stop'
+# PowerShell 7 can turn a native command's non-zero exit into an error that skips the cleanup below;
+# this script checks $LASTEXITCODE itself.
+$PSNativeCommandUseErrorActionPreference = $false
 $invite = $env:KWC
 if (-not $invite) { $invite = Read-Host 'Invite code (kwc_...)' }
 $env:Path = "$env:USERPROFILE\\.local\\bin;$env:Path"
@@ -75,8 +98,9 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
   powershell -NoProfile -ExecutionPolicy ByPass -Command "irm https://astral.sh/uv/install.ps1 | iex" | Out-Null
 }
 Write-Host 'Installing the KW Campus agent __VERSION__...'
+$cfg = Join-Path $env:USERPROFILE '.config\\kw-campus'
 # Kept here: the agent goes back to this release if a later update fails to start.
-$rel = Join-Path $env:USERPROFILE '.config\\kw-campus\\releases'
+$rel = Join-Path $cfg 'releases'
 New-Item -ItemType Directory -Force -Path $rel | Out-Null
 $whl = Join-Path $rel '__WHEEL__'
 $pins = Join-Path $rel '__CONSTRAINTS__'
@@ -87,10 +111,78 @@ if ((Get-FileHash -Algorithm SHA256 $whl).Hash.ToLower() -ne '__SHA256__' -or
   Remove-Item -Force $whl, $pins
   throw 'The downloaded agent failed its checksum.'
 }
+# uv writes UTF-8 into a pipe, but PowerShell decodes a native command's output with the console's
+# code page (949 on Korean Windows), which garbles a Korean profile folder name. Read it as UTF-8.
+$consoleEncoding = [Console]::OutputEncoding
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try { $toolDir = "$(uv tool dir)".Trim() } finally { [Console]::OutputEncoding = $consoleEncoding }
+if ($LASTEXITCODE -ne 0 -or -not $toolDir) { throw 'uv could not tell where it keeps its tools. Run this command again.' }
+$toolEnv = Join-Path $toolDir 'kw-mcp'
+$toolPy = Join-Path $toolEnv 'Scripts\\python.exe'
+function Remove-Agent {
+  # Nothing unchecked may start at login: the login entry and the tool environment both go.
+  Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'KWCampusAgent' -ErrorAction SilentlyContinue
+  uv tool uninstall kw-mcp | Out-Null
+}
+# Stop this user's running agent first: uv removes and recreates the whole tool environment, and
+# Windows can't replace files a running agent holds open. `kw-mcp link` below starts it again.
+function Test-AgentLock {
+  # A running agent holds a lock on the first byte of agent.lock; its process id is in agent.pid.
+  $path = Join-Path $cfg 'agent.lock'
+  if (-not (Test-Path -LiteralPath $path)) { return $false }
+  try { $fs = [System.IO.File]::Open($path, 'Open', 'ReadWrite', 'ReadWrite') } catch { return $false }
+  try { $fs.Lock(0, 1); $fs.Unlock(0, 1); return $false } catch { return $true } finally { $fs.Close() }
+}
+function Test-LegacyAgent {
+  # Agents up to 0.9.0 listen on this localhost port instead, and exit when sent "exit".
+  [bool](Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 47811 -State Listen -ErrorAction SilentlyContinue)
+}
+function Test-ToolInUse {
+  [bool](Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.ExecutablePath -and $_.ExecutablePath.StartsWith($toolEnv + '\\', [System.StringComparison]::OrdinalIgnoreCase) })
+}
+if (Test-AgentLock) {
+  $agentPid = 0
+  [void][int]::TryParse("$(Get-Content -LiteralPath (Join-Path $cfg 'agent.pid') -ErrorAction SilentlyContinue)".Trim(), [ref]$agentPid)
+  $proc = if ($agentPid -gt 0) { Get-Process -Id $agentPid -ErrorAction SilentlyContinue }
+  if ($proc -and $proc.ProcessName -match '^pythonw?$') {
+    Write-Host 'Stopping the running agent...'
+    Stop-Process -Id $agentPid -Force -ErrorAction SilentlyContinue
+  }
+}
+if (Test-LegacyAgent) {
+  Write-Host 'Stopping the running agent...'
+  $client = New-Object System.Net.Sockets.TcpClient
+  try {
+    $client.Connect('127.0.0.1', 47811)
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes("exit`n")
+    $client.GetStream().Write($bytes, 0, $bytes.Length)
+  } catch { } finally { $client.Close() }
+}
+$deadline = (Get-Date).AddSeconds(15)
+while (((Test-AgentLock) -or (Test-LegacyAgent) -or (Test-ToolInUse)) -and (Get-Date) -lt $deadline) {
+  Start-Sleep -Milliseconds 300
+}
+if ((Test-AgentLock) -or (Test-LegacyAgent) -or (Test-ToolInUse)) {
+  throw 'The running KW Campus agent did not stop. Sign out of Windows and back in, then run this again.'
+}
 # Every dependency at the version this release was tested with, nothing uploaded later, no source builds.
 # AbsoluteUri percent-encodes spaces and Korean letters in the profile path.
 uv tool install --force --quiet --python 3.13 --no-build --constraints $pins --exclude-newer '__EXCLUDE_NEWER__' ("kw-mcp @ " + ([System.Uri]$whl).AbsoluteUri)
-if ($LASTEXITCODE -ne 0) { throw 'uv could not install the agent.' }
+if ($LASTEXITCODE -ne 0) { throw 'uv could not install the agent. Run this command again.' }
+# uv tool install reads only the versions from the pins. Put every dependency in again, each checked
+# against its hash in the signed pins; on a mismatch remove the agent so nothing unchecked starts at login.
+# uv tool install --force has already replaced any earlier agent, so a Python missing from uv's tool
+# folder also means unchecked code: it gets its own message, and the agent goes the same way.
+if (-not (Test-Path -LiteralPath $toolPy)) {
+  Remove-Agent
+  throw "The agent's Python was not in uv's tool folder, so its dependencies could not be checked and the agent was removed. Run this command again."
+}
+uv pip install --quiet --python $toolPy --require-hashes --no-deps --reinstall --no-build -r $pins
+if ($LASTEXITCODE -ne 0) {
+  Remove-Agent
+  throw 'A dependency did not match its pinned hash, so the agent was removed. Run this command again later.'
+}
 kw-mcp link $invite --server '__BASE__'
 """
 
@@ -120,7 +212,8 @@ Claude 데스크톱에서만 쓸 수 있고, 초대 코드를 넣어 두면 새 
 <p><b>보조 경로입니다. 항상 켜 두는 PC(집 데스크톱 등)가 있어야 합니다.</b> 그 PC가 꺼져 있거나 잠자기 상태면 모든 기기에서 응답하지 않습니다.
 Claude 데스크톱을 쓴다면 방법 1이 더 간단하고 서버를 거치지 않습니다.</p>
 <p>그 PC에 작은 에이전트를 설치하면, 다른 기기의 Claude·ChatGPT 커넥터가 물을 때 그 PC가 내 KLAS 로그인으로 읽어 답합니다.
-비밀번호는 그 PC 밖으로 나가지 않습니다. 답은 암호화되어 이 서버를 거쳐 전달되고, 서버는 이어지는 질문에 최대 1분 동안 다시 쓴 뒤 메모리에서 버립니다.</p>
+비밀번호는 그 PC 밖으로 나가지 않습니다. 답은 암호화되어 이 서버를 거쳐 전달됩니다. 서버는 풀어낸 답을 메모리에만 두고 이어지는 질문에 최대 1분 다시 쓰며,
+그 뒤에는 그 서버가 다음 요청을 받을 때나 서버 인스턴스가 내려갈 때 지웁니다.</p>
 <p><b>macOS</b> — 터미널에 붙여 넣기</p><pre id="mac"></pre><button data-copy="mac">복사</button>
 <p><b>Windows</b> — PowerShell에 붙여 넣기</p><pre id="win"></pre><button data-copy="win">복사</button>
 <p class="muted">설치 명령을 실행하면 <a href="/privacy">개인정보 처리방침</a>의 PC 에이전트 항목(기기 등록 정보 보관, 답의 암호화 중계)에 동의하는 것으로 봅니다.
@@ -159,7 +252,8 @@ document.getElementById('win').textContent = (ok ? `$env:KWC='${invite}'; ` : ''
 </script>
 <p class="muted"><a href="/privacy">개인정보 처리방침</a></p></body></html>"""
 
-PRIVACY_PAGE = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
+# Rendered by privacy_page(): each __X__ value comes from the constant that enforces it.
+PRIVACY_TEMPLATE = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>KW Campus 개인정보 처리방침</title>
 <style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;color:#222;line-height:1.7}
 h3{margin-top:28px} table{border-collapse:collapse;width:100%;font-size:14px} th,td{border:1px solid #ccc;padding:6px 8px;vertical-align:top;text-align:left}
@@ -174,38 +268,50 @@ KLAS는 사용자 본인의 PC에서 본인 계정으로 읽기만 하며, 제�
 <li><b>Claude 데스크톱 확장(방법 1)</b>: 학교 공지·학식·학사일정 같은 공개 정보와 새 버전 정보를 제공합니다. 개인정보는 처리하지 않습니다.
 학번·비밀번호와 KLAS에서 읽은 내용은 사용자 PC 안에서만 쓰이고 이 서버로 오지 않습니다. 요청에는 초대 토큰과 검색 조건(분류·날짜·검색어)만 담깁니다.</li>
 <li><b>PC 에이전트(방법 2)</b>: 사용자가 연결한 Claude·ChatGPT의 질문을 사용자 PC로 전달하고, PC가 암호화해 보낸 답을 돌려주기 위해 기기와 연결한 앱을 확인·관리하고 부정 사용을 막습니다.</li>
-<li><b>Discord 알림 채널</b>: 학교 공지 알림을 받을 분류를 고르게 합니다.</li>
+<li><b>학교 공지 수집과 Discord 알림 채널</b>: 학교·학과 사이트의 공개 공지를 모아 Discord 채널과 검색 도구로 알리고, 알림 받을 분류를 고르게 합니다.</li>
 <li><b>공통</b>: 서비스 운영, 장애 대응, 보안 사고 조사.</li>
 </ul>
 
 <h3>2. 처리 항목과 보유 기간</h3>
-<p>학번·비밀번호는 받지도 저장하지도 않습니다. 아래는 PC 에이전트를 쓸 때 서버(AWS)에 생기는 기록입니다.</p>
+<p>학번·비밀번호는 받지도 저장하지도 않습니다. 아래는 서버(AWS)에 생기는 기록입니다. 학교 공지 두 줄과 서버 로그를 빼면 PC 에이전트를 쓸 때만 생깁니다.</p>
 <table>
 <tr><th>항목</th><th>보유 기간</th></tr>
-<tr><td>기기 ID(무작위 값), 기기 공개키, 등록 시각</td><td><code>kw-mcp unlink</code>로 해제할 때까지. 해제하면 바로 삭제</td></tr>
-<tr><td>연결한 앱 목록(앱 이름, 돌아갈 주소의 호스트, 연결·마지막 사용 시각)</td><td><code>kw-mcp revoke</code>로 끊거나 기기를 해제할 때까지, 길어도 갱신 토큰 만료(180일)까지</td></tr>
-<tr><td>앱(Claude·ChatGPT) 등록 정보(OAuth 클라이언트 이름, 돌아갈 주소)</td><td>1년</td></tr>
-<tr><td>갱신 토큰의 해시(쓸 때마다 새로 발급)</td><td>180일</td></tr>
-<tr><td>승인 코드의 해시 / 승인 대기 요청(state, 돌아갈 주소, PKCE 값)</td><td>5분 / 10분, 한 번 쓰면 삭제</td></tr>
-<tr><td>1회용 연결 코드의 해시(<code>kw-mcp code</code>)</td><td>15분</td></tr>
-<tr><td>에이전트 접속 정보(WebSocket 연결 ID, 에이전트 버전, 접속 시각)</td><td>3시간</td></tr>
-<tr><td>이미 쓴 기기 서명의 해시(재사용 방지)</td><td>10분</td></tr>
-<tr><td>암호화된 답(요청마다 다른 키로 PC가 암호화한 KLAS 조회 결과)</td><td>전달되면 바로, 늦어도 2분 안에 삭제</td></tr>
-<tr><td>풀어낸 답(서버 메모리에만, DB·디스크에 쓰지 않음)</td><td>이어지는 질문에 최대 1분 다시 쓴 뒤 폐기</td></tr>
+<tr><td>기기 ID(무작위 값), 기기 공개키, 등록 시각, 등록에 쓴 초대 코드의 해시(초대를 회수하면 그 PC도 끊으려고), 마지막 접속 시각</td><td><code>kw-mcp unlink</code>로 해제할 때까지. 해제하면 바로 삭제</td></tr>
+<tr><td>연결한 앱 목록(앱 이름, 돌아갈 주소의 호스트, 승인 때의 초대 코드 해시, 연결·마지막 사용·만료 시각)</td><td><code>kw-mcp revoke</code>로 끊거나 기기를 해제할 때까지, 길어도 승인한 날부터 __GRANT_DAYS__일</td></tr>
+<tr><td>앱(Claude·ChatGPT) 등록 정보(OAuth 클라이언트 이름, 돌아갈 주소)</td><td>토큰을 받기 전에는 __CLIENT_PENDING_DAYS__일, 받은 뒤에는 마지막으로 토큰을 받은 날부터 __CLIENT_DAYS__일</td></tr>
+<tr><td>갱신 토큰의 해시(쓸 때마다 새로 발급. 쓴 토큰은 도용을 알아채려고 쓴 시각과 함께 남김)</td><td>그 연결이 끝날 때까지, 길어도 승인한 날부터 __GRANT_DAYS__일</td></tr>
+<tr><td>승인 코드의 해시 / 승인 대기 요청(state, 돌아갈 주소, PKCE 값)</td><td>__CODE_MIN__분 / __AUTHREQ_MIN__분, 한 번 쓰면 삭제</td></tr>
+<tr><td>1회용 연결 코드의 해시(<code>kw-mcp code</code>)</td><td>__PAIR_MIN__분</td></tr>
+<tr><td>에이전트 접속 정보(WebSocket 연결 ID, 에이전트 버전, 접속 시각)</td><td>__CONN_HOURS__시간</td></tr>
+<tr><td>이미 쓴 기기 서명의 해시(재사용 방지)</td><td>__SIG_MIN__분</td></tr>
+<tr><td>기기별 요청 수(동시 요청 수와 분당 요청 수, 남용 방지)</td><td>2분</td></tr>
+<tr><td>암호화된 답(요청마다 다른 키로 PC가 암호화한 KLAS 조회 결과)</td><td>전달되면 바로, 늦어도 __RESULT_MIN__분 안에 삭제</td></tr>
+<tr><td>풀어낸 답(서버 메모리에만, DB·디스크에 쓰지 않음)</td><td>이어지는 질문에 최대 1분 다시 쓰고, 그 뒤 그 서버가 다음 요청을 받을 때나 서버 인스턴스가 내려갈 때 삭제</td></tr>
+<tr><td>학교 공지: 공개 게시판 글의 제목·분류·부서·게시일·링크(본문과 첨부는 가져오지 않고, 제목의 연락처·학번·사람 이름은 저장 전에 가림)</td><td>마지막으로 바뀐 날부터 __NOTICE_DAYS__일</td></tr>
+<tr><td>학교 공지 알림: 위 제목과 링크를 올린 Discord 메시지, 전달 기록(Discord 메시지·채널 ID, 올린 시각)</td><td>메시지는 Discord 채널에 남고, 삭제 요청을 받으면 지움. 전달 기록은 올린 날부터 __DELIVERY_DAYS__일이고, 공지가 바뀌면(메시지를 고치지 않는 변경이어도) 그날부터 다시 __DELIVERY_DAYS__일(공지 보유 기간보다 __RECORD_GRACE_DAYS__일 더)</td></tr>
 <tr><td>서버 로그: 사건 종류(연결, 승인, 거부, 철회 같은 것)와 오류 코드, 시각</td><td>2주</td></tr>
 </table>
 <p>접근 토큰은 1시간짜리 서명 토큰이라 서버에 저장하지 않습니다. 서버 로그에는 IP 주소, 요청 주소(초대 토큰), 학번·이름·성적 같은 내용을 남기지 않도록 만들었습니다
 (요청을 전달하는 동안 AWS가 IP 주소를 다루기는 합니다). 로그에 남기는 항목을 늘리게 되면 이 표에 먼저 적습니다.
 보유 기간이 지난 기록은 DB의 만료 기능과 로그 보관 설정으로 자동 삭제합니다(DB 만료 삭제는 며칠 늦을 수 있지만, 만료된 기록은 쓰지 않습니다). 별도 백업은 두지 않으며, 백업을 켜게 되면 이 방침에 먼저 적습니다.</p>
 
-<h3>3. Discord 알림 채널</h3>
-<p>#알림-설정의 역할 버튼을 누르면 Discord가 그 계정에 알림 역할을 붙이거나 뗍니다. 누가 어떤 역할을 가졌는지(Discord 사용자 ID)는 Discord의 역할 정보에만 있고,
+<h3>3. 학교 공지 수집과 Discord 알림 채널</h3>
+<p><b>수집하는 곳과 방식</b>: 학교 홈페이지(www.kw.ac.kr)의 공지·취업게시판·FAQ·학식·학사일정, 인공지능융합대학(aicon.kw.ac.kr)과 학과·단과대 사이트(*.kw.ac.kr)의 공지 게시판 첫 페이지,
+학과 블로그 피드(__FEED_HOSTS__)를 읽습니다. 로그인이 필요한 페이지, 글 본문, 첨부 파일은 읽지 않습니다.
+요청은 AWS 서울 리전에서 평일 09:00~18:40에 20분마다와 21:00에 보냅니다(학식·학사일정은 평일 07:30). 한 번 돌 때 서버마다 한 번 요청합니다.
+학교 홈페이지만 예외로, 취업게시판이나 FAQ를 볼 때(한 번에 둘 중 하나)와 평일 07:30에 학식과 학사일정을 함께 받을 때 __GAP_S__초 넘게 기다렸다가 한 번 더 요청합니다.
+같은 서버에는 __GAP_S__초 이상 간격을 두고, 하루 상한(학교 홈페이지 __WWW_CAP__번, 학과 사이트는 서버마다 __DEPT_CAP__번, 블로그 피드는 호스트마다 __FEED_CAP__번)을 넘기지 않습니다. 403·429·보안문자 화면을 받으면 그 서버를 쉬고, 세 번 연속이면 운영자가 다시 켤 때까지 요청하지 않습니다.
+요청의 User-Agent에 이 페이지 주소를 적어 둡니다. 사이트 관리자께서 수집을 원하지 않으시면 아래 보호책임자 이메일로 알려 주세요. 그 사이트 수집을 멈추고 회신합니다.</p>
+<p><b>공지 제목 속 이름</b>: 합격자·수상자 명단처럼 공지 제목에 사람 이름이 들어 있을 수 있습니다. 저장하기 전에 규칙으로 이름·연락처·학번을 가리지만 빠지는 경우가 있습니다.
+내 이름이 나온 공지를 지우고 싶으면 보호책임자에게 이메일로 알려 주세요. 저장된 공지, Discord 메시지, 전달 기록을 지우고 다음 수집에서 다시 올리지 않습니다.</p>
+<p><b>알림 역할</b>: #알림-설정의 역할 버튼을 누르면 Discord가 그 계정에 알림 역할을 붙이거나 뗍니다. 누가 어떤 역할을 가졌는지(Discord 사용자 ID)는 Discord의 역할 정보에만 있고,
 우리 서버는 따로 저장하지 않습니다. 버튼 요청을 처리하는 동안만 메모리에서 쓰고, 서버 로그에는 처리 결과만 남깁니다. 알림 내용은 학교 공개 공지입니다.
 역할 버튼을 다시 누르면 구독이 풀립니다. Discord 이용에는 Discord(미국)의 개인정보 처리방침이 적용됩니다.</p>
 
 <h3>4. 처리 위탁과 국외 이전</h3>
 <ul>
-<li><b>위탁</b>: Amazon Web Services(AWS)에 서버·DB·로그 운영을 맡깁니다. 모든 기록은 아시아 태평양(서울) 리전에 저장됩니다.</li>
+<li><b>위탁</b>: Amazon Web Services(AWS)에 서버·DB·로그 운영을 맡깁니다. 서버의 모든 기록은 아시아 태평양(서울) 리전에 저장됩니다.</li>
+<li><b>Discord(미국)</b>: 학교 공지 알림(공개 공지의 제목과 링크)을 Discord 채널에 올리므로, 올린 메시지는 Discord가 보관합니다. 역할 버튼도 Discord를 거쳐 처리됩니다.</li>
 <li><b>Claude(Anthropic, 미국)·ChatGPT(OpenAI, 미국)</b>: 이 서비스가 제공하거나 위탁하는 곳이 아닙니다. 사용자가 직접 고르고 연결한 AI 서비스가 사용자 계정으로 질문하고,
 PC 에이전트의 답은 그 서비스로 전달됩니다. 전달된 답은 해당 회사의 개인정보 처리방침을 따릅니다. 성적처럼 민감한 내용을 물을지는 사용자가 정합니다.</li>
 </ul>
@@ -242,6 +348,36 @@ PC 에이전트의 답은 그 서비스로 전달됩니다. 전달된 답은 해
 동의하지 않으면 방법 1(데스크톱 확장)을 쓰세요. <code>kw-mcp unlink</code>로 언제든 철회할 수 있습니다.
 이 방침이 바뀌면 이 페이지에 시행일과 함께 알립니다.</p>
 </body></html>"""
+
+
+def privacy_page() -> str:
+    """/privacy with each retention period read from the constant that enforces it, so the notice
+    can't drift from the code (as "180일" once did while grants ran 120 days)."""
+    periods = {
+        "__GRANT_DAYS__": store.GRANT_TTL // 86400,
+        "__CLIENT_PENDING_DAYS__": store.CLIENT_PENDING_TTL // 86400,
+        "__CLIENT_DAYS__": store.CLIENT_TTL // 86400,
+        "__CODE_MIN__": store.CODE_TTL // 60,
+        "__AUTHREQ_MIN__": store.AUTHREQ_TTL // 60,
+        "__PAIR_MIN__": store.PAIR_TTL // 60,
+        "__CONN_HOURS__": store.CONN_TTL // 3600,
+        "__SIG_MIN__": signing.MAX_SKEW_S * 2 // 60,  # the replay window signing.py passes to use_once
+        "__RESULT_MIN__": store.RESULT_TTL // 60,
+        "__NOTICE_DAYS__": NOTICE_TTL.days,
+        "__DELIVERY_DAYS__": DELIVERY_TTL.days,
+        # discord.RECORD_GRACE: _record_ttl keeps a record at least this long past its notice's ttl
+        "__RECORD_GRACE_DAYS__": (DELIVERY_TTL - NOTICE_TTL).days,
+        # what the collector paragraph tells a school webmaster
+        "__GAP_S__": int(politeness.MIN_INTERVAL.total_seconds()),
+        "__FEED_HOSTS__": ", ".join(feed.host for feed in wixfeeds.FEEDS),
+        "__WWW_CAP__": WWW_DAILY_CAP,
+        "__DEPT_CAP__": deptboards.DAILY_CAP,
+        "__FEED_CAP__": wixfeeds.DAILY_CAP,
+    }
+    page = PRIVACY_TEMPLATE
+    for marker, value in periods.items():
+        page = page.replace(marker, str(value))
+    return page
 
 
 @cache
@@ -303,7 +439,7 @@ def routes(base_url: str):
                                      "X-Frame-Options": "DENY"})
 
     async def privacy(request: Request) -> Response:
-        return HTMLResponse(PRIVACY_PAGE, headers={"Cache-Control": "no-cache", "X-Frame-Options": "DENY"})
+        return HTMLResponse(privacy_page(), headers={"Cache-Control": "no-cache", "X-Frame-Options": "DENY"})
 
     async def dist(request: Request) -> Response:
         name = request.path_params["name"]

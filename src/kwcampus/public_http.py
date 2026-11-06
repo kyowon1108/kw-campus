@@ -40,7 +40,7 @@ _PATH = re.compile(r"^/c/([A-Za-z0-9_-]{20,80})(/mcp|/api/notices|/api/menu|/api
 INSTRUCTIONS = """\
 광운대학교 공개 공지(www.kw.ac.kr 메인 공지·취업게시판·종합 FAQ, 학과 게시판)를 조회합니다. 비공식 도구이며 제목·날짜·분류·부서·링크만 있습니다.
 - 분류는 일반, 학사, 학생, 봉사, 등록/장학, 입학, 시설, 병무, 외부, 국제교류, 국제학생(메인 공지), 취업(취업게시판), FAQ, 학과 이름(인공지능융합대학, 전자정보공과대학, 전자공학과 등)입니다. "장학금", "채용", "국제", "학과"(모든 학과), 이름 일부("건축")도 받습니다. 없는 분류는 unknown_category 오류와 쓸 수 있는 분류 목록을 돌려줍니다.
-- 분류 없이 받은 최신 목록에는 FAQ가 빠집니다. 여러 학과가 같이 올린 공지는 하나로 묶고 나머지 post_id를 also에 넣습니다.
+- 분류 없이 받은 최신 목록에는 FAQ가 빠집니다. 여러 게시판이 같은 제목으로 올린 공지는 하나로 묶고 나머지 post_id를 also에, 그 게시판을 also_boards에 넣습니다.
 - 본문은 없으니 자세한 내용은 url 링크를 안내하세요. 날짜는 한국 시간 기준입니다.
 - 학식(함지마루 주간 식단)과 학사일정(학교 학사일정 페이지)도 조회할 수 있습니다.
 """
@@ -189,17 +189,23 @@ def _notices_api(request: Request) -> JSONResponse:
     if sources and not set(sources) <= set(public_data.SOURCES):
         return JSONResponse({"error": "unknown_source", "valid": list(public_data.SOURCES)}, status_code=400)
     try:
+        # kw-mcp's my_notices asks for every department board and keeps the student's own on the PC,
+        # so those boards get the larger cap (the department never comes here).
+        cap = public_data.DEPARTMENT_LIMIT if public_data.only_departments(q.get("category")) else public_data.MAX_LIMIT
         if q.get("q"):
             rows = public_data.search(table, q["q"], q.get("category"), _date(q.get("since"), "since"), limit,
-                                      sources=sources)
+                                      sources=sources, max_limit=cap)
         else:  # `since` must hold here too: kw-mcp's "new notices" ask without a query
             rows = public_data.latest(table, q.get("category"), limit, q.get("pinned", "true") != "false",
-                                      _date(q.get("since"), "since"), sources=sources)
+                                      _date(q.get("since"), "since"), sources=sources, max_limit=cap)
     except public_data.UnknownCategory as e:
         return JSONResponse(e.as_dict(), status_code=400)
     except BadDate:
         return JSONResponse(_BAD_DATE, status_code=400)
-    return JSONResponse({"notices": rows, "source": "광운대 공개 공지(메인·학과·취업 게시판)", "unofficial": True})
+    # max_limit: the cap this answer was cut at, so kw-mcp says "older posts may be missing" only when
+    # the rows actually reached it (it can't tell 50 posts from a cut at 50 otherwise).
+    return JSONResponse({"notices": rows, "max_limit": cap, "source": "광운대 공개 공지(메인·학과·취업 게시판)",
+                         "unofficial": True})
 
 
 def build_app():

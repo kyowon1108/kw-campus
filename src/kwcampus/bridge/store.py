@@ -171,10 +171,15 @@ def touch_grant(t, uid: str, gid: str) -> None:
 
 
 def revoke_grant(t, uid: str, gid: str) -> bool:
-    """End one grant now: its row (access tokens check it) and all its refresh tokens."""
-    old = t.delete_item(Key={"PK": f"DEV#{uid}", "SK": f"GRANT#{gid}"}, ReturnValues="ALL_OLD").get("Attributes")
+    """End one grant of this device now: its row (access tokens check it) and all its refresh tokens.
+    The refresh tokens sit under GRANT#<gid> alone, so they go only when this device's own row did:
+    another PC that learned the grant id (it is in notifications and the token prefix) gets False
+    and leaves the grant alone."""
+    if not _conditional(t.delete_item, Key={"PK": f"DEV#{uid}", "SK": f"GRANT#{gid}"},
+                        ConditionExpression="attribute_exists(PK)"):
+        return False
     _delete_partition(t, f"GRANT#{gid}")
-    return bool(old)
+    return True
 
 
 # OAuth --------------------------------------------------------------------------

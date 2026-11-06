@@ -114,8 +114,12 @@ def verify_jwt(secret: bytes, token: str, audience: str, now: float | None = Non
         header, payload, signature = token.split(".")
     except ValueError:
         return None
+    # compare_digest raises TypeError on a str with non-ASCII characters (a forged bearer token
+    # would be a 500 on every route); a real signature is base64url, so anything else is refused.
+    if not (header + payload + signature).isascii():
+        return None
     expected = b64u(hmac.new(secret, f"{header}.{payload}".encode(), hashlib.sha256).digest())
-    if not hmac.compare_digest(expected, signature):
+    if not hmac.compare_digest(expected.encode(), signature.encode()):
         return None
     try:
         claims = json.loads(b64u_decode(payload))
