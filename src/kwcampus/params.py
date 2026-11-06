@@ -25,21 +25,24 @@ def get(name: str, *, decrypt: bool = False, ttl_s: float = _TTL_S) -> str | Non
     except ClientError as e:
         if e.response["Error"]["Code"] != "ParameterNotFound":
             raise
-        value = None
+        return None  # a miss isn't cached: the value may be put in by hand a moment later
     _CACHE[name] = (time.monotonic(), value)
     return value
 
 
 def get_many(names: list[str], *, decrypt: bool = False, ttl_s: float = _TTL_S) -> dict[str, str | None]:
-    """Several parameters in one GetParameters call (up to 10); missing ones are None."""
+    """Several parameters in one GetParameters call (up to 10); missing ones are None, and not cached."""
     now = time.monotonic()
-    stale = [n for n in names if not ((hit := _CACHE.get(n)) and now - hit[0] < ttl_s)]
+    out = {n: hit[1] for n in names if (hit := _CACHE.get(n)) and now - hit[0] < ttl_s}
+    stale = [n for n in names if n not in out]
     if stale:
         found = {p["Name"]: p["Value"]
                  for p in _client().get_parameters(Names=stale, WithDecryption=decrypt)["Parameters"]}
         for name in stale:
-            _CACHE[name] = (time.monotonic(), found.get(name))
-    return {name: _CACHE[name][1] for name in names}
+            out[name] = found.get(name)
+            if name in found:
+                _CACHE[name] = (time.monotonic(), found[name])
+    return {name: out[name] for name in names}
 
 
 def is_true(name: str) -> bool:

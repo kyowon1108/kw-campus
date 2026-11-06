@@ -205,10 +205,10 @@ def test_post_mentions_only_its_topic_role_and_not_at_night(aws):
         run(aws, {**JOB, "key": {"PK": item["PK"], "SK": item["SK"]}}, fake, night, ROLES)
         _, _, body = fake.calls[-1]
         assert "<@&" not in body["content"] and body["allowed_mentions"] == {"parse": []}
-    # 08:00 is daytime again
+    # 08:00 is daytime again (the next morning, past the 30-minute mention limit)
     item = {**NOTICE, "SK": "N#8"}
     aws["public"].put_item(Item=item)
-    run(aws, {**JOB, "key": {"PK": item["PK"], "SK": item["SK"]}}, fake, datetime(2026, 11, 6, 8, 0, tzinfo=KST), ROLES)
+    run(aws, {**JOB, "key": {"PK": item["PK"], "SK": item["SK"]}}, fake, datetime(2026, 11, 7, 8, 0, tzinfo=KST), ROLES)
     assert fake.calls[-1][2]["allowed_mentions"] == {"parse": [], "roles": ["777"]}
 
 
@@ -361,3 +361,136 @@ def test_handler_never_mentions_the_everyone_role(aws, monkeypatch):
     event = {"Records": [{"messageId": "m1", "body": json.dumps(JOB)}]}
     assert discord.handler(event, None) == {"batchItemFailures": []}  # trailing newline stripped
     assert seen == {"career": "777"}
+
+
+DEPT = {"PK": "SRC#dept-ee", "SK": "N#631", "title": "[필독] 2026-1 졸업요건 안내", "category_id": "dept-ee",
+        "posted_date": "2026-03-02", "updated_date": "2026-03-02", "pinned": True, "seed": True,
+        "department": "전자공학과", "url": "https://ee.kw.ac.kr/x?BoardMode=view&UID=631"}
+
+
+def test_dispatcher_tells_school_edits_from_our_own_and_spots_reposts():
+    today = date(2026, 11, 6)
+    jobs = dispatcher.jobs_for([
+        # our redaction rules changed the title (norm_v bumped), the site's 수정일 didn't: quiet
+        stream("MODIFY", {**NOTICE, "title": "KLAS 보안 강화 안내(수정)", "norm_v": 2}, old={**NOTICE, "norm_v": 1}),
+        # the school moved it from 일반 to 학사: quiet, addressed to where it was posted
+        stream("MODIFY", NOTICE, old={**NOTICE, "category_id": "general"}),
+        # a department reused UID 631 for a new semester: a repost
+        stream("MODIFY", {**DEPT, "title": "[필독] 2026-2 졸업요건 안내", "updated_date": "2026-09-01"}, old=DEPT),
+        # a department fixed a typo a few days later: an ordinary edit
+        stream("MODIFY", {**DEPT, "title": "[필독] 2026-1 졸업 요건 안내", "updated_date": "2026-03-05"}, old=DEPT),
+        # the main board reuses nothing: a big date jump is still an edit
+        stream("MODIFY", {**NOTICE, "title": "새 제목", "updated_date": "2026-12-30"}, old=NOTICE),
+    ], today)
+    assert [(j["action"], j["channel"], j.get("quiet", False)) for j in jobs] == [
+        ("edit", "academic", True),
+        ("edit", "notice", True),
+        ("repost", "department", False),
+        ("edit", "department", False),
+        ("edit", "academic", False),
+    ]
+    assert jobs[1]["changed"] == ["category_id"]
+
+
+def test_dispatcher_resends_only_the_rejected_entries(monkeypatch):
+    class Sqs:
+        def __init__(self, fail_first):
+            self.calls, self.fail_first = [], fail_first
+
+        def send_message_batch(self, QueueUrl, Entries):
+            self.calls.append([e["Id"] for e in Entries])
+            if self.fail_first:
+                self.fail_first -= 1
+                return {"Failed": [{"Id": Entries[0]["Id"]}]}
+            return {}
+
+    sqs = Sqs(fail_first=1)
+    dispatcher._send(sqs, [{"n": 1}, {"n": 2}, {"n": 3}])
+    assert sqs.calls == [["0", "1", "2"], ["0"]]
+    with pytest.raises(RuntimeError):
+        dispatcher._send(Sqs(fail_first=9), [{"n": 1}])
+
+
+def test_quiet_edits_fix_the_message_without_a_note(aws):
+    aws["public"].put_item(Item=NOTICE)
+    fake = FakeDiscord(lambda: DAY)
+    run(aws, JOB, fake, DAY)
+    retitle(aws, "KLAS 보안 강화 안내 (정규화)")
+    assert run(aws, {**EDIT, "quiet": True}, fake, DAY + timedelta(hours=3)) == "edited_quietly"
+    assert [m for m, _, _ in fake.calls] == ["POST", "PATCH"]
+
+
+def test_an_edit_finds_the_message_in_the_channel_it_was_posted_to(aws):
+    aws["public"].put_item(Item=NOTICE)
+    fake = FakeDiscord(lambda: DAY)
+    run(aws, JOB, fake, DAY)  # posted under CH#academic
+    moved = {**EDIT, "channel": "notice", "changed": ["category_id"], "quiet": True}
+    assert run(aws, moved, fake, DAY + timedelta(hours=1)) == "edited_quietly"
+    assert fake.calls[-1][1] == f"/channels/111/messages/{snowflake(DAY)}"
+
+
+def test_a_repost_is_posted_once_then_edited(aws):
+    item = {**DEPT, "title": "[필독] 2026-2 졸업요건 안내", "updated_date": "2026-09-01"}
+    aws["public"].put_item(Item=item)
+    fake = FakeDiscord(lambda: DAY)
+    channels = {"notice": "111"}  # no department channel yet: 학교-공지
+    repost = {"action": "repost", "key": {"PK": item["PK"], "SK": item["SK"]}, "channel": "department",
+              "changed": ["title", "updated_date"]}
+    call = lambda when: discord.handle_job(repost, aws["public"], aws["delivery"], "t", channels, ROLES,
+                                           send=fake, now=when)
+    assert call(DAY) == "posted"
+    assert call(DAY + timedelta(hours=2)) == "edited_replied"  # the same reuse again: edit what we posted
+
+
+def test_titles_that_may_name_someone_go_out_without_title_or_mention(aws):
+    item = {**DEPT, "SK": "N#700", "title": "축하합니다! 홍길동 학생 OO경진대회 수상", "seed": False}
+    aws["public"].put_item(Item=item)
+    fake = FakeDiscord(lambda: DAY)
+    job = {"action": "post", "key": {"PK": item["PK"], "SK": item["SK"]}, "channel": "department"}
+    discord.handle_job(job, aws["public"], aws["delivery"], "t", {"notice": "111"}, {"ei": "780"}, send=fake, now=DAY)
+    _, _, body = fake.calls[-1]
+    assert body["content"].startswith("**[전자공학과]** 새 글 (제목은 링크에서 확인)")
+    assert "홍길동" not in body["content"] and body["allowed_mentions"] == {"parse": []}
+    assert discord.render({**NOTICE, "title": "장학생 김*수 외 3명"}).startswith("**[학사]** 새 글")
+
+
+def test_urgent_rings_only_for_school_wide_notices(aws):
+    fake = FakeDiscord(lambda: DAY)
+    dept = {**DEPT, "SK": "N#701", "title": "전자회로 휴강 안내", "seed": False}
+    aws["public"].put_item(Item=dept)
+    job = {"action": "post", "key": {"PK": dept["PK"], "SK": dept["SK"]}, "channel": "department"}
+    discord.handle_job(job, aws["public"], aws["delivery"], "t", {"notice": "111"}, {**ROLES, "ei": "780"},
+                       send=fake, now=DAY)
+    assert fake.calls[-1][2]["allowed_mentions"] == {"parse": [], "roles": ["780"]}  # the college only
+
+
+def test_a_topic_role_is_mentioned_at_most_every_30_minutes_but_urgent_always(aws):
+    fake = FakeDiscord(lambda: DAY)
+    for i, (title, minutes) in enumerate([("수강신청 안내", 0), ("성적 공시 안내", 10), ("화도관 출입 통제", 20),
+                                          ("졸업 사정 안내", 45)]):
+        item = {**NOTICE, "SK": f"N#t{i}", "title": title}
+        aws["public"].put_item(Item=item)
+        run(aws, {**JOB, "key": {"PK": item["PK"], "SK": item["SK"]}}, fake, DAY + timedelta(minutes=minutes), ROLES)
+    pinged = [c[2]["allowed_mentions"].get("roles", []) for c in fake.calls]
+    assert pinged == [["777"], [], ["779"], ["777"]]
+
+
+def test_after_a_429_the_rest_of_the_batch_waits(aws, monkeypatch):
+    token = "MTIzNDU2Nzg5MDEyMzQ1Njc4.GabcDE.fake_token_value_for_tests_only_xx"
+    aws["ssm"].put_parameter(Name="/kw/discord/bot-token", Value=token, Type="SecureString")
+    calls = []
+
+    def limited(*args, **kwargs):
+        calls.append(args)
+        raise discordapi.RateLimited("discord 429", 5.0)
+
+    monkeypatch.setattr(discord, "handle_job", limited)
+    event = {"Records": [{"messageId": f"m{i}", "body": json.dumps(JOB)} for i in range(3)]}
+    assert discord.handler(event, None) == {"batchItemFailures": [{"itemIdentifier": f"m{i}"} for i in range(3)]}
+    assert len(calls) == 1
+
+
+def test_no_scheduled_run_falls_in_quiet_hours():
+    # weekdays 09:00-18:40 every 20 minutes, plus 21:00 (infra); quiet hours start at 22:00
+    for hour, minute in ((9, 0), (18, 40), (21, 0)):
+        assert not discord.is_quiet(datetime(2026, 11, 6, hour, minute, tzinfo=KST))

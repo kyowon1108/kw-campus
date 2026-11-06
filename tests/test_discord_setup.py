@@ -24,7 +24,8 @@ CHANNELS = {"notice": "201", "academic": "202", "scholarship": "203", "career": 
 class FakeDiscord:
     """Just enough of a guild for discord_setup: roles, channels, overwrites, messages."""
 
-    def __init__(self, bot_perms: int = ds.BOT_RUNTIME | ds.MANAGE_CHANNELS):
+    def __init__(self, bot_perms: int = ds.BOT_RUNTIME | ds.MANAGE_CHANNELS, notifications: int = 1):
+        self.notifications = notifications
         self.roles = [
             {"id": GUILD, "name": "@everyone", "permissions": str(EVERYONE_PERMS), "position": 0},
             {"id": BOT_ROLE, "name": "KW Campus", "permissions": str(bot_perms), "position": 2, "managed": True},
@@ -59,7 +60,7 @@ class FakeDiscord:
         if (method, path) == ("GET", "/users/@me"):
             return {"id": BOT, "username": "KW Campus"}
         if (method, path) == ("GET", f"/guilds/{GUILD}"):
-            return {"id": GUILD, "name": "테스트 서버"}
+            return {"id": GUILD, "name": "테스트 서버", "default_message_notifications": self.notifications}
         if (method, path) == ("GET", f"/guilds/{GUILD}/roles"):
             return copy.deepcopy(self.roles)
         if (method, path) == ("GET", f"/guilds/{GUILD}/channels"):
@@ -99,6 +100,8 @@ class FakeDiscord:
                     return copy.deepcopy(message)
             raise NotFound(path)
         if m := re.fullmatch(r"/channels/(\d+)", path):
+            if method == "PATCH":
+                self._channel(m[1]).update(body)
             return copy.deepcopy(self._channel(m[1]))
         raise AssertionError(f"unexpected {method} {path}")
 
@@ -253,3 +256,121 @@ def test_channels_with_the_same_name_are_both_made_read_only(ssm):
     api._channel("203")["name"] = "학사"  # same name as 202, another category
     run(api, ssm, apply=True)
     assert overwrite(api, "202", GUILD) and overwrite(api, "203", GUILD)
+
+
+class RecordingSsm:
+    """The moto SSM client, with put_parameter calls logged into the fake Discord's write list."""
+
+    def __init__(self, ssm, api, fail=False):
+        self._ssm, self._api, self._fail = ssm, api, fail
+        self.exceptions = ssm.exceptions
+
+    def get_parameter(self, **kw):
+        return self._ssm.get_parameter(**kw)
+
+    def put_parameter(self, **kw):
+        self._api.writes.append(("SSM", kw["Name"]))
+        if self._fail:
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "PutParameter")
+        return self._ssm.put_parameter(**kw)
+
+
+def test_an_administrator_bot_changes_nothing(ssm):
+    api = FakeDiscord(bot_perms=ds.ADMINISTRATOR)
+    code, out = run(api, ssm, apply=True)
+    assert code == 2 and api.writes == []
+    assert "관리자 권한이 있는 봇으로는 아무것도 바꾸지 않습니다" in out
+    code, out = run(api, ssm)  # the dry-run still shows the whole plan
+    assert code == 0 and "역할 만들기" in out and "봇에 관리자 권한이 있습니다" in out
+
+
+def test_a_department_channel_set_by_hand_is_made_read_only(ssm):
+    api = FakeDiscord()
+    api.channels.append({"id": "206", "name": "학과", "type": 0, "parent_id": "300", "guild_id": GUILD,
+                         "permission_overwrites": []})
+    ssm.put_parameter(Name="/kw/discord/channels", Type="String", Overwrite=True,
+                      Value=json.dumps({**CHANNELS, "department": "206"}))
+    run(api, ssm, apply=True)
+    assert int(overwrite(api, "206", BOT)["allow"]) & ds.MENTION_EVERYONE
+    assert int(overwrite(api, "206", GUILD)["deny"]) & ds.SEND_MESSAGES
+
+    ssm.put_parameter(Name="/kw/discord/channels", Type="String", Overwrite=True,
+                      Value=json.dumps({**CHANNELS, "department": "999"}))
+    _, out = run(FakeDiscord(), ssm)
+    assert "'department' 채널(999)을 서버에서 찾지 못했습니다" in out
+
+
+def test_new_channels_inherit_their_category_and_view_is_never_forced(ssm):
+    api = FakeDiscord()
+    api._channel("300")["permission_overwrites"] = [
+        {"id": GUILD, "type": 0, "allow": "0", "deny": str(ds.VIEW_CHANNEL)},
+        {"id": "950", "type": 0, "allow": str(ds.VIEW_CHANNEL), "deny": "0"},  # the verified role
+    ]
+    run(api, ssm, apply=True)
+    menu = next(c for c in api.channels if c["name"] == "알림-설정")
+    everyone = overwrite(api, menu["id"], GUILD)
+    assert int(everyone["deny"]) & ds.VIEW_CHANNEL and not int(everyone["allow"]) & ds.VIEW_CHANNEL
+    assert overwrite(api, menu["id"], "950")["allow"] == str(ds.VIEW_CHANNEL)
+    assert not int(overwrite(api, "201", GUILD)["allow"]) & ds.VIEW_CHANNEL  # nor on existing channels
+
+
+def test_a_same_named_channel_elsewhere_is_not_adopted(ssm):
+    api = FakeDiscord()
+    api.channels.append({"id": "400", "name": "알림-설정", "type": 0, "parent_id": "399", "guild_id": GUILD,
+                         "permission_overwrites": []})
+    run(api, ssm, apply=True)
+    assert len([c for c in api.channels if c["name"] == "알림-설정"]) == 2
+    assert overwrite(api, "400", GUILD) is None
+
+
+def test_mentionable_roles_are_turned_off(ssm):
+    api = FakeDiscord()
+    run(api, ssm, apply=True)
+    role = next(r for r in api.roles if r["name"] == "학사 알림")
+    role["mentionable"] = True
+    api.writes.clear()
+    _, out = run(api, ssm, apply=True)
+    assert api.writes == [("PATCH", f"/guilds/{GUILD}/roles/{role['id']}")] and role["mentionable"] is False
+    assert "'학사 알림' 멤버 멘션 끄기" in out
+
+
+def test_dangerous_and_unnamed_bot_permissions_are_reported(ssm):
+    _, out = run(FakeDiscord(bot_perms=ds.BOT_RUNTIME | ds.BAN_MEMBERS | (1 << 45)), ssm)
+    assert "위험한 권한이 있습니다: 멤버 차단(Ban Members)" in out
+    assert f"기타 권한 비트 {hex(1 << 45)}" in out
+
+
+def test_the_role_map_is_written_before_the_buttons_change(ssm):
+    api = FakeDiscord()
+    code, _ = run(api, RecordingSsm(ssm, api), apply=True)
+    assert code == 0
+    order = [w for w in api.writes if w[0] == "SSM" or "/messages" in w[1]]
+    assert order[0] == ("SSM", "/kw/discord/roles") and order[1][0] == "POST"
+    saved = json.loads(ssm.get_parameter(Name="/kw/discord/roles")["Parameter"]["Value"])
+    assert saved["menu"]["message"]  # and the new message id afterwards
+
+
+def test_an_ssm_write_failure_shows_the_command_to_run(ssm):
+    api = FakeDiscord()
+    code, out = run(api, RecordingSsm(ssm, api, fail=True), apply=True)
+    assert code == 1
+    assert "aws ssm put-parameter --region ap-northeast-2 --name /kw/discord/roles --type String" in out
+    assert "MTIz" not in out  # no token anywhere
+
+
+def test_the_default_notification_level_is_checked(ssm):
+    _, out = run(FakeDiscord(notifications=0), ssm)
+    assert "기본 알림 설정을 '@멘션만'으로" in out
+    _, out = run(FakeDiscord(notifications=1), ssm)
+    assert "@멘션만" not in out
+
+
+def test_a_stale_channel_topic_is_refreshed(ssm):
+    api = FakeDiscord()
+    run(api, ssm, apply=True, department=True)
+    dept = next(c for c in api.channels if c["name"] == "학과-공지")
+    dept["topic"] = "인공지능융합대학·전자정보공과대학 학과 공지. 봇만 글을 씁니다."
+    api.writes.clear()
+    run(api, ssm, apply=True, department=True)
+    assert api.writes == [("PATCH", f"/channels/{dept['id']}")] and dept["topic"] == ds.DEPARTMENT_TOPIC
