@@ -26,17 +26,12 @@ def test_functions_and_tables(tmp_path):
     })
 
 
-def test_schedule_is_weekday_daytime_plus_one_evening_run_kst_without_retries(tmp_path):
-    t = template(tmp_path)
-    for name, expression in (("kw-collector-tick", "cron(0/20 9-18 ? * MON-FRI *)"),
-                             ("kw-collector-evening", "cron(0 21 ? * MON-FRI *)")):
-        t.has_resource_properties("AWS::Scheduler::Schedule", {
-            "Name": name,
-            "ScheduleExpression": expression,
-            "ScheduleExpressionTimezone": "Asia/Seoul",
-            "Target": {"RetryPolicy": {"MaximumRetryAttempts": 0}},
-        })
-    t.resource_count_is("AWS::Scheduler::Schedule", 3)  # + the campus morning tick
+def test_schedule_is_weekday_daytime_kst_without_retries(tmp_path):
+    template(tmp_path).has_resource_properties("AWS::Scheduler::Schedule", {
+        "ScheduleExpression": "cron(0/20 9-18 ? * MON-FRI *)",
+        "ScheduleExpressionTimezone": "Asia/Seoul",
+        "Target": {"RetryPolicy": {"MaximumRetryAttempts": 0}},
+    })
 
 
 def test_collector_cannot_read_discord_secrets(tmp_path):

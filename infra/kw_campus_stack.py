@@ -20,9 +20,6 @@ from constructs import Construct
 
 # Weekdays 09:00-18:59 KST, every 20 minutes (30 runs a day).
 COLLECT_SCHEDULE = "cron(0/20 9-18 ? * MON-FRI *)"
-# Weekdays 21:00 KST: one evening pass for posts made after the last daytime run (18:40), before
-# the 22:00 quiet hours. No weekend runs: none of the stored notices was posted on a weekend.
-EVENING_SCHEDULE = "cron(0 21 ? * MON-FRI *)"
 # Weekdays 07:30 KST: cafeteria menu / academic calendar refresh (0-2 requests).
 CAMPUS_SCHEDULE = "cron(30 7 ? * MON-FRI *)"
 # Lambda Web Adapter (arm64) in ap-northeast-2; serves uvicorn behind Lambda.
@@ -213,20 +210,18 @@ class KwCampusStack(cdk.Stack):
                 retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
             ),
         )
-        for sid, name, expression in (("CollectSchedule", "kw-collector-tick", COLLECT_SCHEDULE),
-                                      ("EveningSchedule", "kw-collector-evening", EVENING_SCHEDULE)):
-            scheduler.CfnSchedule(
-                self, sid,
-                name=name,
-                schedule_expression=expression,
-                schedule_expression_timezone="Asia/Seoul",
-                flexible_time_window=scheduler.CfnSchedule.FlexibleTimeWindowProperty(mode="OFF"),
-                target=scheduler.CfnSchedule.TargetProperty(
-                    arn=collector.function_arn,
-                    role_arn=schedule_role.role_arn,
-                    retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
-                ),
-            )
+        scheduler.CfnSchedule(
+            self, "CollectSchedule",
+            name="kw-collector-tick",
+            schedule_expression=COLLECT_SCHEDULE,
+            schedule_expression_timezone="Asia/Seoul",
+            flexible_time_window=scheduler.CfnSchedule.FlexibleTimeWindowProperty(mode="OFF"),
+            target=scheduler.CfnSchedule.TargetProperty(
+                arn=collector.function_arn,
+                role_arn=schedule_role.role_arn,
+                retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
+            ),
+        )
 
         # alarms
         topic = sns.Topic(self, "Alarms", topic_name="kw-alarms")

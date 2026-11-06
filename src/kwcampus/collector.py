@@ -19,7 +19,7 @@ from kwcampus.kwnotice.parsing_shared import boundary_or_issue, soup_from_bounda
 from kwcampus.kwnotice.source import NOTICE_HOST, build_list_url
 from kwcampus.obs import log, metrics
 
-DAILY_CAP = 40  # weekday 09:00-18:59 every 20 min = 30 runs, plus one at 21:00
+DAILY_CAP = 40  # weekday 09:00-18:59 every 20 min = 30 runs
 
 
 def run(now: datetime, table, fetch=fetch_list_page) -> dict[str, object]:

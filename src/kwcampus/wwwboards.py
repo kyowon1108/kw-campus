@@ -8,8 +8,7 @@ So the rows are read here with kwnotice's helpers and get this board's category.
 They share www's gate and daily cap with the main board, so they are checked rarely: the job board
 at most every 2 hours, the FAQ at most once a day, never both in one run. The main board has just
 used the run's www request, so the check first waits out the 60 s gap (as the campus Lambda does).
-www budget per weekday: main board 31 (30 daytime runs + 21:00) + job 6 + FAQ 1 + campus <= 2,
-within the cap of 40.
+www budget per weekday: main board 30 + job 5 + FAQ 1 + campus <= 3, under the cap of 40.
 """
 
 from __future__ import annotations
