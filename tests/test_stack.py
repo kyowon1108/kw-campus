@@ -8,10 +8,11 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "infra"))
 from kw_campus_stack import KwCampusStack
 
 
-def template(tmp_path) -> Template:
+def template(tmp_path, alarm_email: str | None = None) -> Template:
     (tmp_path / "placeholder.py").write_text("")
     app = cdk.App()
-    stack = KwCampusStack(app, "Test", asset_path=str(tmp_path), env=cdk.Environment(region="ap-northeast-2"))
+    stack = KwCampusStack(app, "Test", asset_path=str(tmp_path), alarm_email=alarm_email,
+                          env=cdk.Environment(region="ap-northeast-2"))
     return Template.from_stack(stack)
 
 
@@ -112,3 +113,48 @@ def test_collector_runs_one_at_a_time_and_disabled_origins_alarm(tmp_path):
     assert names["kw-collector-needs-human"] == "NeedsHuman"
     assert names["kw-collector-row-issues"] == "RowIssues" and names["kw-collector-uid-regressed"] == "UidRegressed"
     assert names["kw-collector-source-failed"] == "SourceFailed"
+
+
+def test_bridge_routes_have_their_own_limits(tmp_path):
+    t = template(tmp_path)
+    routes = {r["Properties"]["RouteKey"] for r in t.find_resources("AWS::ApiGatewayV2::Route").values()}
+    assert {"POST /oauth/register", "POST /device/register", "POST /device/result", "ANY /{proxy+}"} <= routes
+    stage = next(s["Properties"] for s in t.find_resources("AWS::ApiGatewayV2::Stage").values()
+                 if "RouteSettings" in s["Properties"])
+    settings = stage["RouteSettings"]
+    assert settings["POST /oauth/register"] == {"ThrottlingRateLimit": 1, "ThrottlingBurstLimit": 5}
+    assert settings["POST /device/result"]["ThrottlingRateLimit"] == 20
+    assert stage["DefaultRouteSettings"] == {"ThrottlingRateLimit": 10, "ThrottlingBurstLimit": 20}
+    t.has_resource_properties("AWS::Lambda::Function", {"FunctionName": "kw-bridge",
+                                                        "ReservedConcurrentExecutions": 20})
+
+
+def test_failures_and_security_events_raise_alarms(tmp_path):
+    t = template(tmp_path)
+    names = {a["Properties"]["AlarmName"] for a in t.find_resources("AWS::CloudWatch::Alarm").values()}
+    assert {"kw-bridge-5xx", "kw-public-api-5xx", "kw-discord-api-5xx", "kw-stream-dlq",
+            "kw-bridge-throttles", "kw-collector-throttles", "kw-bridge-refresh-reuse",
+            "kw-bridge-device-signature-refused", "kw-bridge-approve-cross-site"} <= names
+    filters = [f["Properties"]["FilterPattern"] for f in t.find_resources("AWS::Logs::MetricFilter").values()]
+    assert any("refresh_reuse_revoked" in f for f in filters) and any("cross_site" in f for f in filters)
+    t.has_resource_properties("AWS::Lambda::EventSourceMapping", {
+        "DestinationConfig": {"OnFailure": {"Destination": Match.any_value()}}})
+    t.resource_count_is("AWS::Budgets::Budget", 0)  # no address, no budget mail
+
+
+def test_budget_mails_the_alarm_address(tmp_path):
+    t = template(tmp_path, alarm_email="ops@example.com")
+    t.has_resource_properties("AWS::Budgets::Budget", {
+        "Budget": Match.object_like({"BudgetLimit": {"Amount": 5, "Unit": "USD"}, "TimeUnit": "MONTHLY"}),
+        "NotificationsWithSubscribers": Match.array_with([Match.object_like({
+            "Subscribers": [{"SubscriptionType": "EMAIL", "Address": "ops@example.com"}]})]),
+    })
+
+
+def test_logical_ids_stay_put(tmp_path):
+    """The deployed stack's IDs (checked against CloudFormation, 2026-11-06). A changed ID replaces the
+    resource: a new API id breaks every connector and installer URL, a replaced table loses its data."""
+    deployed = {"PublicD0AE4A11", "Delivery5F6C039D", "BridgeTable91945A73", "BridgeApi2D65AE30",
+                "BridgeWsApi49B6887C", "PublicApiC8293BC5", "DiscordQueueF83490F5", "DiscordDlq7CEACF49",
+                "Alarms04B5A0BF", "Bridge48182F58", "BridgeWs0035CE13", "Collector9EBA7CF5"}
+    assert deployed <= set(template(tmp_path).to_json()["Resources"])

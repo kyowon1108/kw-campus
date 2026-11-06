@@ -5,6 +5,7 @@ from __future__ import annotations
 import aws_cdk as cdk
 from aws_cdk import aws_apigatewayv2 as apigw
 from aws_cdk import aws_apigatewayv2_integrations as apigw_int
+from aws_cdk import aws_budgets as budgets
 from aws_cdk import aws_cloudwatch as cw
 from aws_cdk import aws_cloudwatch_actions as cw_actions
 from aws_cdk import aws_dynamodb as ddb
@@ -25,6 +26,22 @@ COLLECT_SCHEDULE = "cron(0/20 9-18 ? * MON-FRI *)"
 EXTRA_COLLECT_SCHEDULES = {"CollectEveningSchedule": ("kw-collector-evening", "cron(0 21 ? * MON-FRI *)")}
 # Weekdays 07:30 KST: cafeteria menu / academic calendar refresh (0-2 www requests a run).
 CAMPUS_SCHEDULE = "cron(30 7 ? * MON-FRI *)"
+# Per-route limits on the bridge (requests/s, burst). The stage default stays 10/20 for /mcp and the
+# installer pages; signup-like routes get much less, and agents' result posts get their own room so
+# anonymous traffic can't starve them.
+BRIDGE_ROUTE_LIMITS = {
+    ("POST", "/oauth/register"): (1, 5),
+    ("GET", "/oauth/authorize"): (2, 5),
+    ("POST", "/oauth/approve"): (2, 5),
+    ("POST", "/oauth/token"): (5, 10),
+    ("POST", "/device/register"): (1, 3),
+    ("POST", "/device/pair"): (2, 5),
+    ("POST", "/device/grants"): (2, 5),
+    ("POST", "/device/revoke"): (2, 5),
+    ("POST", "/device/unlink"): (2, 5),
+    ("POST", "/device/result"): (20, 40),
+}
+MONTHLY_BUDGET_USD = 5
 # Lambda Web Adapter (arm64) in ap-northeast-2; serves uvicorn behind Lambda.
 LWA_LAYER = "arn:aws:lambda:ap-northeast-2:753240598075:layer:LambdaAdapterLayerArm64:30"
 
@@ -123,12 +140,15 @@ class KwCampusStack(cdk.Stack):
             actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/collector/*"]))
 
         # dispatcher: reads the stream, writes jobs, reads the notify switch
+        # Records the dispatcher still can't handle after the retries are kept here instead of dropped.
+        stream_dlq = sqs.Queue(self, "StreamDlq", queue_name="kw-stream-dlq", retention_period=cdk.Duration.days(14))
         dispatcher.add_event_source(sources.DynamoEventSource(
             public,
             starting_position=lambda_.StartingPosition.LATEST,
             batch_size=25,
             retry_attempts=3,
             bisect_batch_on_error=True,
+            on_failure=sources.SqsDlq(stream_dlq),
             filters=[lambda_.FilterCriteria.filter({
                 "eventName": lambda_.FilterRule.or_("INSERT", "MODIFY"),
                 "dynamodb": {"Keys": {"SK": {"S": lambda_.FilterRule.begins_with("N#")}}},
@@ -189,7 +209,8 @@ class KwCampusStack(cdk.Stack):
         ws_stage = apigw.WebSocketStage(self, "BridgeWsStage", web_socket_api=ws_api, stage_name="prod",
                                         auto_deploy=True, throttle=apigw.ThrottleSettings(rate_limit=5, burst_limit=10))
         bridge_api = apigw.HttpApi(self, "BridgeApi", api_name="kw-bridge", create_default_stage=False)
-        bridge = fn("Bridge", "run.sh", 30, memory=512, layers=[lwa], extra_env={
+        # 20 at most: a flood on the bridge can't take the concurrency the collector and Discord need.
+        bridge = fn("Bridge", "run.sh", 30, memory=512, layers=[lwa], concurrency=20, extra_env={
             **web_env, **bridge_env, "KW_APP": "kwcampus.bridge.app:app",
             "KW_BRIDGE_BASE_URL": bridge_api.api_endpoint,
             "KW_BRIDGE_WS_URL": ws_stage.url, "KW_BRIDGE_WS_MGMT": ws_stage.callback_url,
@@ -199,12 +220,17 @@ class KwCampusStack(cdk.Stack):
         ws_stage.grant_management_api_access(bridge)
         bridge.add_to_role_policy(iam.PolicyStatement(
             actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/bridge/*", f"{ssm_arn}/kw/mcp/*"]))
-        bridge_api.add_routes(path="/{proxy+}", methods=[apigw.HttpMethod.ANY],
-                              integration=apigw_int.HttpLambdaIntegration("BridgeIntegration", bridge))
+        bridge_integration = apigw_int.HttpLambdaIntegration("BridgeIntegration", bridge)
+        bridge_api.add_routes(path="/{proxy+}", methods=[apigw.HttpMethod.ANY], integration=bridge_integration)
+        for method, path in BRIDGE_ROUTE_LIMITS:
+            bridge_api.add_routes(path=path, methods=[apigw.HttpMethod(method)], integration=bridge_integration)
         # Account-wide, not per IP (HTTP APIs take no WAF): high enough that one noisy client doesn't
         # lock everyone out, low enough to cap the bill (the budget alarm covers the rest).
-        bridge_api.add_stage("BridgeDefaultStage", stage_name="$default", auto_deploy=True,
-                             throttle=apigw.ThrottleSettings(rate_limit=10, burst_limit=20))
+        bridge_stage = bridge_api.add_stage("BridgeDefaultStage", stage_name="$default", auto_deploy=True,
+                                            throttle=apigw.ThrottleSettings(rate_limit=10, burst_limit=20))
+        bridge_stage.node.default_child.add_property_override("RouteSettings", {
+            f"{method} {path}": {"ThrottlingRateLimit": rate, "ThrottlingBurstLimit": burst}
+            for (method, path), (rate, burst) in BRIDGE_ROUTE_LIMITS.items()})
 
         # schedules
         schedule_role = iam.Role(self, "ScheduleRole", assumed_by=iam.ServicePrincipal("scheduler.amazonaws.com"))
@@ -258,6 +284,40 @@ class KwCampusStack(cdk.Stack):
         five_min = cdk.Duration.minutes(5)
         for f in (collector, dispatcher, sender, interactions, campus, public_mcp, bridge, bridge_ws):
             alarm(f"{f.node.id.lower()}-errors", f.metric_errors(period=five_min))
+        for f in (collector, bridge, interactions):
+            alarm(f"{f.node.id.lower()}-throttles", f.metric_throttles(period=five_min))
+        # 5xx answers that never raise in the function (adapter or integration failures, timeouts)
+        for name, http_api in (("bridge", bridge_api), ("public-api", api), ("discord-api", discord_api)):
+            alarm(f"{name}-5xx", http_api.metric_server_error(period=five_min), threshold=3)
+        alarm("stream-dlq", stream_dlq.metric_approximate_number_of_messages_visible(period=five_min))
+        # Security events the bridge logs (obs.log): a reused refresh token (a stolen one, or a
+        # client bug), a burst of bad device signatures, approvals posted from another site.
+        is_event = lambda event: logs.FilterPattern.string_value("$.event", "=", event)
+        security_events = (
+            ("refresh-reuse", "RefreshReuseRevoked", is_event("refresh_reuse_revoked"), 1),
+            ("device-signature-refused", "DeviceSignatureRefused", is_event("device_signature_refused"), 20),
+            ("approve-cross-site", "ApproveCrossSite",
+             logs.FilterPattern.all(is_event("approve_refused"),
+                                    logs.FilterPattern.string_value("$.reason", "=", "cross_site")), 3),
+        )
+        for name, metric_name, pattern, threshold in security_events:
+            logs.MetricFilter(self, f"{metric_name}Filter", log_group=bridge.log_group,
+                              metric_namespace="KwCampus", metric_name=metric_name, metric_value="1",
+                              filter_pattern=pattern)
+            alarm(f"bridge-{name}", cw.Metric(namespace="KwCampus", metric_name=metric_name,
+                                             statistic="Sum", period=five_min), threshold=threshold)
+        if alarm_email:
+            budgets.CfnBudget(self, "MonthlyBudget", budget=budgets.CfnBudget.BudgetDataProperty(
+                budget_name="kw-campus-monthly", budget_type="COST", time_unit="MONTHLY",
+                budget_limit=budgets.CfnBudget.SpendProperty(amount=MONTHLY_BUDGET_USD, unit="USD")),
+                notifications_with_subscribers=[
+                    budgets.CfnBudget.NotificationWithSubscribersProperty(
+                        notification=budgets.CfnBudget.NotificationProperty(
+                            notification_type=kind, comparison_operator="GREATER_THAN", threshold=percent,
+                            threshold_type="PERCENTAGE"),
+                        subscribers=[budgets.CfnBudget.SubscriberProperty(subscription_type="EMAIL",
+                                                                          address=alarm_email)])
+                    for kind, percent in (("ACTUAL", 80), ("FORECASTED", 100))])
         # hard blocks only (403, 429, a challenge page); transient failures go to NeedsHuman after 6 in a row
         alarm("collector-blocked", cw.Metric(namespace="KwCampus", metric_name="Blocked",
                                              statistic="Sum", period=cdk.Duration.minutes(20)))
