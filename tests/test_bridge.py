@@ -84,6 +84,7 @@ def env(aws, monkeypatch):
     bridge._SNAP.clear()
     sent = []
     snapshots = {}  # uid -> snapshot its agent answers with (default SNAPSHOT)
+    answers = {"department": {"result": None}}  # op -> the agent's whole answer; other ops echo their args
 
     def fake_post(conn, message):
         # The "agent" answers immediately by posting an encrypted result.
@@ -91,7 +92,8 @@ def env(aws, monkeypatch):
         if message["type"] == "call":
             echo = {"op": message["op"], **message["args"]}
             result = [echo] if message["op"] in ("attendance", "exam_info") else echo  # list-returning ops
-            body = FakeDevice.encrypt(message["key"], message["request_id"], {"result": result})
+            answer = answers.get(message["op"], {"result": result})
+            body = FakeDevice.encrypt(message["key"], message["request_id"], answer)
             store.put_result(t, body["request_id"], body["iv"], body["ct"])
             return True
         if message["type"] != "snapshot":
@@ -103,7 +105,8 @@ def env(aws, monkeypatch):
 
     monkeypatch.setattr(bridge, "_post_to_connection", fake_post)
     with TestClient(bridge.build_app(), base_url="http://localhost:8080") as client:
-        yield {"client": client, "table": t, "sent": sent, "snapshots": snapshots, "public": aws["public"]}
+        yield {"client": client, "table": t, "sent": sent, "snapshots": snapshots, "answers": answers,
+               "public": aws["public"]}
 
 
 def register(client, device):
@@ -650,10 +653,12 @@ def test_every_op_the_bridge_sends_is_one_the_agent_knows():
     tree = ast.parse(inspect.getsource(bridge))
     calls = {node.args[0].value: {k.arg for k in node.keywords} for node in ast.walk(tree)
              if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "agent_call"}
-    assert len(calls) == 16
+    assert len(calls) == 17
     for op, args in calls.items():
         assert op in agent.CALLS, op
-        assert args == set(agent.CALLS[op]), op
+        # The agent also takes the optional ids its lists hand out (agent.OPTIONAL_ARGS); every
+        # other argument it knows, the bridge sends.
+        assert args <= set(agent.CALLS[op]) and set(agent.CALLS[op]) - args <= agent.OPTIONAL_ARGS, op
     assert set(agent.CALLS) == set(calls) | {"deadlines"}  # every agent read has a tool
     assert agent.CALLS["deadlines"] == ("days",)
     shapes_source = inspect.getsource(shapes)
@@ -875,10 +880,11 @@ def test_my_notices_clamps_days_and_takes_the_students_department(env):
     out = tool(c, tokens["access_token"], "my_notices", days=10_000_000)["structuredContent"]
     assert out["days"] == 180 and "department" not in out  # no college is assumed for anyone
     assert tool(c, tokens["access_token"], "my_notices", days=-3)["structuredContent"]["days"] == 1
+    assert tool(c, tokens["access_token"], "my_notices", days=0)["structuredContent"]["days"] == 7  # as kw-mcp
+    # The department is the student's own, from the agent's 학적; a name the model passes is not used.
     dept = tool(c, tokens["access_token"], "my_notices", department="전자공학과")["structuredContent"]
-    assert dept["department"] == []
-    unknown = tool(c, tokens["access_token"], "my_notices", department="없는학과xyz")["structuredContent"]
-    assert "unknown_category" in unknown["department_error"] and unknown["school_academic"] == []
+    # a protocol-1 agent can't answer the department request: the rest still answers
+    assert "department" not in dept and "kw-mcp update" in dept["department_note"] and dept["public_data"] == "ok"
 
 
 def test_snapshot_cache_is_swept_on_every_request(env):
