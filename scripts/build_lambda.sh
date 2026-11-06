@@ -61,7 +61,8 @@ uv pip install -r "$TMP/requirements.txt" --target "$TMP/lambda" \
 # kw-mcp (KLAS client, shared with the PC agent): the released wheel, so the bridge runs released code.
 uv pip install "$RELEASE/$WHEEL" --no-deps --target "$TMP/lambda" --python-platform aarch64-manylinux2014 \
   --python-version 3.13 --quiet
-cp -R src/kwcampus "$TMP/lambda/"
+# Committed files only: no ignored session state, caches or local files in the production bundle.
+git archive --format=tar HEAD src/kwcampus | tar -x -C "$TMP" && mv "$TMP/src/kwcampus" "$TMP/lambda/" && rmdir "$TMP/src"
 cp scripts/run_public_mcp.sh "$TMP/lambda/run.sh" && chmod +x "$TMP/lambda/run.sh"
 # The bridge serves the release to PCs: /install.sh and /install.ps1 install that wheel with those
 # pins, agents update from latest.json, and /setup links the extension.
