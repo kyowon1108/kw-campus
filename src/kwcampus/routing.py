@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from kwcampus import deptboards, wwwboards
-from kwcampus.topics import TOPIC_BY_KEY, TOPICS, Topic
+import re
 
-__all__ = ["CATEGORY_LABEL", "CATEGORY_TO_CHANNEL", "TOPICS", "TOPIC_BY_KEY", "Topic", "channel_for", "topic_for"]
+from kwcampus import deptboards, wwwboards
+from kwcampus.topics import TOPIC_BY_KEY, TOPICS, URGENT, Topic
+
+__all__ = ["CATEGORY_LABEL", "CATEGORY_TO_CHANNEL", "TOPICS", "TOPIC_BY_KEY", "URGENT", "Topic", "channel_for",
+           "is_urgent", "topic_for"]
 
 # channel keys match the keys of the JSON in the /kw/discord/channels parameter
 CHANNEL_KEYS = ("notice", "academic", "scholarship", "career", "international", "department")
@@ -70,3 +73,15 @@ def topic_for(category_id: str) -> str | None:
     if channel is None:
         return None
     return _COLLEGE_TOPIC.get(category_id) or _CHANNEL_TOPIC.get(channel)
+
+
+# What students most need to hear at once, from any board: cancelled or moved classes, closed
+# buildings, outages. Look-alikes stay out: 출입국, 장애학생/장애인, 내부통제, 긴급생활비 (a grant), 단수전공, 정전기.
+_URGENT = re.compile(
+    r"\[긴급\]|긴급\s*(?:공지|안내|알림)|휴강|휴교|정전(?!기)|단수(?!\s*전공)|(?:강의|수업)\s*(?:실|요일|시간|장소)\s*변경"
+    r"|(?<!내부)(?<!내부 )통제|출입\s*(?:제한|금지)|(?:시스템|서비스|전산|네트워크|접속)\s*(?:장애|중단)"
+)
+
+
+def is_urgent(title: str) -> bool:
+    return bool(_URGENT.search(title))

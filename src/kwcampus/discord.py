@@ -4,7 +4,8 @@ The bot token comes from SSM (SecureString), channel ids from /kw/discord/channe
 subscription role ids from /kw/discord/roles. A delivery record (kw-delivery) is claimed before
 posting so an SQS retry never posts the same notice twice.
 
-- post: the notice, mentioning its topic role (only that role may ping; none at night).
+- post: the notice, mentioning its topic role (none 22:00-08:00) and, for urgent titles, the
+  긴급 role at any hour. Only those roles may ping; never @everyone, @here or users.
 - edit: the original message is rewritten. If it was posted more than 30 minutes ago, a short
   "수정됨" reply under it tells readers, at most once per notice per KST day.
 """
@@ -34,7 +35,7 @@ from kwcampus.config import (
 from kwcampus.discordapi import NotFound, RetryLater, token_problem
 from kwcampus.discordapi import call as _discord
 from kwcampus.obs import log, metrics
-from kwcampus.routing import CATEGORY_LABEL, topic_for
+from kwcampus.routing import CATEGORY_LABEL, URGENT, is_urgent, topic_for
 
 SUPPRESS_EMBEDS = 1 << 2
 MAX_LEN = 2000
@@ -56,7 +57,17 @@ def is_quiet(now: datetime) -> bool:
     return hour >= QUIET_FROM_HOUR or hour < QUIET_UNTIL_HOUR
 
 
-def render(item: dict, mention: str | None = None) -> str:
+def mentions_for(item: dict, roles: dict[str, str] | None, now: datetime) -> list[str]:
+    """Role ids to ping: the topic role by day, the 긴급 role at any hour when the title is urgent."""
+    roles = roles or {}
+    wanted = [] if is_quiet(now) else [roles.get(topic_for(str(item.get("category_id", ""))) or "")]
+    if is_urgent(str(item.get("title") or "")):
+        wanted.append(roles.get(URGENT))
+    ids = [str(r) for r in wanted if r and str(r).isascii() and str(r).isdigit()]
+    return list(dict.fromkeys(ids))
+
+
+def render(item: dict, mentions: list[str] | None = None) -> str:
     label = CATEGORY_LABEL.get(str(item.get("category_id")), "공지")
     lines = [f"**[{label}]** {escape(str(item['title']))}"]
     posted, updated = str(item.get("posted_date") or ""), str(item.get("updated_date") or "")
@@ -66,7 +77,7 @@ def render(item: dict, mention: str | None = None) -> str:
     if meta:
         lines.append(meta)
     lines.append(f"<{item['url']}>")
-    tail = f"\n<@&{mention}>" if mention else ""
+    tail = "\n" + " ".join(f"<@&{m}>" for m in mentions) if mentions else ""
     return "\n".join(lines)[: MAX_LEN - len(tail)] + tail
 
 
@@ -134,18 +145,16 @@ def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str]
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return "already_posted"
             raise
-        topic = topic_for(str(item.get("category_id", "")))
-        role_id = (roles or {}).get(topic or "")
-        mention = role_id if role_id and str(role_id).isdigit() and not is_quiet(now) else None
-        # Only the topic role may ping: never @everyone, @here, users or other roles.
-        allowed = {"parse": [], "roles": [mention]} if mention else NO_PINGS
+        mentions = mentions_for(item, roles, now)
+        # Only these roles may ping: never @everyone, @here, users or other roles.
+        allowed = {"parse": [], "roles": mentions} if mentions else NO_PINGS
         message = send("POST", f"/channels/{channel_id}/messages", token,
-                       {"content": render(item, mention), "allowed_mentions": allowed, "flags": SUPPRESS_EMBEDS})
+                       {"content": render(item, mentions), "allowed_mentions": allowed, "flags": SUPPRESS_EMBEDS})
         values = {":sent": "sent", ":mid": str(message["id"])}
         update = "SET #s = :sent, message_id = :mid"
-        if mention:  # kept so later edits show the same role and night posts stay without one
-            update += ", mention = :m"
-            values[":m"] = mention
+        if mentions:  # kept so later edits show the same roles and night posts stay without them
+            update += ", mentions = :m"
+            values[":m"] = mentions
         delivery.update_item(Key=dkey, UpdateExpression=update,
                              ExpressionAttributeNames={"#s": "status"}, ExpressionAttributeValues=values)
         return "posted"
@@ -158,7 +167,7 @@ def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str]
         try:
             # Edits never ping, even though the mention stays in the text.
             send("PATCH", f"/channels/{record_channel}/messages/{message_id}", token,
-                 {"content": render(item, record.get("mention")), "allowed_mentions": NO_PINGS})
+                 {"content": render(item, record.get("mentions")), "allowed_mentions": NO_PINGS})
         except NotFound:
             return "message_gone"  # someone deleted it; don't bring it back
         sent_at = posted_at(message_id)

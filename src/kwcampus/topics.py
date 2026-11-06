@@ -18,7 +18,9 @@ class Topic:
     role: str  # Discord role name (scripts/discord_setup.py creates it)
 
 
+URGENT = "urgent"  # by title keywords (routing.is_urgent), any board; pinged even at night
 TOPICS: tuple[Topic, ...] = (
+    Topic(URGENT, "긴급 (휴강·통제·장애)", "긴급 알림"),
     Topic("academic", "학사", "학사 알림"),
     Topic("scholarship", "장학", "장학 알림"),
     Topic("career", "취업", "취업 알림"),

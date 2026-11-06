@@ -82,7 +82,7 @@ def test_render_escapes_markdown_and_never_pings():
 JOB = {"action": "post", "key": {"PK": NOTICE["PK"], "SK": NOTICE["SK"]}, "channel": "academic"}
 EDIT = {**JOB, "action": "edit", "changed": ["title"]}
 CHANNELS = {"academic": "111"}
-ROLES = {"academic": "777", "general": "778"}
+ROLES = {"academic": "777", "general": "778", "urgent": "779"}
 DAY = datetime(2026, 11, 6, 10, 0, tzinfo=KST)  # a Friday morning
 
 
@@ -254,3 +254,27 @@ def test_rest_calls_carry_a_body_except_get_and_delete(monkeypatch):
         discordapi.call("PATCH", "/missing", "t", {"content": "x"})
     with pytest.raises(discordapi.RetryLater):
         discordapi.call("POST", "/busy", "t", {"content": "x"})
+
+
+def test_urgent_notices_also_ping_the_urgent_role_even_at_night(aws):
+    item = {**NOTICE, "title": "11/7(금) 화도관 출입 통제 및 휴강 안내"}
+    aws["public"].put_item(Item=item)
+    fake = FakeDiscord(lambda: DAY)
+    run(aws, JOB, fake, DAY, ROLES)
+    _, _, body = fake.calls[-1]
+    assert body["content"].endswith("\n<@&777> <@&779>")
+    assert body["allowed_mentions"] == {"parse": [], "roles": ["777", "779"]}
+
+    night_item = {**item, "SK": "N#night"}
+    aws["public"].put_item(Item=night_item)
+    night = datetime(2026, 11, 6, 23, 40, tzinfo=KST)
+    run(aws, {**JOB, "key": {"PK": item["PK"], "SK": "N#night"}}, fake, night, ROLES)
+    _, _, body = fake.calls[-1]
+    assert body["content"].endswith("\n<@&779>") and "<@&777>" not in body["content"]
+    assert body["allowed_mentions"] == {"parse": [], "roles": ["779"]}
+
+    # without a 긴급 role configured an urgent night post pings nobody
+    quiet_item = {**item, "SK": "N#quiet"}
+    aws["public"].put_item(Item=quiet_item)
+    run(aws, {**JOB, "key": {"PK": item["PK"], "SK": "N#quiet"}}, fake, night, {"academic": "777"})
+    assert fake.calls[-1][2]["allowed_mentions"] == {"parse": []}
