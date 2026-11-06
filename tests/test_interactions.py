@@ -1,0 +1,134 @@
+import json
+import time
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+from kwcampus import discord, interactions
+from kwcampus.routing import TOPICS
+
+GUILD = "1567793602120261653"
+USER = "123456789012345678"
+CFG = {"guild": GUILD, "roles": {"academic": "700000000000000001", "career": "700000000000000003"}}
+KEY = Ed25519PrivateKey.generate()
+PUBLIC_HEX = KEY.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+
+
+def signed_event(payload: dict, key=KEY, ts: int | None = None) -> dict:
+    body = json.dumps(payload)
+    stamp = str(ts if ts is not None else int(time.time()))
+    return {"body": body, "isBase64Encoded": False, "headers": {
+        "X-Signature-Ed25519": key.sign(stamp.encode() + body.encode()).hex(), "X-Signature-Timestamp": stamp}}
+
+
+def click(custom_id: str, roles: list[str] = (), guild: str = GUILD) -> dict:
+    return {"type": 3, "guild_id": guild, "data": {"custom_id": custom_id, "component_type": 2},
+            "member": {"user": {"id": USER}, "roles": list(roles)}}
+
+
+class Recorder:
+    def __init__(self, fail=None):
+        self.calls, self.fail = [], fail
+
+    def __call__(self, method, path, token, body=None, timeout=10):
+        self.calls.append((method, path, timeout))
+        if self.fail:
+            raise self.fail
+        return {}
+
+
+@pytest.fixture
+def params(aws):
+    aws["ssm"].put_parameter(Name="/kw/discord/public-key", Value=PUBLIC_HEX, Type="String")
+    aws["ssm"].put_parameter(Name="/kw/discord/roles", Value=json.dumps(CFG), Type="String")
+    aws["ssm"].put_parameter(Name="/kw/discord/bot-token", Value="bot.token.value", Type="SecureString")
+    return aws
+
+
+def test_ping_is_answered_only_when_signed(params):
+    ok = interactions.handler(signed_event({"type": 1}), None)
+    assert ok["statusCode"] == 200 and json.loads(ok["body"]) == {"type": 1}
+
+    forged = signed_event({"type": 1}, key=Ed25519PrivateKey.generate())
+    assert interactions.handler(forged, None)["statusCode"] == 401
+    tampered = signed_event({"type": 1})
+    tampered["body"] = tampered["body"].replace("1", "2")
+    assert interactions.handler(tampered, None)["statusCode"] == 401
+    assert interactions.handler({"body": "{}", "headers": {}}, None)["statusCode"] == 401
+    replayed = signed_event({"type": 1}, ts=int(time.time()) - 3600)
+    assert interactions.handler(replayed, None)["statusCode"] == 401
+
+
+def test_without_a_public_key_everything_is_rejected(aws):
+    assert interactions.handler(signed_event({"type": 1}), None)["statusCode"] == 401
+
+
+def test_verify_rejects_junk():
+    now = time.time()
+    assert not interactions.verify("zz", "00", str(int(now)), b"{}", now)
+    assert not interactions.verify(PUBLIC_HEX, "not-hex", str(int(now)), b"{}", now)
+    assert not interactions.verify(PUBLIC_HEX, "00" * 64, "soon", b"{}", now)
+
+
+def test_button_turns_its_role_on_and_off():
+    send = Recorder()
+    response, outcome = interactions.handle(click("kwsub:academic"), CFG, "tok", send)
+    assert outcome == "on"
+    assert send.calls == [("PUT", f"/guilds/{GUILD}/members/{USER}/roles/700000000000000001",
+                           interactions.ROLE_TIMEOUT_S)]
+    assert response["type"] == 4 and response["data"]["flags"] == 64  # only the clicker sees it
+    assert response["data"]["allowed_mentions"] == {"parse": []}
+
+    response, outcome = interactions.handle(click("kwsub:academic", roles=["700000000000000001"]), CFG, "tok", send)
+    assert outcome == "off" and send.calls[-1][0] == "DELETE"
+    assert "껐습니다" in response["data"]["content"]
+
+
+def test_buttons_never_touch_any_other_role():
+    send = Recorder()
+    for custom_id in ("kwsub:700000000000000009", "kwsub:", "kwsub:scholarship",  # unmapped topic
+                      "admin", "kwsub:academic/../../roles/1", "kwsub:__class__"):
+        _, outcome = interactions.handle(click(custom_id), CFG, "tok", send)
+        assert outcome == "unknown_button"
+    # a role map pointing at @everyone is ignored
+    _, outcome = interactions.handle(click("kwsub:academic"), {"guild": GUILD, "roles": {"academic": GUILD}},
+                                     "tok", send)
+    assert outcome == "unknown_button"
+    # another server, or no member (a DM)
+    assert interactions.handle(click("kwsub:academic", guild="42"), CFG, "tok", send)[1] == "wrong_guild"
+    dm = {**click("kwsub:academic"), "member": None, "user": {"id": USER}}
+    assert interactions.handle(dm, CFG, "tok", send)[1] == "wrong_guild"
+    assert send.calls == []
+
+
+def test_list_shows_current_subscriptions_without_calls():
+    send = Recorder()
+    response, _ = interactions.handle(click("kwsub:list", roles=["700000000000000003", "55"]), CFG, "tok", send)
+    assert response["data"]["content"] == "지금 받는 알림: 취업"
+    response, _ = interactions.handle(click("kwsub:list"), CFG, "tok", send)
+    assert "아직 받는 알림이 없습니다" in response["data"]["content"]
+    assert send.calls == []
+
+
+def test_discord_trouble_gets_a_polite_ephemeral_answer():
+    for error in (RuntimeError("discord 403 on PUT"), discord.RetryLater("discord unreachable")):
+        response, outcome = interactions.handle(click("kwsub:career"), CFG, "tok", Recorder(fail=error))
+        assert outcome == "role_failed" and response["data"]["flags"] == 64
+    assert interactions.handle(click("kwsub:career"), CFG, None, Recorder())[1] == "no_token"
+
+
+def test_handler_wires_ssm_values(params, monkeypatch):
+    monkeypatch.setattr(interactions, "handle", lambda p, cfg, token: (
+        {"type": 4, "data": {"content": f"{cfg['guild']}:{token}"}}, "x"))
+    response = interactions.handler(signed_event(click("kwsub:academic")), None)
+    assert json.loads(response["body"])["data"]["content"] == f"{GUILD}:bot.token.value"
+
+
+def test_menu_has_a_button_per_topic_in_rows_of_five():
+    menu = interactions.menu_message()
+    ids = [c["custom_id"] for row in menu["components"] for c in row["components"]]
+    assert ids == [f"kwsub:{t.key}" for t in TOPICS] + ["kwsub:list"]
+    assert all(len(row["components"]) <= 5 for row in menu["components"])
+    assert all(len(c["label"]) <= 80 for row in menu["components"] for c in row["components"])
+    assert menu["allowed_mentions"] == {"parse": []}

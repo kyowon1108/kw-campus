@@ -31,7 +31,8 @@ from kwcampus.obs import log, metrics
 
 SERVER_A = "61.111.8.4"  # ei, ee, elcomm, radiowave, electric, snme, semicon.kw.ac.kr
 # The collector runs 30 times a weekday (every 20 min, 09:00-18:40), one request each; the cap keeps
-# manual or overlapping runs from adding more. With 7 boards each one is read about every 2h20m.
+# manual or overlapping runs from adding more, and the 21:00 evening run finds it reached and skips
+# this server. With 7 boards each one is read about every 2h20m.
 DAILY_CAP = 30
 
 

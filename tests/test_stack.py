@@ -5,7 +5,7 @@ import aws_cdk as cdk
 from aws_cdk.assertions import Match, Template
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "infra"))
-from kw_campus_stack import KwCampusStack  # noqa: E402
+from kw_campus_stack import KwCampusStack
 
 
 def template(tmp_path) -> Template:
@@ -17,7 +17,7 @@ def template(tmp_path) -> Template:
 
 def test_functions_and_tables(tmp_path):
     t = template(tmp_path)
-    t.resource_count_is("AWS::Lambda::Function", 7)
+    t.resource_count_is("AWS::Lambda::Function", 8)
     t.resource_count_is("AWS::DynamoDB::Table", 3)
     t.has_resource_properties("AWS::DynamoDB::Table", {
         "TableName": "kw-public",
@@ -26,12 +26,17 @@ def test_functions_and_tables(tmp_path):
     })
 
 
-def test_schedule_is_weekday_daytime_kst_without_retries(tmp_path):
-    template(tmp_path).has_resource_properties("AWS::Scheduler::Schedule", {
-        "ScheduleExpression": "cron(0/20 9-18 ? * MON-FRI *)",
-        "ScheduleExpressionTimezone": "Asia/Seoul",
-        "Target": {"RetryPolicy": {"MaximumRetryAttempts": 0}},
-    })
+def test_schedule_is_weekday_daytime_plus_one_evening_run_kst_without_retries(tmp_path):
+    t = template(tmp_path)
+    for name, expression in (("kw-collector-tick", "cron(0/20 9-18 ? * MON-FRI *)"),
+                             ("kw-collector-evening", "cron(0 21 ? * MON-FRI *)")):
+        t.has_resource_properties("AWS::Scheduler::Schedule", {
+            "Name": name,
+            "ScheduleExpression": expression,
+            "ScheduleExpressionTimezone": "Asia/Seoul",
+            "Target": {"RetryPolicy": {"MaximumRetryAttempts": 0}},
+        })
+    t.resource_count_is("AWS::Scheduler::Schedule", 3)  # + the campus morning tick
 
 
 def test_collector_cannot_read_discord_secrets(tmp_path):
@@ -60,7 +65,7 @@ def test_public_mcp_runs_behind_web_adapter_with_throttling(tmp_path):
         "DefaultRouteSettings": {"ThrottlingRateLimit": 2, "ThrottlingBurstLimit": 5},
     })
     policies = t.find_resources("AWS::IAM::Policy")
-    mcp_policy = str([p for n, p in policies.items() if n.startswith("PublicMcpServiceRole")][0])
+    mcp_policy = str(next(p for n, p in policies.items() if n.startswith("PublicMcpServiceRole")))
     assert "PutItem" not in mcp_policy and "/kw/mcp/*" in mcp_policy and "/kw/discord" not in mcp_policy
 
 
@@ -76,7 +81,22 @@ def test_bridge_wiring_and_least_privilege(tmp_path):
     routes = {r["Properties"]["RouteKey"] for r in t.find_resources("AWS::ApiGatewayV2::Route").values()}
     assert {"$connect", "$disconnect", "$default", "ANY /{proxy+}"} <= routes
     policies = t.find_resources("AWS::IAM::Policy")
-    bridge = str([p for n, p in policies.items() if n.startswith("BridgeServiceRole")][0])
-    ws = str([p for n, p in policies.items() if n.startswith("BridgeWsServiceRole")][0])
+    bridge = str(next(p for n, p in policies.items() if n.startswith("BridgeServiceRole")))
+    ws = str(next(p for n, p in policies.items() if n.startswith("BridgeWsServiceRole")))
     assert "execute-api:ManageConnections" in bridge and "/kw/bridge/*" in bridge and "/kw/discord" not in bridge
     assert "ssm:" not in ws and "ManageConnections" not in ws
+
+
+def test_discord_interactions_have_their_own_api_and_least_privilege(tmp_path):
+    t = template(tmp_path)
+    t.has_resource_properties("AWS::Lambda::Function", {
+        "FunctionName": "kw-discordinteractions", "Handler": "kwcampus.interactions.handler", "Timeout": 5})
+    apis = {a["Properties"]["Name"] for a in t.find_resources("AWS::ApiGatewayV2::Api").values()}
+    assert "kw-discord" in apis
+    routes = {r["Properties"]["RouteKey"] for r in t.find_resources("AWS::ApiGatewayV2::Route").values()}
+    assert "POST /discord/interactions" in routes
+    policies = t.find_resources("AWS::IAM::Policy")
+    policy = str(next(p for n, p in policies.items() if n.startswith("DiscordInteractionsServiceRole")))
+    assert all(f"/kw/discord/{name}" in policy for name in ("bot-token", "public-key", "roles"))
+    assert "/kw/discord/*" not in policy and "/kw/discord/channels" not in policy
+    assert "dynamodb" not in policy and "sqs" not in policy

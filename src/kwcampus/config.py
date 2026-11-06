@@ -17,6 +17,9 @@ COLLECTOR_ENABLED_PARAM = "/kw/collector/enabled"  # "true" to collect; missing 
 NOTIFY_ENABLED_PARAM = "/kw/collector/notify"  # "true" to send Discord alerts; missing = off
 DISCORD_TOKEN_PARAM = "/kw/discord/bot-token"  # SecureString
 DISCORD_CHANNELS_PARAM = "/kw/discord/channels"  # String: JSON {channel_key: channel_id}
+DISCORD_PUBLIC_KEY_PARAM = "/kw/discord/public-key"  # the app's Ed25519 public key (hex), put in by hand
+# Written by scripts/discord_setup.py: {"guild": id, "roles": {topic: role_id}, "menu": {"channel", "message"}}
+DISCORD_ROLES_PARAM = "/kw/discord/roles"
 
 USER_AGENT = (
     "kw-campus/0.1 (+https://github.com/kyowon1108/kw-notice-mcp; "
@@ -28,3 +31,9 @@ NOTICE_TTL = timedelta(days=120)
 DELIVERY_TTL = timedelta(days=120)
 # A pinned post seen for the first time is only announced if it is this recent.
 PINNED_MAX_AGE = timedelta(days=3)
+
+# Posts between 22:00 and 08:00 KST go out without the topic role mention (no pings at night).
+QUIET_FROM_HOUR, QUIET_UNTIL_HOUR = 22, 8
+# An edit this soon after the post only updates the message; later ones also get a "수정됨" reply,
+# at most one reply per notice per KST day.
+EDIT_REPLY_AFTER = timedelta(minutes=30)

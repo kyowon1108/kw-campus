@@ -20,6 +20,9 @@ from constructs import Construct
 
 # Weekdays 09:00-18:59 KST, every 20 minutes (30 runs a day).
 COLLECT_SCHEDULE = "cron(0/20 9-18 ? * MON-FRI *)"
+# Weekdays 21:00 KST: one evening pass for posts made after the last daytime run (18:40), before
+# the 22:00 quiet hours. No weekend runs: none of the stored notices was posted on a weekend.
+EVENING_SCHEDULE = "cron(0 21 ? * MON-FRI *)"
 # Weekdays 07:30 KST: cafeteria menu / academic calendar refresh (0-2 requests).
 CAMPUS_SCHEDULE = "cron(30 7 ? * MON-FRI *)"
 # Lambda Web Adapter (arm64) in ap-northeast-2; serves uvicorn behind Lambda.
@@ -135,6 +138,19 @@ class KwCampusStack(cdk.Stack):
         sender.add_to_role_policy(iam.PolicyStatement(
             actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/discord/*"]))
 
+        # Discord buttons (#알림-설정): its own function and API, no table access, reads only the
+        # three parameters it needs. Discord must get an answer within 3 s.
+        interactions = fn("DiscordInteractions", "kwcampus.interactions.handler", 5)
+        interactions.add_to_role_policy(iam.PolicyStatement(
+            actions=["ssm:GetParameter"],
+            resources=[f"{ssm_arn}/kw/discord/{name}" for name in ("bot-token", "public-key", "roles")]))
+        discord_api = apigw.HttpApi(self, "DiscordApi", api_name="kw-discord", create_default_stage=False)
+        discord_api.add_routes(path="/discord/interactions", methods=[apigw.HttpMethod.POST],
+                               integration=apigw_int.HttpLambdaIntegration("DiscordInteractionsIntegration",
+                                                                           interactions))
+        discord_api.add_stage("DiscordDefaultStage", stage_name="$default", auto_deploy=True,
+                              throttle=apigw.ThrottleSettings(rate_limit=5, burst_limit=10))
+
         # campus data: same table and switch as the collector
         public.grant_read_write_data(campus)
         campus.add_to_role_policy(iam.PolicyStatement(
@@ -196,18 +212,20 @@ class KwCampusStack(cdk.Stack):
                 retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
             ),
         )
-        scheduler.CfnSchedule(
-            self, "CollectSchedule",
-            name="kw-collector-tick",
-            schedule_expression=COLLECT_SCHEDULE,
-            schedule_expression_timezone="Asia/Seoul",
-            flexible_time_window=scheduler.CfnSchedule.FlexibleTimeWindowProperty(mode="OFF"),
-            target=scheduler.CfnSchedule.TargetProperty(
-                arn=collector.function_arn,
-                role_arn=schedule_role.role_arn,
-                retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
-            ),
-        )
+        for sid, name, expression in (("CollectSchedule", "kw-collector-tick", COLLECT_SCHEDULE),
+                                      ("EveningSchedule", "kw-collector-evening", EVENING_SCHEDULE)):
+            scheduler.CfnSchedule(
+                self, sid,
+                name=name,
+                schedule_expression=expression,
+                schedule_expression_timezone="Asia/Seoul",
+                flexible_time_window=scheduler.CfnSchedule.FlexibleTimeWindowProperty(mode="OFF"),
+                target=scheduler.CfnSchedule.TargetProperty(
+                    arn=collector.function_arn,
+                    role_arn=schedule_role.role_arn,
+                    retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
+                ),
+            )
 
         # alarms
         topic = sns.Topic(self, "Alarms", topic_name="kw-alarms")
@@ -228,7 +246,7 @@ class KwCampusStack(cdk.Stack):
             a.add_alarm_action(action)
 
         five_min = cdk.Duration.minutes(5)
-        for f in (collector, dispatcher, sender, campus, public_mcp, bridge, bridge_ws):
+        for f in (collector, dispatcher, sender, interactions, campus, public_mcp, bridge, bridge_ws):
             alarm(f"{f.node.id.lower()}-errors", f.metric_errors(period=five_min))
         alarm("collector-blocked", cw.Metric(namespace="KwCampus", metric_name="Blocked",
                                              statistic="Sum", period=cdk.Duration.minutes(20)))
@@ -242,3 +260,5 @@ class KwCampusStack(cdk.Stack):
         cdk.CfnOutput(self, "PublicApiUrl", value=api.api_endpoint)
         cdk.CfnOutput(self, "BridgeUrl", value=bridge_api.api_endpoint)
         cdk.CfnOutput(self, "BridgeWsUrl", value=ws_stage.url)
+        # Developer Portal → General Information → Interactions Endpoint URL
+        cdk.CfnOutput(self, "DiscordInteractionsUrl", value=f"{discord_api.api_endpoint}/discord/interactions")

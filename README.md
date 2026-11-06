@@ -44,20 +44,20 @@ uv run python -c "from kw_mcp.agent import make_invite; import sys; print(make_i
 ## 5단계: 학과 게시판 (전자정보공과대학)
 
 - 출처: 학과 사이트들이 같이 쓰는 PHP 게시판(`BoardMode=list&BOARD_CODE=...`). 전자정보공과대학(ei)·전자공학과·전자통신공학과·전자융합공학과·전기공학과·전자재료공학과·반도체시스템공학부. 게시판 목록과 학과 이름은 `src/kwcampus/deptboards.py`의 `BOARDS` 한 곳에만 있고, 게시판을 늘릴 때는 한 줄을 더합니다. 단과대 공지는 학과 사이트마다 똑같이 걸려 있어 ei에서만 읽습니다.
-- 수집: 이 호스트들은 모두 서버 하나(61.111.8.4)의 별칭이라 요청 간격·하루 상한(30회)·쿨다운은 서버 기준입니다. 실행마다 이 서버에는 1회만 요청하고, 가장 오래 안 읽은 게시판을 돌아가며 읽습니다(게시판마다 약 2시간 20분에 한 번). 1페이지의 고정 글도 읽고, 새 글은 위치가 아니라 UID로 판단합니다. 전에 본 가장 큰 UID보다 크면 새 글이고, 작은데 처음 보이는 글은 알림 없이 저장합니다.
+- 수집: 이 호스트들은 모두 서버 하나(61.111.8.4)의 별칭이라 요청 간격·하루 상한(30회)·쿨다운은 서버 기준입니다. 실행마다 이 서버에는 1회만 요청하고, 가장 오래 안 읽은 게시판을 돌아가며 읽습니다(게시판마다 약 2시간 20분에 한 번). 평일 21:00 회차에는 하루 상한이 이미 차 있어 이 서버는 건너뜁니다. 1페이지의 고정 글도 읽고, 새 글은 위치가 아니라 UID로 판단합니다. 전에 본 가장 큰 UID보다 크면 새 글이고, 작은데 처음 보이는 글은 알림 없이 저장합니다.
 - 저장: 게시판마다 `SRC#dept-<키>`(예: `SRC#dept-ee`). 글 번호는 `dept-ee-<UID>`, 분류와 부서는 학과 이름입니다. 첫 수집은 기준점만 저장합니다(알림 없음).
-- 알림: 분류 `dept-<키>` → 채널 키 `department`(없으면 학교-공지).
+- 알림: 분류 `dept-<키>` → 채널 키 `department`(없으면 학교-공지). 구독 역할은 단과대 단위입니다(`전자정보공과대학 알림`).
 
 ## 취업게시판·종합 FAQ (www.kw.ac.kr)
 
 - 메인 공지와 같은 목록 형식이지만 분류 이름이 달라서(`[취업관련]`, 부서 이름) 자체 분류 "취업"(`job`), "FAQ"(`faq`)로 저장합니다. `SRC#kw-job`, `SRC#kw-faq`, 글 번호 `kw-job-<번호>`, `kw-faq-<번호>`.
-- www의 요청 간격·하루 40회 상한을 메인 공지와 같이 씁니다. 그래서 취업게시판은 2시간에 한 번, FAQ는 하루에 한 번만 읽고, 한 실행에서 둘 중 하나만 읽습니다. 메인 공지 요청 뒤 실제로 61초를 쉬고 읽습니다(그래서 수집 Lambda 제한 시간은 150초입니다). 하루 www 요청: 메인 30 + 취업 5 + FAQ 1 + 학식·학사일정 3 이하.
+- www의 요청 간격·하루 40회 상한을 메인 공지와 같이 씁니다. 그래서 취업게시판은 2시간에 한 번, FAQ는 하루에 한 번만 읽고, 한 실행에서 둘 중 하나만 읽습니다. 메인 공지 요청 뒤 실제로 61초를 쉬고 읽습니다(그래서 수집 Lambda 제한 시간은 150초입니다). 하루 www 요청: 메인 31(낮 30 + 21:00) + 취업 6 + FAQ 1 + 학식·학사일정 2 이하 = 상한 40.
 - 알림: 취업 → 채널 키 `career`. FAQ는 검색만 되고 알림은 보내지 않습니다.
 
 ## 1단계 구성
 
 ```
-EventBridge Scheduler (평일 09:00~18:59 KST, 20분마다)
+EventBridge Scheduler (평일 09:00~18:59 KST 20분마다, 평일 21:00 한 번 더)
   → kw-collector: 메인 공지 1페이지 GET 1회 → 파싱·마스킹 → kw-public (DynamoDB)
   → DynamoDB Streams → kw-dispatcher → SQS kw-discord → kw-discordsender → Discord 채널
 ```
@@ -77,8 +77,39 @@ EventBridge Scheduler (평일 09:00~18:59 KST, 20분마다)
 | 학사 | 학사 |
 | 장학 | 등록/장학 |
 | 취업 | 외부, 취업(취업게시판) |
-| 학과 | 인공지능융합대학, 전자정보공과대학과 그 학과들 (없으면 학교-공지) |
+| 학과-공지 | 인공지능융합대학, 전자정보공과대학과 그 학과들 (`department` 채널 ID가 없으면 학교-공지) |
 | 국제 | 국제교류, 국제학생 |
+
+## Discord 알림: 수정 공지·구독 역할·읽기 전용 채널
+
+- **수정 공지**: 이미 알린 공지의 제목이나 수정일(메인 공지·취업게시판에만 있음, 학과 게시판·aicon은 제목만)이 바뀌면 원래 메시지를 고칩니다. 올린 지 30분이 넘었으면 그 메시지에 `✏️ 수정됨 · <수정일>` 답글을 링크와 함께 답니다. 수정일이 없는 게시판은 바뀐 걸 본 날짜를 씁니다. 답글은 공지 하나에 한국 시간 하루 한 번까지이고, `kw-delivery`의 `reply_day`로 셉니다. 누가 원래 메시지를 지웠으면 다시 만들지 않습니다.
+- **구독 역할**: 주제마다 역할 하나(`학사 알림`, `장학 알림`, `취업 알림`, `국제 알림`, `일반 공지 알림`, `인공지능융합대학 알림`, `전자정보공과대학 알림`, 목록은 `routing.TOPICS`). #알림-설정의 버튼을 누르면 그 역할이 켜지거나 꺼지고, 누른 사람에게만 보이는 답이 옵니다. 새 공지는 자기 주제 역할만 멘션합니다(`allowed_mentions`에 그 역할 하나, @everyone·@here 없음). 22:00~08:00에 올라가는 공지는 멘션 없이 올립니다. 공지를 고쳐도 다시 울리지 않습니다.
+- **버튼 처리**: `kw-discordinteractions` Lambda(`POST /discord/interactions`, API `kw-discord`). Discord 서명(Ed25519)을 확인하고, 버튼 ID에 맞는 역할을 `/kw/discord/roles`에서만 찾아 그 역할 하나만 붙이거나 뗍니다. 요청에 든 역할 ID는 쓰지 않습니다. 이 함수는 SSM 세 값(`bot-token`, `public-key`, `roles`)만 읽고 테이블 권한은 없습니다.
+- **읽기 전용 채널**: 공지 채널과 #알림-설정은 @everyone에게 보기·기록 보기만 허용하고 메시지·스레드 만들기·스레드 메시지를 막습니다. 봇에는 그 채널에서 보기·보내기·링크 첨부·기록 보기와 역할 멘션만 줍니다.
+
+### 서버 설정 (`scripts/discord_setup.py`)
+
+인자 없이 돌리면 계획만 보여 주고 아무것도 바꾸지 않습니다. `--apply`를 붙여야 실제로 만듭니다. 몇 번을 돌려도 없는 것만 만들고 다른 것만 고칩니다. 채널에 원래 있던 다른 권한 설정은 그대로 둡니다.
+
+```bash
+uv run --with 'botocore[crt]' python scripts/discord_setup.py --department-channel           # 계획만
+uv run --with 'botocore[crt]' python scripts/discord_setup.py --department-channel --apply   # 적용
+```
+
+`--apply`가 하는 일: 구독 역할 만들기(권한 없음, 멤버는 멘션 불가) → #알림-설정 만들기(`--department-channel`이면 #학과-공지도) → 채널 권한 설정 → 버튼 메시지 올리기/고치기 → SSM `/kw/discord/roles` 쓰기(`--department-channel`이면 `/kw/discord/channels`에 `department` 추가). `--region`의 기본값은 `ap-northeast-2`입니다.
+
+처음 켤 때 순서:
+1. `cdk deploy` 뒤 출력 `DiscordInteractionsUrl`을 확인합니다.
+2. 공개키를 SSM에 넣습니다. Discord 개발자 포털 → 앱 → General Information → Public Key를 복사한 뒤 터미널에서 직접 실행합니다.
+   ```bash
+   aws ssm put-parameter --region ap-northeast-2 --name /kw/discord/public-key --type String --overwrite --value "$(pbpaste)" && pbcopy < /dev/null
+   ```
+3. 개발자 포털 → General Information → Interactions Endpoint URL에 1번 주소를 넣고 저장합니다. Discord가 바로 서명 확인 요청을 보내므로 2번이 먼저 되어 있어야 저장됩니다. 버튼 메시지보다 먼저 해 두어야 처음 누른 버튼이 실패하지 않습니다.
+4. 서버 설정 → 역할 → 봇 역할(KW Campus)에 `역할 관리`와 `채널 관리`를 켭니다. 봇 역할이 구독 역할보다 위에 있어야 합니다(새로 만드는 역할은 맨 아래에 생김). 관리자 권한은 주지 않습니다.
+5. 계획을 보고 `--apply`로 적용합니다.
+6. 적용이 끝나면 봇 역할에서 `채널 관리`를 끕니다. 봇 역할에 남길 권한은 채널 보기·메시지 보내기·링크 첨부·메시지 기록 보기·역할 관리(권한 값 268520448)입니다.
+
+@everyone 역할에 `@everyone, @here, 모든 역할 멘션하기`가 켜져 있으면 멤버 누구나 구독 역할을 멘션해 구독자 전원을 부를 수 있습니다. 끄는 것을 권합니다. 봇은 공지 채널에서 따로 허용받아 영향이 없습니다. 끄는 건 `--apply` 뒤에 합니다. 봇은 자기에게 있는 권한만 채널에 줄 수 있어서, 먼저 끄면 공지 채널의 봇 멘션 허용을 설정하지 못합니다.
 
 ## 스위치와 비밀값 (SSM, CDK가 만들지 않음)
 
@@ -87,7 +118,9 @@ EventBridge Scheduler (평일 09:00~18:59 KST, 20분마다)
 | `/kw/collector/enabled` | `true`일 때만 수집. 없으면 꺼짐 |
 | `/kw/collector/notify` | `true`일 때만 Discord 전송. 없으면 꺼짐 |
 | `/kw/discord/bot-token` | 봇 토큰 (SecureString). 본인이 직접 넣음 |
-| `/kw/discord/channels` | `{"notice": "<채널ID>", "academic": ..., "scholarship": ..., "career": ..., "international": ...}` |
+| `/kw/discord/channels` | `{"notice": "<채널ID>", "academic": ..., "scholarship": ..., "career": ..., "international": ..., "department": ...}` (`department`는 선택) |
+| `/kw/discord/public-key` | Discord 앱의 공개키(Ed25519, 16진수). 버튼 요청 서명 확인용. 본인이 직접 넣음 |
+| `/kw/discord/roles` | `scripts/discord_setup.py`가 씀: `{"guild": ..., "roles": {주제: 역할ID}, "menu": {"channel", "message"}}` |
 | `/kw/mcp/tokens` | 초대·공개 MCP 토큰의 SHA-256 해시 목록 (JSON 배열) |
 | `/kw/bridge/jwt-secret` | 액세스 토큰 서명 키 (SecureString) |
 | `/kw/bridge/seal-key` | 간편 연결 봉인 키, 32바이트 base64url (SecureString). 바꾸면 모든 간편 연결이 끊김 |

@@ -1,7 +1,8 @@
 """Lambda: turn kw-public stream records into Discord jobs on SQS.
 
 - INSERT of a notice → "post" (skipped for seed rows, old pinned posts and the FAQ)
-- MODIFY that changed the title → "edit"
+- MODIFY that changed the title or the site's 수정일 (updated_date) → "edit" with what changed.
+  Department boards and the aicon widget have no 수정일, so only their titles count there.
 Nothing is sent while the /kw/collector/notify switch is off.
 """
 
@@ -19,6 +20,9 @@ from kwcampus.obs import log, metrics
 from kwcampus.routing import channel_for
 
 _deserializer = TypeDeserializer()
+# What makes an already-posted notice worth a "수정됨" note. Category, department or pinned
+# changes also rewrite the item, but readers don't need to hear about them.
+EDIT_FIELDS = ("title", "updated_date")
 
 
 def _image(record: dict, key: str) -> dict:
@@ -49,8 +53,9 @@ def jobs_for(records: list[dict], today: date) -> list[dict]:
             jobs.append({"action": "post", "key": key, "channel": channel})
         elif record["eventName"] == "MODIFY":
             old = _image(record, "OldImage")
-            if old.get("title") != new.get("title"):
-                jobs.append({"action": "edit", "key": key, "channel": channel})
+            changed = [field for field in EDIT_FIELDS if old.get(field) != new.get(field)]
+            if changed:
+                jobs.append({"action": "edit", "key": key, "channel": channel, "changed": changed})
     return jobs
 
 

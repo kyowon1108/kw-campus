@@ -1,6 +1,8 @@
-"""Which Discord channel a category goes to, and the label users see for it."""
+"""Which Discord channel a category goes to, the label users see for it, and its subscription topic."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from kwcampus import deptboards, wwwboards
 
@@ -49,3 +51,42 @@ def channel_for(category_id: str) -> str | None:
     if category_id in QUIET_CATEGORIES:
         return None
     return CATEGORY_TO_CHANNEL.get(category_id, "notice")
+
+
+@dataclass(frozen=True)
+class Topic:
+    """A subscription: one Discord role that a button in #알림-설정 toggles and new notices mention."""
+
+    key: str  # button custom_id suffix and key in /kw/discord/roles
+    label: str  # button label
+    role: str  # Discord role name (scripts/discord_setup.py creates it)
+
+
+TOPICS: tuple[Topic, ...] = (
+    Topic("academic", "학사", "학사 알림"),
+    Topic("scholarship", "장학", "장학 알림"),
+    Topic("career", "취업", "취업 알림"),
+    Topic("international", "국제", "국제 알림"),
+    Topic("general", "일반 (봉사·학생 등)", "일반 공지 알림"),
+    Topic("aicon", "인공지능융합대학", "인공지능융합대학 알림"),
+    Topic("ei", "전자정보공과대학", "전자정보공과대학 알림"),
+)
+TOPIC_BY_KEY: dict[str, Topic] = {t.key: t for t in TOPICS}
+
+# Colleges get their own topic. Every board in deptboards.BOARDS belongs to 전자정보공과대학;
+# a board of another college needs a new Topic here and an entry below.
+_COLLEGE_TOPIC: dict[str, str] = {
+    "dept-aicon": "aicon",
+    **{b.category_id: "ei" for b in deptboards.BOARDS},
+}
+# The other topics are the channels themselves; the 학교-공지 channel is the "general" topic.
+_CHANNEL_TOPIC = {"notice": "general", "academic": "academic", "scholarship": "scholarship",
+                  "career": "career", "international": "international"}
+
+
+def topic_for(category_id: str) -> str | None:
+    """None: the category is never announced, so nobody can subscribe to it."""
+    channel = channel_for(category_id)
+    if channel is None:
+        return None
+    return _COLLEGE_TOPIC.get(category_id) or _CHANNEL_TOPIC.get(channel)
