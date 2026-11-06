@@ -96,7 +96,7 @@ def test_an_unsigned_or_incomplete_release_is_not_installable(client, static, ke
 
 def test_setup_page_and_extension_downloads(client, static, key):
     page = client.get("/setup").text
-    assert "kw-mcp code" in page and "/dist/kw-klas.mcpb" in page and "(아직 없음)" in page and "/privacy" in page
+    assert "kw-mcp code" in page and "/dist/kw-campus.mcpb" in page and "(아직 없음)" in page and "/privacy" in page
     assert "보조 경로" in page and "항상 켜 두는 PC" in page  # web/mobile and ChatGPT need an always-on PC
     assert "동의하는 것으로 봅니다" in page  # one-line consent for the agent path
     assert "kw-mcp connections" in page and "kw-mcp revoke" in page
@@ -104,10 +104,12 @@ def test_setup_page_and_extension_downloads(client, static, key):
     script = page.split("<script>")[1]
     assert "try { raw = decodeURIComponent(raw); }" in script
     assert script.index("`${base}/mcp`") < script.index("decodeURIComponent")
-    assert client.get("/dist/kw-klas.mcpb").status_code == 404
-    (static / "kw-klas.mcpb").write_bytes(b"PK mcpb")
-    assert client.get("/dist/kw-klas.mcpb").content == b"PK mcpb"
-    zipped = client.get("/dist/kw-klas.zip")  # same file for "Install Unpacked Extension"
+    assert client.get("/dist/kw-campus.mcpb").status_code == 404
+    (static / "kw-campus.mcpb").write_bytes(b"PK mcpb")
+    assert client.get("/dist/kw-campus.mcpb").content == b"PK mcpb"
+    assert client.get("/dist/kw-klas.mcpb").content == b"PK mcpb"  # links handed out before 1.0.0
+    assert client.get("/dist/kw-klas.zip").content == b"PK mcpb"
+    zipped = client.get("/dist/kw-campus.zip")  # same file for "Install Unpacked Extension"
     assert zipped.content == b"PK mcpb" and zipped.headers["content-type"] == "application/zip"
     assert hashlib.sha256(b"PK mcpb").hexdigest() in client.get("/setup").text
     assert client.get("/dist/latest.json").status_code == 404

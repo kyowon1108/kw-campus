@@ -40,7 +40,9 @@ STATIC_DIR = Path(__file__).parent / "static"
 MCPB_NAME = release.MCPB_NAME  # Claude Desktop extension, packed and signed by kw-mcp's scripts/release.sh
 # The same bytes as a .zip, for Claude Desktop builds whose installer closes on .mcpb files
 # (Windows Store build, mcpb issue #281): unzip, then "Install Unpacked Extension".
-MCPB_ZIP_NAME = "kw-klas.zip"
+MCPB_ZIP_NAME = "kw-campus.zip"
+# Links handed out before 1.0.0 (the extension was "kw-klas" then) still get the current file.
+OLD_MCPB_NAMES = {"kw-klas.mcpb": MCPB_NAME, "kw-klas.zip": MCPB_ZIP_NAME}
 # Signed release manifest (kw_mcp.release). The signatures are made on the release machine; this
 # server only passes them along and cannot forge one.
 MANIFEST_NAME = release.MANIFEST_NAME
@@ -200,12 +202,13 @@ h3{margin-top:32px} .muted{color:#666;font-size:14px} .tag{font-size:12px;backgr
 <p id="noinvite" class="muted" hidden>초대 링크로 열면 여기에 초대 코드가 채워집니다.</p>
 
 <h3>방법 1. Claude 데스크톱 앱 확장 <span class="tag">기본</span></h3>
-<p><a class="btn" href="/dist/kw-klas.mcpb">kw-klas.mcpb 받기</a> → 파일을 더블클릭해 Claude 데스크톱에 설치 → 학번·비밀번호·초대 코드 입력.
+<p><a class="btn" href="/dist/kw-campus.mcpb">kw-campus.mcpb 받기</a> → 파일을 더블클릭해 Claude 데스크톱에 설치 → 학번·비밀번호·초대 코드 입력.
 모든 처리가 이 PC 안에서 일어나고, 학번과 비밀번호는 OS 키체인에 암호화해 저장되며 KLAS로만 갑니다. 우리 서버로는 개인 정보가 오지 않습니다.
-Claude 데스크톱에서만 쓸 수 있고, 초대 코드를 넣어 두면 새 버전이 나올 때 확장이 알려 줍니다.</p>
+Claude 데스크톱에서만 쓸 수 있고, 초대 코드를 넣어 두면 새 버전이 나올 때 확장이 알려 줍니다.
+확장 목록에는 "KW CAMPUS (광운 캠퍼스)"로 보입니다. 예전 "광운대 KLAS (읽기 전용)" 확장이 있으면 새 확장을 설치한 뒤 지우세요.</p>
 <p class="muted">받은 파일이 깨지지 않았는지 확인(SHA-256): <code>__MCPB_SHA256__</code><br>
 설치 창이 그냥 닫히면(Windows Microsoft Store판 Claude에서 생기는 문제):
-<a href="/dist/kw-klas.zip">kw-klas.zip</a>을 받아 압축을 풀고, Claude 설정 → 확장 프로그램 → 고급 설정 → "압축 해제된 확장 설치"에서 푼 폴더를 고르세요.
+<a href="/dist/kw-campus.zip">kw-campus.zip</a>을 받아 압축을 풀고, Claude 설정 → 확장 프로그램 → 고급 설정 → "압축 해제된 확장 설치"에서 푼 폴더를 고르세요.
 출처를 모르는 다른 확장은 같이 설치하지 마세요(다른 확장이 저장된 비밀번호를 꺼낼 수 있다는 보고가 있습니다).</p>
 
 <h3>방법 2. Claude 웹·모바일, ChatGPT: PC 에이전트 <span class="tag sub">보조</span></h3>
@@ -443,6 +446,7 @@ def routes(base_url: str):
 
     async def dist(request: Request) -> Response:
         name = request.path_params["name"]
+        name = OLD_MCPB_NAMES.get(name, name)
         rel = current_release()
         if rel and name in (rel["wheel"], rel["constraints"]["file"]):
             media = "text/plain; charset=utf-8" if name.endswith(".txt") else "application/octet-stream"

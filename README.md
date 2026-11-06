@@ -11,7 +11,7 @@
 - `kw-bridge` 테이블에는 기기 공개키, OAuth 클라이언트, 코드·토큰 해시, 연결 ID, 2분짜리 암호문만 둡니다. 학번·비밀번호·개인 데이터는 없습니다.
 - redirect는 Claude·ChatGPT의 콜백 URL 3개(정확히 일치)와 localhost만 받습니다. 다른 사이트로 돌아가는 클라이언트로 승인을 낚는 것을 막기 위해서입니다.
 - 남용 방어: 승인 요청 하나에 실패 5번이면 닫습니다. `/device/result`는 서버가 연 요청 자리에만 한 번 쓸 수 있고 300KB까지입니다. 기기 서명은 한 번만 쓰입니다. 에이전트는 설치한 서버와 초대 코드의 서버가 다르면 연결하지 않습니다. 새 앱이 연결 코드로 붙으면 에이전트 로그에 남습니다. API는 경로별로 제한합니다: 클라이언트 등록·기기 등록 초당 1건, 승인·연결 코드·연결 관리 2건, 토큰 5건, `/mcp` 5건(순간 10건), 에이전트 결과 20건, 나머지(설치 파일 등) 10건(순간 20건). IP별 제한이 아니어서 누가 계속 두드리면 그 경로를 쓰는 모두가 느려질 수 있지만, 가입성 경로가 막혀도 에이전트 응답은 영향을 받지 않습니다. HTTP API에는 WAF를 붙일 수 없어 비용 상한 쪽을 택했습니다: bridge Lambda 동시 실행 20개, 에이전트 결과를 받는 Lambda는 따로 5개(답을 기다리는 `/mcp` 요청이 20개를 다 써도 결과는 들어옴), 월 5달러 예산 알림(크레딧·환불은 빼고 셈), 4xx 응답이 5분에 100건 이상이면 알림.
-- 설치 파일도 bridge가 직접 줍니다: `/install.sh`, `/install.ps1`, `/dist/kw_mcp-*.whl`, `/dist/kw-klas.mcpb`. 공개 JSON API(`/c/<토큰>/api/...`)도 같은 주소에서 받습니다.
+- 설치 파일도 bridge가 직접 줍니다: `/install.sh`, `/install.ps1`, `/dist/kw_mcp-*.whl`, `/dist/kw-campus.mcpb`. 공개 JSON API(`/c/<토큰>/api/...`)도 같은 주소에서 받습니다.
 
 **초대**: 초대 코드는 `kwc_`로 시작하는 문자열 하나(서버 주소 + 토큰)입니다. 토큰을 새로 만들어 해시를 `/kw/mcp/tokens`에 더한 뒤 코드를 만듭니다.
 
@@ -205,7 +205,7 @@ cd infra && npm install && ./node_modules/.bin/cdk synth
 
 bridge Lambda에는 kw-mcp의 서명된 릴리스가 그대로 들어갑니다(KLAS 로그인 코드를 PC 에이전트와 같이 씀). 서명은 여기서 하지 않습니다.
 
-1. kw-mcp에서 `scripts/release.sh`를 돌립니다. 작업 트리가 깨끗하고 HEAD에 `v<version>` 태그가 있어야 합니다. 테스트와 설치 확인을 거친 wheel, 의존성 고정 파일, Claude 데스크톱 확장(`kw-klas.mcpb`)을 이 Mac 키체인의 릴리스 키로 서명해 `latest.json`과 함께 `dist/release/`에 둡니다. `--dry-run`은 버리는 키로 서명한 연습본(`dist/release-dry-run/`)이라 배포할 수 없습니다.
+1. kw-mcp에서 `scripts/release.sh`를 돌립니다. 작업 트리가 깨끗하고 HEAD에 `v<version>` 태그가 있어야 합니다. 테스트와 설치 확인을 거친 wheel, 의존성 고정 파일, Claude 데스크톱 확장(`kw-campus.mcpb`)을 이 Mac 키체인의 릴리스 키로 서명해 `latest.json`과 함께 `dist/release/`에 둡니다. `--dry-run`은 버리는 키로 서명한 연습본(`dist/release-dry-run/`)이라 배포할 수 없습니다.
 2. 여기서 `./scripts/build_lambda.sh`를 돌립니다. `../kw-mcp/dist/release`가 없거나 `kw_mcp.release check`(서명·해시 확인)를 통과하지 못하면 멈춥니다. 통과하면 그 wheel을 Lambda에 깔고, 같은 파일들을 `/install.sh`·`/install.ps1`·`/dist/...`로 내려 주도록 복사합니다. kw-mcp가 다른 곳에 있으면 `KW_MCP_DIR`로 알려 줍니다.
 3. 아래처럼 `cdk deploy`로 배포합니다.
 

@@ -547,7 +547,7 @@ def test_installer_pages_are_mounted_on_the_bridge(env, tmp_path, monkeypatch):
     monkeypatch.setattr(install, "STATIC_DIR", tmp_path)
     assert c.get("/install.sh").status_code == 503  # no signed release shipped
     assert "kw-mcp code" in c.get("/setup").text and "보호책임자" in c.get("/privacy").text
-    assert c.get("/dist/kw-klas.mcpb").status_code == 404
+    assert c.get("/dist/kw-campus.mcpb").status_code == 404
 
 
 def test_public_json_api_is_served_with_the_invite_token(env):
