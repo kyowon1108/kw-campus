@@ -1,15 +1,13 @@
-"""Bridge server: OAuth for Claude/ChatGPT connectors + MCP tools answered by the user's browser.
+"""Bridge server: OAuth for Claude/ChatGPT connectors + MCP tools answered by the user's PC agent.
 
 Flow for a personal tool call:
   connector --Bearer--> /mcp --(WebSocket)--> user's PC agent --(own KLAS login)--> KLAS
   PC agent --AES-GCM ciphertext--> /device/result --> this request decrypts in memory --> answer
 
-Connecting, on /oauth/authorize when the user adds the connector:
-  PC 에이전트 (default): `kw-mcp link` registers the PC (public key only) and prints a one-time
-    connection code; the password never leaves the PC.
-  간편 연결 (off unless /kw/bridge/password-mode is "true"): KLAS id/password typed once, sealed into
-    the tokens the connector holds and unsealed per request to log in from here (bridge/password.py).
-    Off because KLAS demands 2FA for logins from AWS addresses.
+Connecting, on /oauth/authorize when the user adds the connector: `kw-mcp link` registers the PC
+(public key only) and `kw-mcp code` prints a one-time connection code; the password never leaves
+the PC. Each approval is a grant (store.GRANT_TTL, about one semester) that the PC can list
+(/device/grants) and end (/device/revoke); unlinking the PC ends all of them.
 """
 
 from __future__ import annotations
@@ -19,15 +17,19 @@ import hashlib
 import hmac
 import html
 import json
+import logging
 import os
 import re
 import secrets
 import time
+import unicodedata
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
 import boto3
+from kw_mcp.combined import ACADEMIC_DEADLINE_WORDS, CAMPUS_ALERT_WORDS, HOLIDAY_WORDS
+from kw_mcp.service import CLASS_CHANGE_WORDS, term_in_session
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
@@ -37,30 +39,47 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 
-from kwcampus import params, public_http
-from kw_mcp.combined import ACADEMIC_DEADLINE_WORDS, CAMPUS_ALERT_WORDS, HOLIDAY_WORDS
-from kw_mcp.service import term_in_session
-
-from kwcampus.bridge import crypto, install, password, shapes, store
-from kwcampus.config import KST
+from kwcampus import params, public_data, public_http
+from kwcampus.bridge import crypto, install, shapes, signing, store
+from kwcampus.config import KST, NOTICE_SOURCE
 from kwcampus.obs import log
 
 BASE_URL = os.environ.get("KW_BRIDGE_BASE_URL", "http://localhost:8080").rstrip("/")
 ISSUER = str(AnyHttpUrl(BASE_URL))  # pydantic adds the trailing slash; use the same string everywhere
 RESOURCE = f"{BASE_URL}/mcp"
+_ORIGIN = "{0.scheme}://{0.netloc}".format(urlparse(BASE_URL))
 WS_MGMT_URL = os.environ.get("KW_BRIDGE_WS_MGMT", "")
 WS_URL = os.environ.get("KW_BRIDGE_WS_URL", "")
 JWT_SECRET_PARAM = "/kw/bridge/jwt-secret"
 INVITES_PARAM = "/kw/mcp/tokens"  # an MCP access token doubles as an invite code
 SCOPE = "klas.read"
 ACCESS_TTL = 3600
+REFRESH_GRACE_S = 60  # a just-used refresh token still works this long (lost response, parallel refresh)
 SNAPSHOT_WAIT_S = 22
 SNAPSHOT_CACHE_S = 60
+POLL_FIRST_S, POLL_MAX_S = 0.25, 1.0  # result polling backs off: each poll is a DynamoDB write
+MAX_INFLIGHT = 3  # agent requests one PC may have open at once
+MAX_CALLS_PER_MINUTE = 30  # agent requests one PC may get per minute (each can mean dozens of KLAS reads)
 CALL_MIN_VERSION = 2  # PC agents from before single-item reads answer only "snapshot"
-DEVICE_SKEW_S = 300
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"  # no I/L/O/U/0/1
+
+GRANT_ID = re.compile(r"g_[A-Za-z0-9_-]{12}")
+CLIENT_ID = re.compile(r"c_[A-Za-z0-9_-]{22}")
+NONCE = re.compile(r"[A-Za-z0-9_-]{32}")
+CODE_CHALLENGE = re.compile(r"[A-Za-z0-9_-]{43}")  # S256: base64url of 32 bytes, no padding
+CODE_VERIFIER = re.compile(r"[A-Za-z0-9._~-]{43,128}")  # RFC 7636 4.1
+REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+IV = re.compile(r"[A-Za-z0-9_-]{1,24}")
+MAX_JSON_BYTES = 16_384
+MAX_RESULT_BYTES = store.MAX_RESULT_CHARS + 4096
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True)
 
@@ -69,6 +88,7 @@ INSTRUCTIONS = """\
 - 개인 정보는 요청할 때마다 사용자 PC의 KW Campus 에이전트가 사용자 본인의 KLAS 로그인으로 읽어 옵니다. PC가 켜져 있어야 합니다(브라우저는 필요 없음).
 - "이번 주 할 일"은 this_week, "오늘 뭐 있어"는 today_briefing, "새 공지"는 my_notices를 먼저 쓰세요.
 - 수강정정·포기, 장학 신청, 성적 조회, 수업평가 같은 학사 기한은 my_academic_deadlines를 쓰세요.
+- 결과에 incomplete가 있으면 그 부분을 읽지 못한 것이니 사용자에게 알리세요.
 - 응답의 data_as_of는 KLAS에서 읽은 시각입니다. 읽기 전용이며 제출·수정은 할 수 없습니다. 비공식 도구입니다.
 """
 
@@ -80,30 +100,35 @@ def _jwt_secret() -> bytes:
     return secret.encode()
 
 
+def _invite_alive(row: dict) -> bool:
+    """False once the invite this device (or grant) came in with is withdrawn from the list.
+    Rows from before invites were recorded have none and stay alive."""
+    invite_hash = row.get("invite_hash")
+    if not invite_hash:
+        return True
+    known = json.loads(params.get(INVITES_PARAM, ttl_s=60) or "[]")
+    return any(hmac.compare_digest(str(invite_hash), k) for k in known)
+
+
+def _token_alive(claims: dict) -> bool:
+    uid, gid = str(claims.get("sub", "")), claims.get("gid")
+    if not signing.UID.fullmatch(uid):
+        return False  # includes the removed 간편 연결's p_ subjects
+    t = store.table()
+    if gid is None:  # issued before grants existed; such tokens run out within ACCESS_TTL of the upgrade
+        device = store.get_device(t, uid)
+        return bool(device) and _invite_alive(device)
+    grant = store.get_grant(t, uid, str(gid))
+    return bool(grant) and grant.get("client_id") == claims.get("client_id") and _invite_alive(grant)
+
+
 class BridgeTokenVerifier:
     async def verify_token(self, token: str) -> AccessToken | None:
         claims = crypto.verify_jwt(_jwt_secret(), token, RESOURCE)
-        if not claims or not _grant_alive(claims["sub"]):
-            return None  # bad token, unlinked PC, or a password KLAS rejected: the client re-authorizes
+        if not claims or not _token_alive(claims):
+            return None  # bad token, revoked grant or unlinked PC: the client re-authorizes
         return AccessToken(token=token, client_id=claims["client_id"], scopes=claims.get("scope", "").split(),
                            expires_at=int(claims["exp"]), resource=RESOURCE, subject=claims["sub"])
-
-
-# 간편 연결 is off unless this switch is "true". KLAS asks for 2FA (app or e-mail) on logins from
-# IPs it treats as foreign (notice DUID 53483, from 2026-10-26), and it treats AWS addresses that way,
-# so a server-side login can't run unattended. Turning it off also ends existing 간편 connections.
-PASSWORD_MODE_PARAM = "/kw/bridge/password-mode"
-
-
-def _password_mode() -> bool:
-    return params.is_true(PASSWORD_MODE_PARAM)
-
-
-def _grant_alive(sub: str) -> bool:
-    t = store.table()
-    if sub.startswith("p_"):
-        return _password_mode() and not store.is_bad_login(t, sub[2:])
-    return store.device_key(t, sub) is not None
 
 
 mcp = MCPServer(
@@ -112,12 +137,24 @@ mcp = MCPServer(
     token_verifier=BridgeTokenVerifier(),
     auth=AuthSettings(issuer_url=ISSUER, resource_server_url=RESOURCE, required_scopes=[SCOPE],
                       validate_token_resource=True),
+    log_level="WARNING",
 )
+# Failed tool calls are logged at INFO with their text, which carries course lists and KLAS login
+# hints; none of that may reach CloudWatch. (public_http sets this too: it is imported first.)
+logging.getLogger("mcp").setLevel(logging.WARNING)
 
 
-# --- snapshot from the user's extension ---------------------------------------------
+# --- answers from the user's PC agent ---------------------------------------------------
 
 _SNAP: dict[str, tuple[float, dict]] = {}
+
+
+def _sweep_snap() -> None:
+    """Drop decrypted snapshots past the cache window. Runs on every request, so a warm instance
+    holds one no longer than /privacy says even when no snapshot tool is called again."""
+    now = time.monotonic()
+    for stale in [k for k, (at, _) in _SNAP.items() if now - at >= SNAPSHOT_CACHE_S]:
+        del _SNAP[stale]
 
 
 def _post_to_connection(conn: str, message: dict) -> bool:
@@ -130,7 +167,6 @@ def _post_to_connection(conn: str, message: dict) -> bool:
 
 
 _ERRORS = {
-    "klas_bad_password": "KLAS가 저장된 비밀번호를 거부했습니다(비밀번호를 바꿨다면 이 경우입니다). 같은 비밀번호로 계속 시도하면 보안문자가 걸리므로 이 연결을 멈췄습니다. Claude/ChatGPT에서 커넥터를 다시 연결해 주세요.",
     "klas_login_required": "PC 에이전트가 KLAS에 로그인하지 못했습니다. PC에서 `kw-mcp setup`으로 학번·비밀번호를 다시 저장해 주세요.",
     "klas_blocked": "KLAS가 자동 로그인을 막았습니다(보안문자 또는 2차 인증).",
     "klas_error": "KLAS에서 데이터를 읽지 못했습니다. 잠시 뒤 다시 시도해 주세요.",
@@ -141,17 +177,14 @@ _ERRORS = {
 _SNAP_PENDING: dict[str, asyncio.Task] = {}  # one snapshot request per PC at a time
 
 
-async def snapshot_for(uid: str, claims: dict | None = None) -> dict:
-    now = time.monotonic()
-    for stale in [k for k, (at, _) in _SNAP.items() if now - at >= SNAPSHOT_CACHE_S]:
-        del _SNAP[stale]  # decrypted personal data: keep it no longer than the cache window
+async def snapshot_for(uid: str) -> dict:
+    _sweep_snap()
     hit = _SNAP.get(uid)
     if hit:
         return hit[1]
     pending = _SNAP_PENDING.get(uid)
     if pending is None:
-        pending = asyncio.ensure_future(
-            _password_snapshot(uid, claims or {}) if uid.startswith("p_") else _agent_snapshot(uid))
+        pending = asyncio.ensure_future(_agent_request(uid, {"type": "snapshot"}))
         _SNAP_PENDING[uid] = pending
         pending.add_done_callback(lambda _: _SNAP_PENDING.pop(uid, None))
     data = await asyncio.shield(pending)
@@ -161,6 +194,8 @@ async def snapshot_for(uid: str, claims: dict | None = None) -> dict:
 
 
 def _raise_for(data: dict) -> None:
+    """The agent's error as a ToolError for the model. Its message is user-facing text only: the
+    SDK logs ToolErrors at INFO, which is off, and nothing here logs or stores it."""
     if not data.get("error"):
         return
     detail = str(data.get("message") or "")[:300]
@@ -172,6 +207,7 @@ def _raise_for(data: dict) -> None:
 
 
 _UPDATE_AGENT = "PC 에이전트가 옛 버전입니다. PC에서 처음 설치할 때 쓴 명령을 한 번 더 실행해 업데이트해 주세요(연결은 그대로 유지됩니다)."
+_UNREADABLE = "PC 에이전트의 응답을 읽지 못했습니다. 잠시 뒤 다시 시도해 주세요."
 
 
 async def agent_call(op: str, **args: str):
@@ -179,25 +215,9 @@ async def agent_call(op: str, **args: str):
     token = get_access_token()
     if token is None or not token.subject:
         raise ToolError("인증이 필요합니다.")
-    if token.subject.startswith("p_"):
-        raise ToolError("이 기능은 PC 에이전트 연결에서만 쓸 수 있습니다.")
     data = await _agent_request(token.subject, {"type": "call", "op": op, "args": args}, CALL_MIN_VERSION)
     _raise_for(data)
     return data.get("result")
-
-
-async def _password_snapshot(uid: str, claims: dict) -> dict:
-    login = password.unseal(str(claims.get("cred", "")), str(claims.get("client_id", "")))
-    if not login or f"p_{login.cid}" != uid:
-        raise ToolError("연결 정보를 읽지 못했습니다. Claude/ChatGPT에서 커넥터를 다시 연결해 주세요.")
-    data = await password.snapshot(login)
-    if data.get("error") == "klas_bad_password":
-        store.mark_bad_login(store.table(), login.cid)
-    return data
-
-
-async def _agent_snapshot(uid: str) -> dict:
-    return await _agent_request(uid, {"type": "snapshot"})
 
 
 async def _agent_request(uid: str, payload: dict, need_version: int = 1) -> dict:
@@ -208,29 +228,44 @@ async def _agent_request(uid: str, payload: dict, need_version: int = 1) -> dict
     conn = info[0] if info else None
     if not conn:
         raise ToolError("PC 에이전트가 연결돼 있지 않습니다. PC가 켜져 있는지 확인해 주세요(로그인하면 에이전트가 자동으로 연결됩니다).")
-    request_id, key = crypto.random_token(16), crypto.new_result_key()
-    store.open_result(t, request_id)  # /device/result only fills slots opened here
-    command = {**payload, "request_id": request_id, "key": crypto.b64u(key),
-               "result_url": f"{BASE_URL}/device/result"}
-    if not await asyncio.to_thread(_post_to_connection, conn, command):
-        store.remove_connection(t, conn)
-        raise ToolError("PC 에이전트 연결이 방금 끊겼습니다. 잠시 뒤 다시 시도해 주세요.")
-    deadline = time.monotonic() + SNAPSHOT_WAIT_S
-    while time.monotonic() < deadline:
-        await asyncio.sleep(0.4)
-        item = store.take_result(t, request_id)
-        if item:
-            return crypto.decrypt_result(key, item["iv"], item["ct"], request_id)
-    store.close_result(t, request_id)
-    raise ToolError("PC 에이전트가 제때 응답하지 않았습니다. PC가 잠자기 상태가 아닌지 확인해 주세요.")
+    if not store.count_request(t, uid, MAX_CALLS_PER_MINUTE):
+        raise ToolError(f"이 PC에 1분 동안 보낼 수 있는 요청({MAX_CALLS_PER_MINUTE}개)을 넘었습니다. 1분 뒤 다시 시도해 주세요.")
+    if not store.open_request(t, uid, MAX_INFLIGHT):
+        raise ToolError(f"이 PC에서 이미 요청 {MAX_INFLIGHT}개를 처리하고 있습니다. 앞 요청이 끝난 뒤 다시 시도해 주세요.")
+    try:
+        request_id, key = crypto.random_token(16), crypto.new_result_key()
+        store.open_result(t, request_id)  # /device/result only fills slots opened here
+        command = {**payload, "request_id": request_id, "key": crypto.b64u(key),
+                   "result_url": f"{BASE_URL}/device/result"}
+        if not await asyncio.to_thread(_post_to_connection, conn, command):
+            store.remove_connection(t, conn)
+            raise ToolError("PC 에이전트 연결이 방금 끊겼습니다. 잠시 뒤 다시 시도해 주세요.")
+        deadline, delay, item = time.monotonic() + SNAPSHOT_WAIT_S, POLL_FIRST_S, None
+        while item is None and (left := deadline - time.monotonic()) > 0:
+            await asyncio.sleep(min(delay, left))
+            delay = min(delay * 1.5, POLL_MAX_S)
+            item = store.take_result(t, request_id)
+        if item is None:  # one last look that also shuts the slot, so nothing lands unread after it
+            item = store.take_result(t, request_id, close=True)
+        if item is None:
+            raise ToolError("PC 에이전트가 제때 응답하지 않았습니다. PC가 잠자기 상태이거나 KLAS 응답이 느린 것일 수 있습니다. "
+                            "1분 안에 다시 물어보면 PC에 남은 결과로 더 빨리 답합니다.")
+    finally:
+        store.close_request(t, uid)
+    try:
+        data = crypto.decrypt_result(key, item["iv"], item["ct"], request_id)
+    except (ValueError, KeyError):
+        raise ToolError(_UNREADABLE) from None
+    if not isinstance(data, dict):
+        raise ToolError(_UNREADABLE)
+    return data
 
 
 async def _snapshot() -> dict:
     token = get_access_token()
     if token is None or not token.subject:
         raise ToolError("인증이 필요합니다.")
-    claims = crypto.verify_jwt(_jwt_secret(), token.token, RESOURCE) if token.subject.startswith("p_") else None
-    return await snapshot_for(token.subject, claims)
+    return await snapshot_for(token.subject)
 
 
 def _now() -> datetime:
@@ -275,19 +310,29 @@ async def my_course_notices(course: str | None = None) -> list[dict[str, Any]]:
     return shapes.course_posts(await _snapshot(), course)
 
 
+# What a snapshot can't tell: an agent from before 0.8 has no single "deadlines" request.
+_OLD_AGENT_DEADLINES = {"missing": ["online_test", "survey", "discussion"],
+                        "message": "PC 에이전트가 옛 버전이라 온라인시험·설문·토론 마감이 빠졌습니다. " + _UPDATE_AGENT}
+
+
+def _clamp_days(days: int) -> int:
+    return max(0, min(int(days), 180))
+
+
 async def _deadlines(days: int) -> dict:
     """The PC agent's own deadline list, which also covers online exams, surveys and discussions.
-    Agents from before 0.8 don't know that request, so their snapshot is shaped here instead."""
+    Agents from before 0.8 don't know that request, so their snapshot is shaped here instead,
+    marked incomplete."""
     token = get_access_token()
     uid = token.subject if token is not None else None
-    info = store.latest_connection_info(store.table(), uid) if uid and not uid.startswith("p_") else None
+    info = store.latest_connection_info(store.table(), uid) if uid else None
     if info and info[1] >= CALL_MIN_VERSION:
         data = await _agent_request(uid, {"type": "call", "op": "deadlines", "args": {"days": str(days)}},
                                     CALL_MIN_VERSION)
         if data.get("error") != "unsupported":
             _raise_for(data)
             return data.get("result") or {}
-    return shapes.deadlines(await _snapshot(), _now(), days)
+    return {**shapes.deadlines(await _snapshot(), _now(), days), "incomplete": _OLD_AGENT_DEADLINES}
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -296,71 +341,108 @@ async def my_deadlines(days: int = 7) -> dict[str, Any]:
     진도 100% 미만 온라인 강의, 그 안에 끝나는 토론(참여 여부는 KLAS가 알려 주지 않음).
     마감이 지났지만 지각 제출 기간인 과제·팀플은 late_submission=true로 포함합니다(이때 due는 과거).
     incomplete가 있으면 일부 목록을 읽지 못한 것이니 사용자에게 알리세요."""
-    return await _deadlines(days)
+    return await _deadlines(_clamp_days(days))
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def this_week(days: int = 7) -> dict[str, Any]:
     """이번 주 할 일(현재 학기): 마감 목록(지각 제출 가능 항목은 late_submission=true)과 같은 기간의 학사일정."""
-    now = _now()
-    deadlines = await _deadlines(days)  # clamps days to 0..180; the calendar follows it
+    now, days = _now(), _clamp_days(days)
+    deadlines = await _deadlines(days)
+    span = int(deadlines.get("days", days))  # the calendar follows the agent's own clamp
     return {**deadlines,
             "academic_events": public_http.academic_calendar(
-                now.date().isoformat(), (now.date() + timedelta(days=deadlines["days"])).isoformat())}
+                now.date().isoformat(), (now.date() + timedelta(days=span)).isoformat())}
+
+
+def _due_of(item: dict) -> str | None:
+    return item.get("late_due") if item.get("late_submission") else item.get("effective_due") or item.get("due")
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def today_briefing() -> dict[str, Any]:
-    """오늘 브리핑: 오늘 수업(교시·강의실), 오늘·내일 마감, 오늘 학식, 최근 과목 게시판 글과 학교 공지."""
-    # Both asked of the PC at once: one after the other could outlast the Lambda's 30 s.
-    snap, upcoming = await asyncio.gather(_snapshot(), _deadlines(2))
+    """오늘 브리핑: 오늘 수업(교시·강의실), 오늘·내일 마감, 오늘 학식, 최근 과목 게시판 글과 학교 공지.
+    PC에서 일부를 받지 못하면 나머지로 답하고 빠진 부분을 incomplete(또는 deadlines_incomplete)에 적습니다."""
+    # Both asked of the PC at once (one after the other could outlast the Lambda's 30 s). Each may
+    # fail alone; gather waits for both, so neither is left running after this returns.
+    snap, upcoming = await asyncio.gather(_snapshot(), _deadlines(2), return_exceptions=True)
+    for outcome in (snap, upcoming):
+        if isinstance(outcome, BaseException) and not isinstance(outcome, ToolError):
+            raise outcome  # a bug or a cancellation, not the PC failing to answer
     now = _now()
+    missing: list[str] = []
+    problem = ""
+    if isinstance(snap, ToolError):
+        missing, problem, snap = ["classes", "new_course_posts"], str(snap), None
+    if isinstance(upcoming, ToolError):
+        if snap is not None:  # the snapshot still has assignments, quizzes, lectures and team projects
+            upcoming = {**shapes.deadlines(snap, now, 2), "incomplete": {
+                "missing": ["online_test", "survey", "discussion"],
+                "message": f"PC 에이전트의 마감 목록을 받지 못해 온라인시험·설문·토론 마감이 빠졌습니다({upcoming})."}}
+        else:
+            missing.append("due_today_or_tomorrow")
+            problem = problem or str(upcoming)
+            upcoming = {}
     end_tomorrow = (now + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
-
-    def due_of(item: dict) -> str | None:
-        return item.get("late_due") if item.get("late_submission") else item.get("effective_due") or item.get("due")
-
-    soon = [i for i in upcoming.get("items", []) if (shapes.parse_kst(due_of(i)) or end_tomorrow) <= end_tomorrow]
+    # Same rule as kw-mcp: a due that doesn't parse is left out, not counted as due today.
+    soon = [i for i in upcoming.get("items", []) if (due := shapes.parse_due(_due_of(i))) and due <= end_tomorrow]
     since = (now - timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
+    in_session = snap is not None and term_in_session(snap.get("semester"), now)
+    new_posts = [p for p in shapes.course_posts(snap) if (p["posted"] or "") >= since] if snap else []
+    alerts = _campus_alerts(now)
     return {
         "date": now.strftime("%Y-%m-%d"), "weekday": shapes.WEEKDAYS[now.weekday()],
         # Same rule as kw-mcp: no timetable outside the semester's class period.
-        "classes": shapes.classes_on(snap, now) if term_in_session(snap.get("semester"), now) else [],
-        **({} if term_in_session(snap.get("semester"), now)
-           else {"classes_note": f"{snap.get('semester')} 학기 수업 기간이 아니라 시간표를 비웠습니다."}),
+        "classes": shapes.classes_on(snap, now) if in_session else [],
+        **({"classes_note": f"{snap.get('semester')} 학기 수업 기간이 아니라 시간표를 비웠습니다."}
+           if snap is not None and not in_session else {}),
         "due_today_or_tomorrow": soon,
         **({"deadlines_incomplete": upcoming["incomplete"]} if upcoming.get("incomplete") else {}),
         "cafeteria": public_http.cafeteria_menu(now.date().isoformat()),
-        "new_course_posts": (new_posts := [p for p in shapes.course_posts(snap) if (p["posted"] or "") >= since]),
-        "possible_class_changes": [p for p in new_posts if shapes.CLASS_CHANGE_WORDS.search(p.get("title") or "")],
-        "new_school_notices": public_http.search_notices("", None, (now.date() - timedelta(days=1)).isoformat(), 10),
-        **({"campus_alerts": alerts} if (alerts := _campus_alerts(now))["notices"] or alerts["today"] else {}),
-        "data_as_of": snap.get("fetched_at"),
+        "new_course_posts": new_posts,
+        "possible_class_changes": [p for p in new_posts if CLASS_CHANGE_WORDS.search(p.get("title") or "")],
+        # Same as kw-mcp: yesterday on, no pinned posts; latest() leaves the FAQ out on its own.
+        "new_school_notices": public_data.latest(public_http._table(), None, 10, include_pinned=False,
+                                                 since=now.date() - timedelta(days=1)),
+        **({"campus_alerts": alerts} if alerts["notices"] or alerts["today"] else {}),
+        **({"incomplete": {"missing": missing, "message": problem}} if missing else {}),
+        "data_as_of": snap.get("fetched_at") if snap else upcoming.get("data_as_of"),
     }
 
 
 def _campus_alerts(now: datetime) -> dict:
-    """Same rule as kw_mcp.combined.campus_alerts: recent closures/outages/holidays and today's days off."""
-    today = now.date().isoformat()
-    recent = public_http.search_notices("", None, (now.date() - timedelta(days=3)).isoformat(), 30)
+    """Same rule as kw_mcp.combined.campus_alerts: recent closures/outages/holidays and today's days off.
+    Main board only (a department's 휴강 or a job post naming 기상청 is not a campus alert), selected
+    by public_data before its limit; three days of the main board stay well under 50 posts."""
+    today = now.date()
+    recent = public_data.latest(public_http._table(), None, 50, include_pinned=True, since=today - timedelta(days=3),
+                                sources=(NOTICE_SOURCE,))
     return {"notices": [n for n in recent if CAMPUS_ALERT_WORDS.search(n.get("title") or "")],
-            "today": [e for e in public_http.academic_calendar(today, today) if HOLIDAY_WORDS.search(e.get("title") or "")]}
+            "today": [e for e in public_http.academic_calendar(today.isoformat(), today.isoformat())
+                      if HOLIDAY_WORDS.search(e.get("title") or "")]}
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def my_notices(days: int = 7) -> dict[str, Any]:
-    """내 공지함: 최근 days일의 학교 학사·장학 공지 + 내 과목 게시판 새 글(KLAS 홈에 뜨는 최근 몇 개만).
-    오래된 과목 공지나 특정 주제는 my_course_board로 찾으세요."""
+async def my_notices(days: int = 7, department: str | None = None) -> dict[str, Any]:
+    """내 공지함: 최근 days일(1~180)의 학교 학사·장학 공지 + 내 과목 게시판 새 글(KLAS 홈에 뜨는 최근 몇 개만).
+    department에 내 학과·단과대 이름(예: "전자공학과", "인공지능융합대학")을 주면 그 학과 공지도 넣습니다.
+    학과를 모르면 my_grades의 학과를 쓰거나 사용자에게 물어보세요. 오래된 과목 공지나 특정 주제는 my_course_board로 찾으세요."""
+    days = max(1, min(int(days), 180))
     snap = await _snapshot()
     now = _now()
     since_dt = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
     since = (now.date() - timedelta(days=days)).isoformat()
-    return {"days": days,
-            "course_posts": [p for p in shapes.course_posts(snap) if (p["posted"] or "") >= since_dt],
-            "school_academic": public_http.search_notices("", "학사", since, 20),
-            "school_scholarship": public_http.search_notices("", "장학", since, 20),
-            "department": public_http.search_notices("", "인공지능융합대학", since, 20),
-            "data_as_of": snap.get("fetched_at")}
+    out = {"days": days,
+           "course_posts": [p for p in shapes.course_posts(snap) if (p["posted"] or "") >= since_dt],
+           "school_academic": public_http.search_notices("", "학사", since, 20),
+           "school_scholarship": public_http.search_notices("", "장학", since, 20),
+           "data_as_of": snap.get("fetched_at")}
+    if department and department.strip():
+        try:
+            out["department"] = public_http.search_notices("", department.strip(), since, 20)
+        except ToolError as e:  # an unknown name: say so and keep the rest
+            out["department_error"] = str(e)
+    return out
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -484,12 +566,12 @@ async def my_attachment(course: str, title: str, file_name: str = "", part: int 
 
 
 # public tools: same functions as the public MCP, so one connector covers everything
-for _fn in (public_http.latest_notices, public_http.search_notices, public_http.get_notice,
-            public_http.cafeteria_menu, public_http.academic_calendar):
+for _fn in (public_http.list_notice_categories, public_http.latest_notices, public_http.search_notices,
+            public_http.get_notice, public_http.cafeteria_menu, public_http.academic_calendar):
     mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False))(_fn)
 
 
-# --- OAuth authorization server -------------------------------------------------------
+# --- request helpers ----------------------------------------------------------------------
 
 def _json(data: dict, status: int = 200) -> JSONResponse:
     return JSONResponse(data, status_code=status, headers={"Cache-Control": "no-store"})
@@ -498,6 +580,39 @@ def _json(data: dict, status: int = 200) -> JSONResponse:
 def _oauth_error(error: str, description: str, status: int = 400) -> JSONResponse:
     return _json({"error": error, "error_description": description}, status)
 
+
+async def _json_object(request: Request, max_bytes: int = MAX_JSON_BYTES) -> dict | None:
+    """The body as a JSON object, or None (not JSON, not an object, or too big)."""
+    try:
+        if int(request.headers.get("content-length") or 0) > max_bytes:
+            return None
+        raw = await request.body()
+        data = json.loads(raw) if len(raw) <= max_bytes else None
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _clean_name(value: object) -> str:
+    """A client-chosen name, safe to show and log: no control or format characters (newlines that
+    forge log lines, bidi overrides), whitespace squeezed, at most 100 characters."""
+    text = "".join(ch if not unicodedata.category(ch).startswith("C") else " " if ch.isspace() else ""
+                   for ch in str(value or ""))
+    return " ".join(text.split())[:100] or "MCP client"
+
+
+def _app_label(host: str) -> str:
+    """Who the approval really goes to, judged by the redirect host (client_name is self-chosen)."""
+    if host in ("claude.ai", "claude.com"):
+        return "Claude"
+    if host == "chatgpt.com":
+        return "ChatGPT"
+    if host in ("localhost", "127.0.0.1"):
+        return "이 PC의 앱(Claude Code, MCP Inspector 등)"
+    return host
+
+
+# --- OAuth authorization server -------------------------------------------------------
 
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
 async def as_metadata(request: Request) -> Response:
@@ -511,6 +626,7 @@ async def as_metadata(request: Request) -> Response:
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": [SCOPE],
+        "authorization_response_iss_parameter_supported": True,
     })
 
 
@@ -529,10 +645,12 @@ MAX_REDIRECT_URIS = 5
 
 
 def _redirect_ok(uri: str) -> bool:
+    if len(uri) > 300:
+        return False
     if uri in REDIRECT_URIS or CHATGPT_CALLBACK.fullmatch(uri):
         return True
     # Claude Code and MCP Inspector listen on the user's own PC.
-    if len(uri) > 300 or any(ch in uri for ch in "\\@ \t\r\n#"):
+    if any(ch in uri for ch in "\\@ \t\r\n#"):
         return False
     parsed = urlparse(uri)
     return parsed.scheme == "http" and parsed.netloc.split(":")[0] in ("localhost", "127.0.0.1")
@@ -540,16 +658,15 @@ def _redirect_ok(uri: str) -> bool:
 
 @mcp.custom_route("/oauth/register", methods=["POST"])
 async def register_client(request: Request) -> Response:
-    try:
-        body = await request.json()
-    except ValueError:
-        return _oauth_error("invalid_client_metadata", "JSON body required")
+    body = await _json_object(request)
+    if body is None:
+        return _oauth_error("invalid_client_metadata", "a JSON object of at most 16 KB is required")
     uris = body.get("redirect_uris") or []
     if not isinstance(uris, list) or not 0 < len(uris) <= MAX_REDIRECT_URIS \
             or not all(isinstance(u, str) and _redirect_ok(u) for u in uris):
         return _oauth_error("invalid_redirect_uri", "only Claude, ChatGPT or localhost callback URLs are accepted")
     client_id = "c_" + crypto.random_token(16)
-    name = str(body.get("client_name") or "MCP client")[:100]
+    name = _clean_name(body.get("client_name") if isinstance(body.get("client_name"), str) else None)
     store.put_client(store.table(), client_id, name, uris)
     return _json({"client_id": client_id, "client_name": name, "redirect_uris": uris,
                   "token_endpoint_auth_method": "none", "grant_types": ["authorization_code", "refresh_token"],
@@ -561,108 +678,96 @@ _AUTHORIZE_PAGE = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <style>body{{font-family:system-ui,sans-serif;max-width:480px;margin:40px auto;padding:0 16px;color:#222;line-height:1.5}}
 label{{display:block;margin:10px 0 2px;font-size:14px}} input{{font-size:16px;padding:8px 10px;width:100%;box-sizing:border-box}}
 button{{font-size:16px;padding:10px 18px;border-radius:8px;border:0;background:#8b1d2c;color:#fff;cursor:pointer;margin-top:12px}}
-details{{margin-top:28px}} .muted{{color:#666;font-size:13px}} #status{{margin-top:16px;font-weight:600}}</style></head><body>
+.muted{{color:#666;font-size:13px}} #status{{margin-top:16px;font-weight:600}}</style></head><body>
 <h2>KW Campus 연결</h2>
-<p><b>{client}</b>이(가) 내 KLAS 과제·퀴즈·온라인강의·시간표·과목 공지를 <b>읽기 전용</b>으로 조회하려고 합니다.</p>
-<p class="muted">승인하면 <b>{redirect_host}</b>(으)로 돌아갑니다. 직접 Claude·ChatGPT에서 커넥터를 추가하다 열린 페이지가 아니라면 입력하지 마세요.</p>
-{password_block}
-{agent_block}
+<p><b>{app}</b>이(가) 내 KLAS 과제·퀴즈·시험·성적·출석·졸업 이수·시간표·과목 게시판과 첨부 파일을 <b>읽기 전용</b>으로 조회하려고 합니다.</p>
+<p class="muted">승인하면 <b>{redirect_host}</b>(으)로 돌아갑니다. 앱이 스스로 밝힌 이름: “{client}”.
+직접 Claude·ChatGPT에서 커넥터를 추가하다 열린 페이지가 아니라면 코드를 입력하지 마세요. 남이 보낸 링크에서 승인하면 그 사람이 내 정보를 보게 됩니다.</p>
+<p class="muted">데이터는 내 PC의 KW Campus 에이전트가 내 KLAS 로그인으로 읽어 옵니다. 비밀번호는 PC 밖으로 나가지 않고, 서버에는 저장하지 않습니다.
+연결은 {grant_days}일 동안 유지되고, PC 에이전트에서 연결된 앱을 보고 하나씩 끊을 수 있습니다.</p>
+<form id="pc"><label for="code">연결 코드</label><input id="code" autocomplete="off" placeholder="XXXX-XXXX" required>
+<p class="muted">PC에 KW Campus 에이전트를 설치하고 <code>kw-mcp code</code>를 실행하면 나오는 코드입니다(15분, 1회용).
+에이전트가 없다면 <a href="/setup" target="_blank" rel="noopener">설치 안내</a>를 보세요.</p>
+<button>승인</button></form>
 <p id="status"></p>
 <p class="muted">광운대학교가 만들거나 승인한 도구가 아닙니다. 연결한 사람 본인의 정보만 조회합니다.</p>
-<script>
+<script nonce="{script_nonce}">
 const nonce = {nonce_json};
 const status = document.getElementById('status');
-async function send(body, button) {{
+document.getElementById('pc').onsubmit = async (e) => {{
+  e.preventDefault();
+  const button = e.submitter;
   button.disabled = true;
-  status.textContent = body.mode === 'password' ? 'KLAS 로그인 확인 중…' : '확인 중…';
+  status.textContent = '확인 중…';
   try {{
     const r = await fetch('/oauth/approve', {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{nonce, ...body}})}});
+      body: JSON.stringify({{nonce, code: document.getElementById('code').value}})}});
     const j = await r.json();
     if (j.redirect_to) {{ status.textContent = '연결됐습니다. 돌아가는 중…'; location.href = j.redirect_to; return; }}
     status.textContent = j.error_description || j.error;
-  }} catch (e) {{ status.textContent = '서버에 연결하지 못했습니다. 다시 시도해 주세요.'; }}
+  }} catch (err) {{ status.textContent = '서버에 연결하지 못했습니다. 다시 시도해 주세요.'; }}
   button.disabled = false;
-}}
-const v = (id) => document.getElementById(id).value;
-const pw = document.getElementById('pw');
-if (pw) pw.onsubmit = (e) => {{ e.preventDefault();
-  send({{mode: 'password', invite: v('invite'), login_id: v('login_id'), password: v('password')}}, e.submitter); }};
-document.getElementById('pc').onsubmit = (e) => {{ e.preventDefault(); send({{mode: 'code', code: v('code')}}, e.submitter); }};
+}};
 </script></body></html>"""
 
-_PASSWORD_FORM = """<form id="pw">
-<label for="invite">초대 코드</label><input id="invite" autocomplete="off" required>
-<label for="login_id">KLAS 학번</label><input id="login_id" autocomplete="username" inputmode="numeric" required>
-<label for="password">KLAS 비밀번호</label><input id="password" type="password" autocomplete="current-password" required>
-<p class="muted">비밀번호는 서버에 저장하지 않습니다. 암호화해서 이 연결(Claude/ChatGPT가 보관하는 토큰) 안에만 두고,
-조회할 때마다 서버 메모리에서만 풀어 KLAS에 로그인합니다. 비밀번호를 서버에 맡기기 싫다면 아래 PC 에이전트 방식을 쓰세요.</p>
-<button>연결</button></form>"""
 
-_AGENT_FORM = """<form id="pc"><label for="code">연결 코드</label><input id="code" autocomplete="off" placeholder="XXXX-XXXX" required>
-<p class="muted">PC에 KW Campus 에이전트를 설치하고 <code>kw-mcp code</code>를 실행하면 나오는 코드입니다(15분, 1회용).
-에이전트가 없다면 <a href="/setup" target="_blank">설치 안내</a>를 보세요.</p>
-<button>승인</button></form>"""
-
-
-def _authorize_blocks() -> dict[str, str]:
-    if _password_mode():
-        return {"password_block": _PASSWORD_FORM,
-                "agent_block": f"<details><summary>PC 에이전트로 연결 (비밀번호가 PC 밖으로 나가지 않음)</summary>{_AGENT_FORM}</details>"}
-    return {"password_block": "",
-            "agent_block": "<p class=\"muted\">데이터는 내 PC의 KW Campus 에이전트가 내 KLAS 로그인으로 읽어 옵니다. "
-                           "비밀번호는 PC 밖으로 나가지 않고, 서버에는 저장하지 않습니다.</p>" + _AGENT_FORM}
+def _page(message: str, status: int = 400) -> HTMLResponse:
+    return HTMLResponse(f'<!doctype html><meta charset="utf-8"><p>{html.escape(message)}</p>', status_code=status,
+                        headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY",
+                                 "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'"})
 
 
 @mcp.custom_route("/oauth/authorize", methods=["GET"])
 async def authorize(request: Request) -> Response:
     q = request.query_params
-    client = store.get_client(store.table(), q.get("client_id", ""))
-    redirect_uri = q.get("redirect_uri", "")
+    t = store.table()
+    client_id, redirect_uri = q.get("client_id", ""), q.get("redirect_uri", "")
+    client = store.get_client(t, client_id) if CLIENT_ID.fullmatch(client_id) else None
     if not client or redirect_uri not in client["redirect_uris"]:
-        return HTMLResponse("<p>알 수 없는 클라이언트이거나 redirect_uri가 등록되지 않았습니다.</p>", status_code=400)
-    if q.get("response_type") != "code" or q.get("code_challenge_method") != "S256" or not q.get("code_challenge"):
-        return HTMLResponse("<p>PKCE(S256)를 쓰는 authorization code 요청만 받습니다.</p>", status_code=400)
+        # Never redirect to an unverified URI. A client row that expired lands here: say how to recover.
+        return _page("이 커넥터의 등록 정보가 없거나 만료됐습니다. Claude·ChatGPT에서 이 커넥터를 지우고 다시 추가해 주세요.")
+
+    def back(error: str, description: str) -> Response:  # RFC 6749 4.1.2.1: errors go to the client
+        query = urlencode({"error": error, "error_description": description,
+                           **({"state": q["state"]} if q.get("state") else {}), "iss": ISSUER})
+        return RedirectResponse(f"{redirect_uri}{'&' if '?' in redirect_uri else '?'}{query}", status_code=302)
+
+    if q.get("response_type") != "code" or q.get("code_challenge_method") != "S256" \
+            or not CODE_CHALLENGE.fullmatch(q.get("code_challenge", "")):
+        return back("invalid_request", "only authorization code requests with PKCE S256 are accepted")
+    resource = q.get("resource")
+    if resource is not None and resource.rstrip("/") != RESOURCE:  # RFC 8707
+        return back("invalid_target", f"the only resource here is {RESOURCE}")
     nonce = crypto.random_token(24)
-    store.put_authreq(store.table(), nonce, {
-        "client_id": client["PK"][len("CLIENT#"):], "redirect_uri": redirect_uri, "state": q.get("state", ""),
-        "code_challenge": q["code_challenge"], "resource": q.get("resource", RESOURCE),
+    store.put_authreq(t, nonce, {"client_id": client_id, "redirect_uri": redirect_uri,
+                                 "state": q.get("state", "")[:500], "code_challenge": q["code_challenge"]})
+    host = urlparse(redirect_uri).hostname or ""
+    script_nonce = crypto.random_token(16)
+    page = _AUTHORIZE_PAGE.format(nonce_json=json.dumps(nonce), script_nonce=script_nonce,
+                                  app=html.escape(_app_label(host)), redirect_host=html.escape(host),
+                                  client=html.escape(_clean_name(client.get("client_name"))),
+                                  grant_days=store.GRANT_TTL // 86400)
+    return HTMLResponse(page, headers={
+        "Cache-Control": "no-store", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": (f"default-src 'none'; script-src 'nonce-{script_nonce}'; style-src 'unsafe-inline'; "
+                                    "connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"),
     })
-    return HTMLResponse(_AUTHORIZE_PAGE.format(nonce_json=json.dumps(nonce), client=html.escape(client["client_name"]),
-                                               redirect_host=html.escape(urlparse(redirect_uri).hostname or ""),
-                                               **_authorize_blocks()),
-                        headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY",
-                                 "Content-Security-Policy": "frame-ancestors 'none'"})
 
 
 def _normalize_code(code: str) -> str:
     return "".join(ch for ch in code.upper() if ch in CODE_ALPHABET)
 
 
-def _invite_token(text: str) -> str:
-    """Invites come as the raw token or as the kwc_... string `kw-mcp link` takes."""
-    text = text.strip()
-    if text.startswith("kwc_"):
-        try:
-            return str(json.loads(crypto.b64u_decode(text[4:]))["t"])
-        except (ValueError, KeyError, TypeError):
-            return ""
-    return text
-
-
-def _with_seal(token: str, sealed: str | None) -> str:
-    return f"{token}.{sealed}" if sealed else token
-
-
-def _sealed_part(token: str) -> str | None:
-    return token.split(".", 1)[1] if "." in token else None
-
-
-_APPROVE_ERRORS = {
-    "klas_bad_password": "KLAS가 학번 또는 비밀번호를 거부했습니다. 여러 번 틀리면 KLAS가 보안문자를 요구하니 확인한 뒤 입력해 주세요.",
-    "klas_blocked": "KLAS가 자동 로그인을 막았습니다(보안문자 또는 2차 인증).",
-    "klas_error": "KLAS에 로그인하지 못했습니다. 잠시 뒤 다시 시도해 주세요.",
-}
+def _same_site(request: Request) -> bool:
+    """Approvals come only from our own page's fetch: JSON (a cross-site form or no-cors fetch can't
+    send that without a preflight we never grant), and the browser's Origin/Sec-Fetch-Site agree."""
+    if request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
+        return False
+    origin = request.headers.get("origin")
+    if origin is not None and origin != _ORIGIN:
+        return False
+    return request.headers.get("sec-fetch-site", "same-origin") in ("same-origin", "none")
 
 
 def _refuse(t, nonce: str, message: str, reason: str) -> Response:
@@ -673,172 +778,251 @@ def _refuse(t, nonce: str, message: str, reason: str) -> Response:
     return _oauth_error("access_denied", message, 403)
 
 
-def _grant(t, nonce: str, uid: str, login: password.Login | None = None) -> Response:
+def _grant(t, nonce: str, uid: str, device: dict) -> Response:
     req = store.take_authreq(t, nonce)
     if not req:
         return _oauth_error("invalid_request", "이미 처리된 승인 요청입니다.")
-    sealed = password.seal(login, req["client_id"]) if login else None
-    code = _with_seal(crypto.random_token(32), sealed)
-    store.put_code(t, crypto.sha256_hex(code), {"uid": uid, "client_id": req["client_id"],
+    client = store.get_client(t, req["client_id"])
+    if not client:
+        return _oauth_error("invalid_request", "커넥터 등록이 만료됐습니다. Claude/ChatGPT에서 다시 연결해 주세요.")
+    host = urlparse(req["redirect_uri"]).hostname or ""
+    name = _clean_name(client.get("client_name"))
+    gid = "g_" + crypto.random_token(9)
+    store.put_grant(t, uid, gid, req["client_id"], name, host, device.get("invite_hash"))
+    code = crypto.random_token(32)
+    store.put_code(t, crypto.sha256_hex(code), {"uid": uid, "client_id": req["client_id"], "grant_id": gid,
                                                 "redirect_uri": req["redirect_uri"],
                                                 "code_challenge": req["code_challenge"]})
-    if not uid.startswith("p_"):
-        _notify_paired(t, uid, req)
-    log("approve_granted", mode="password" if login else "code")
+    _notify_paired(t, uid, gid, name, host)
+    log("approve_granted")
     query = urlencode({"code": code, **({"state": req["state"]} if req.get("state") else {}), "iss": ISSUER})
     sep = "&" if "?" in req["redirect_uri"] else "?"
     return _json({"redirect_to": f"{req['redirect_uri']}{sep}{query}"})
 
 
-def _notify_paired(t, uid: str, req: dict) -> None:
-    """Let the PC agent log which app its code just connected (a leaked code shows up there)."""
+def _notify_paired(t, uid: str, gid: str, client_name: str, redirect_host: str) -> None:
+    """Tell the PC agent which app its code just connected, so it can show the student (a leaked
+    code shows up there) and name the grant to revoke."""
     conn = store.latest_connection(t, uid)
-    client = store.get_client(t, req["client_id"]) or {}
     if conn:
         try:
-            _post_to_connection(conn, {"type": "paired", "client_name": str(client.get("client_name", ""))[:100],
-                                       "redirect_host": urlparse(req["redirect_uri"]).hostname or ""})
-        except Exception:  # best effort; the grant itself already succeeded
+            _post_to_connection(conn, {"type": "paired", "client_name": client_name, "redirect_host": redirect_host,
+                                       "app": _app_label(redirect_host), "grant_id": gid})
+        except Exception:  # noqa: BLE001 - best effort; the grant itself already succeeded
             log("paired_notice_failed")
 
 
 @mcp.custom_route("/oauth/approve", methods=["POST"])
 async def approve(request: Request) -> Response:
-    try:
-        body = await request.json()
-    except ValueError:
+    if not _same_site(request):
+        log("approve_refused", reason="cross_site")
+        return _oauth_error("access_denied", "승인은 연결 페이지에서만 할 수 있습니다.", 403)
+    body = await _json_object(request)
+    if body is None:
         return _oauth_error("invalid_request", "JSON body required")
-    nonce = str(body.get("nonce", ""))
-    t = store.table()
-    if not store.peek_authreq(t, nonce):
+    nonce, t = body.get("nonce"), store.table()
+    if not isinstance(nonce, str) or not NONCE.fullmatch(nonce) or not store.peek_authreq(t, nonce):
         return _oauth_error("invalid_request", "승인 요청이 만료됐습니다. Claude/ChatGPT에서 다시 연결해 주세요.")
-    if body.get("mode") == "password":
-        if not _password_mode():
-            return _oauth_error("access_denied", "간편 연결은 지금 쓸 수 없습니다. PC 에이전트 연결 코드를 쓰세요.", 403)
-        return await _approve_password(t, nonce, body)
-    code = _normalize_code(str(body.get("code", "")))
+    code = _normalize_code(str(body.get("code") or "")[:32])
     uid = store.take_pair(t, crypto.sha256_hex(code)) if len(code) == 8 else None
-    if not uid or not store.device_key(t, uid):
+    device = store.get_device(t, uid) if uid else None
+    if not device or not _invite_alive(device):
         return _refuse(t, nonce, "연결 코드가 맞지 않거나 만료됐습니다. PC에서 `kw-mcp code`로 새 코드를 받으세요.", "bad_code")
-    return _grant(t, nonce, uid)
+    return _grant(t, nonce, uid, device)
 
 
-async def _approve_password(t, nonce: str, body: dict) -> Response:
-    # The invite is checked before anything reaches KLAS, so the page can't be used to test logins.
-    if not _invite_ok(_invite_token(str(body.get("invite", "")))):
-        return _refuse(t, nonce, "초대 코드가 올바르지 않습니다.", "bad_invite")
-    login_id, secret = str(body.get("login_id", "")).strip(), str(body.get("password", ""))
-    if not (0 < len(login_id) <= 32 and 0 < len(secret) <= 128):
-        return _oauth_error("invalid_request", "학번과 비밀번호를 입력해 주세요.")
-    login = password.Login(crypto.random_token(12), login_id, secret)
-    problem = await password.check(login)
-    if problem:
-        detail = str(problem.get("message") or "")[:200]
-        return _refuse(t, nonce, " ".join(x for x in (detail, _APPROVE_ERRORS.get(problem["error"], _APPROVE_ERRORS["klas_error"])) if x),
-                       problem["error"])
-    return _grant(t, nonce, f"p_{login.cid}", login)
-
-
-def _issue_tokens(uid: str, client_id: str, sealed: str | None = None) -> dict:
+def _issue_tokens(t, grant: dict) -> dict:
+    uid, gid, client_id, expires = grant["uid"], grant["grant_id"], grant["client_id"], int(grant["expires"])
     now = int(time.time())
-    claims = {"iss": ISSUER, "sub": uid, "aud": RESOURCE, "client_id": client_id, "scope": SCOPE,
-              "iat": now, "exp": now + ACCESS_TTL, **({"cred": sealed} if sealed else {})}
-    access = crypto.sign_jwt(_jwt_secret(), claims)
-    refresh = _with_seal(crypto.random_token(32), sealed)
-    store.put_refresh(store.table(), crypto.sha256_hex(refresh), {"uid": uid, "client_id": client_id})
-    return {"access_token": access, "token_type": "Bearer", "expires_in": ACCESS_TTL,
+    exp = min(now + ACCESS_TTL, expires)
+    access = crypto.sign_jwt(_jwt_secret(), {"iss": ISSUER, "sub": uid, "aud": RESOURCE, "client_id": client_id,
+                                             "gid": gid, "scope": SCOPE, "iat": now, "exp": exp})
+    refresh = f"{gid}.{crypto.random_token(32)}"  # the grant id finds its family; the rest is the secret
+    store.put_refresh(t, gid, crypto.sha256_hex(refresh), uid, client_id, expires)
+    store.touch_grant(t, uid, gid)
+    store.touch_client(t, client_id)
+    return {"access_token": access, "token_type": "Bearer", "expires_in": exp - now,
             "refresh_token": refresh, "scope": SCOPE}
+
+
+_BAD_REFRESH = "refresh token is invalid or expired"
+
+
+def _refresh(t, raw: str, client_id: str) -> Response:
+    gid, _, secret = raw.partition(".")
+    if not (GRANT_ID.fullmatch(gid) and secret):
+        return _refresh_legacy(t, raw, client_id)
+    token_hash = crypto.sha256_hex(raw)
+    row = store.get_refresh(t, gid, token_hash)
+    if not row or row.get("client_id") != client_id:
+        return _oauth_error("invalid_grant", _BAD_REFRESH)
+    grant = store.get_grant(t, str(row["uid"]), gid)
+    if not grant or grant.get("client_id") != client_id or not _invite_alive(grant):
+        return _oauth_error("invalid_grant", _BAD_REFRESH)
+    used_at = row.get("rotated_at")
+    if used_at is None:
+        used_at = store.mark_refresh_used(t, gid, token_hash)
+    if used_at is not None and time.time() - int(used_at) > REFRESH_GRACE_S:
+        # A token already exchanged comes back later: one of its holders isn't the client. End the
+        # whole grant; the student approves again with a new code.
+        store.revoke_grant(t, str(row["uid"]), gid)
+        log("refresh_reuse_revoked")
+        return _oauth_error("invalid_grant", _BAD_REFRESH)
+    return _json(_issue_tokens(t, grant))  # first use, or a retry within the grace window
+
+
+def _refresh_legacy(t, raw: str, client_id: str) -> Response:
+    """A refresh token from before grants: move it into a new grant, once."""
+    old = store.take_legacy_refresh(t, crypto.sha256_hex(raw))
+    uid = str((old or {}).get("uid", ""))
+    if not old or old.get("client_id") != client_id or not signing.UID.fullmatch(uid):
+        return _oauth_error("invalid_grant", _BAD_REFRESH)
+    device, client = store.get_device(t, uid), store.get_client(t, client_id)
+    if not device or not client or not _invite_alive(device):
+        return _oauth_error("invalid_grant", _BAD_REFRESH)
+    host = urlparse((client.get("redirect_uris") or [""])[0]).hostname or ""
+    grant = store.put_grant(t, uid, "g_" + crypto.random_token(9), client_id, _clean_name(client.get("client_name")),
+                            host, device.get("invite_hash"))
+    log("legacy_refresh_migrated")
+    return _json(_issue_tokens(t, grant))
 
 
 @mcp.custom_route("/oauth/token", methods=["POST"])
 async def token(request: Request) -> Response:
-    form = await request.form()
-    grant = form.get("grant_type")
+    try:
+        form = await request.form()
+    except Exception:  # noqa: BLE001 - any unreadable body is the client's mistake, not a 500
+        return _oauth_error("invalid_request", "form-encoded body required")
+    grant_type, client_id = form.get("grant_type"), str(form.get("client_id") or "")
+    if grant_type not in ("authorization_code", "refresh_token"):
+        return _oauth_error("unsupported_grant_type", "authorization_code or refresh_token")
     t = store.table()
-    if grant == "authorization_code":
-        raw = str(form.get("code", ""))
-        code = store.take_code(t, crypto.sha256_hex(raw))
-        if not code or code["client_id"] != form.get("client_id") or code["redirect_uri"] != form.get("redirect_uri"):
-            return _oauth_error("invalid_grant", "code is invalid, used, or expired")
-        if not hmac.compare_digest(crypto.pkce_s256(str(form.get("code_verifier", ""))), code["code_challenge"]):
-            return _oauth_error("invalid_grant", "PKCE verification failed")
-        return _json(_issue_tokens(code["uid"], code["client_id"], _sealed_part(raw)))
-    if grant == "refresh_token":
-        raw = str(form.get("refresh_token", ""))
-        old = store.take_refresh(t, crypto.sha256_hex(raw))
-        if not old or old["client_id"] != form.get("client_id") or not _grant_alive(old["uid"]):
-            return _oauth_error("invalid_grant", "refresh token is invalid or expired")
-        return _json(_issue_tokens(old["uid"], old["client_id"], _sealed_part(raw)))
-    return _oauth_error("unsupported_grant_type", "authorization_code or refresh_token")
+    if not CLIENT_ID.fullmatch(client_id) or not store.get_client(t, client_id):
+        # RFC 6749 5.2: MCP clients register again when they see this
+        return _oauth_error("invalid_client", "unknown or expired client; register again", 401)
+    if grant_type == "refresh_token":
+        return _refresh(t, str(form.get("refresh_token") or "")[:200], client_id)
+    raw = str(form.get("code") or "")[:200]
+    code = store.take_code(t, crypto.sha256_hex(raw)) if raw else None
+    if not code or code["client_id"] != client_id or code["redirect_uri"] != form.get("redirect_uri"):
+        return _oauth_error("invalid_grant", "code is invalid, used, or expired")
+    verifier = str(form.get("code_verifier") or "")
+    if not CODE_VERIFIER.fullmatch(verifier) or not hmac.compare_digest(
+            crypto.pkce_s256(verifier).encode(), str(code["code_challenge"]).encode()):
+        return _oauth_error("invalid_grant", "PKCE verification failed")
+    grant = store.get_grant(t, str(code["uid"]), str(code.get("grant_id", "")))
+    if not grant:
+        return _oauth_error("invalid_grant", "this approval was revoked or has expired")
+    return _json(_issue_tokens(t, grant))
 
 
 # --- device endpoints -----------------------------------------------------------------
 
-def _invite_ok(invite: str) -> bool:
+def _invite_ok(invite: str) -> str | None:
+    """The invite's hash if it is on the list."""
     known = json.loads(params.get(INVITES_PARAM, ttl_s=0) or "[]")
     digest = hashlib.sha256(invite.encode()).hexdigest()
-    return any(hmac.compare_digest(digest, k) for k in known)
+    return digest if any(hmac.compare_digest(digest, k) for k in known) else None
 
 
 @mcp.custom_route("/device/register", methods=["POST"])
 async def device_register(request: Request) -> Response:
-    body = await request.json()
-    if not _invite_ok(str(body.get("invite", ""))):
+    body = await _json_object(request)
+    if body is None:
+        return _json({"error": "bad_request"}, 400)
+    invite = body.get("invite")
+    invite_hash = _invite_ok(invite) if isinstance(invite, str) and len(invite) <= 200 else None
+    if not invite_hash:
         log("device_register_refused")
         return _json({"error": "invalid_invite"}, 403)
-    jwk = body.get("public_key") or {}
+    jwk = body.get("public_key")
     try:
         crypto.public_key_from_jwk(jwk)
     except (ValueError, KeyError, TypeError):
         return _json({"error": "invalid_public_key"}, 400)
     uid = "u_" + crypto.random_token(16)
-    store.put_device(store.table(), uid, jwk)
+    store.put_device(store.table(), uid, jwk, invite_hash)
     return _json({"uid": uid, "ws_url": WS_URL, "mcp_url": RESOURCE}, 201)
 
 
-def _signed_device(body: dict, purpose: str) -> str | None:
-    """uid if body carries a fresh device signature over 'kw-<purpose>:<uid>:<ts>'."""
-    uid, ts, sig = str(body.get("uid", "")), str(body.get("ts", "")), str(body.get("sig", ""))
+async def _signed_device(request: Request, purpose: str) -> tuple[dict, dict | None, Response | None]:
+    """(body, device, None) when the body carries a fresh signature over "kw-<purpose>:<uid>:<ts>",
+    else (body, None, refusal). Refusals are listed in signing.py; a stale clock also gets server_time."""
+    body = await _json_object(request)
+    if body is None:
+        return {}, None, _json({"error": "bad_request"}, 400)
+    uid, ts = body.get("uid"), body.get("ts")
     try:
-        fresh = abs(time.time() - int(ts)) <= DEVICE_SKEW_S
-    except ValueError:
-        return None
-    t = store.table()
-    jwk = store.device_key(t, uid) if fresh else None
-    if not jwk or not crypto.verify_device_signature(jwk, f"kw-{purpose}:{uid}:{ts}", sig):
-        log("device_signature_refused", purpose=purpose, fresh=fresh, known_device=bool(jwk))
-        return None
-    if not store.use_once(t, crypto.sha256_hex(sig), DEVICE_SKEW_S * 2):
-        log("device_signature_replayed", purpose=purpose)
-        return None
-    return uid
+        device = signing.check(store.table(), uid, ts, body.get("sig"), (f"kw-{purpose}:{uid}:{ts}",))
+    except signing.Refused as e:
+        log("device_signature_refused", purpose=purpose.split(":")[0], reason=e.error)
+        extra = {"server_time": int(time.time())} if e.status == 401 else {}
+        return body, None, _json({"error": e.error, **extra}, e.status)
+    return body, device, None
 
 
 @mcp.custom_route("/device/pair", methods=["POST"])
 async def device_pair(request: Request) -> Response:
-    uid = _signed_device(await request.json(), "pair")
-    if not uid:
-        return _json({"error": "invalid_signature"}, 403)
+    body, device, refused = await _signed_device(request, "pair")
+    if refused:
+        return refused
+    if not _invite_alive(device):
+        return _json({"error": "invite_revoked"}, 403)
     code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
-    store.put_pair(store.table(), crypto.sha256_hex(code), uid)
+    store.put_pair(store.table(), crypto.sha256_hex(code), body["uid"])
     return _json({"code": f"{code[:4]}-{code[4:]}", "expires_in": store.PAIR_TTL, "mcp_url": RESOURCE})
+
+
+def _kst(epoch: object) -> str | None:
+    return datetime.fromtimestamp(int(epoch), KST).isoformat(timespec="seconds") if epoch else None
+
+
+@mcp.custom_route("/device/grants", methods=["POST"])
+async def device_grants(request: Request) -> Response:
+    """The apps this PC's codes connected, newest first. Also a signed check that mints nothing."""
+    body, _, refused = await _signed_device(request, "grants")
+    if refused:
+        return refused
+    rows = sorted(store.list_grants(store.table(), body["uid"]), key=lambda g: int(g["created"]), reverse=True)
+    return _json({"grants": [{"id": g["grant_id"], "client": g.get("client_name", ""),
+                              "redirect_host": g.get("redirect_host", ""), "created": _kst(g["created"]),
+                              "last_used": _kst(g.get("last_used")), "expires": _kst(g["expires"])} for g in rows]})
+
+
+@mcp.custom_route("/device/revoke", methods=["POST"])
+async def device_revoke(request: Request) -> Response:
+    """End one grant now: its access tokens stop at the next call and its refresh tokens are deleted."""
+    gid = (await _json_object(request) or {}).get("grant_id")  # Starlette keeps the body for the next read
+    if not isinstance(gid, str) or not GRANT_ID.fullmatch(gid):
+        return _json({"error": "bad_request"}, 400)
+    body, _, refused = await _signed_device(request, f"revoke:{gid}")  # signs "kw-revoke:<gid>:<uid>:<ts>"
+    if refused:
+        return refused
+    if not store.revoke_grant(store.table(), body["uid"], gid):
+        return _json({"error": "unknown_grant"}, 404)
+    log("grant_revoked")
+    return _json({"ok": True})
 
 
 @mcp.custom_route("/device/unlink", methods=["POST"])
 async def device_unlink(request: Request) -> Response:
-    uid = _signed_device(await request.json(), "unlink")
-    if not uid:
-        return _json({"error": "invalid_signature"}, 403)
-    store.delete_device(store.table(), uid)
-    _SNAP.pop(uid, None)
+    """Always allowed for the device itself (even with its invite withdrawn): removes the key,
+    connections, every grant and their refresh tokens."""
+    body, _, refused = await _signed_device(request, "unlink")
+    if refused:
+        return refused
+    store.delete_device(store.table(), body["uid"])
+    _SNAP.pop(body["uid"], None)
     return _json({"ok": True})
 
 
 @mcp.custom_route("/device/result", methods=["POST"])
 async def device_result(request: Request) -> Response:
-    body = await request.json()
-    request_id, iv, ct = str(body.get("request_id", "")), str(body.get("iv", "")), str(body.get("ct", ""))
-    if not request_id or not iv or not ct or len(ct) > store.MAX_RESULT_CHARS:
+    """The agent's encrypted answer. Posting the same body again is fine (202): agents retry."""
+    body = await _json_object(request, MAX_RESULT_BYTES)
+    request_id, iv, ct = (body or {}).get("request_id"), (body or {}).get("iv"), (body or {}).get("ct")
+    if not (isinstance(request_id, str) and REQUEST_ID.fullmatch(request_id) and isinstance(iv, str)
+            and IV.fullmatch(iv) and isinstance(ct, str) and 0 < len(ct) <= store.MAX_RESULT_CHARS):
         return _json({"error": "bad_request"}, 400)
     stored = store.put_result(store.table(), request_id, iv, ct)
     return _json({"ok": stored}, 202 if stored else 409)
@@ -865,6 +1049,8 @@ def build_app():
     )
 
     async def app(scope, receive, send):
+        if scope["type"] == "http":
+            _sweep_snap()
         if scope["type"] == "http" and scope["path"].startswith("/c/"):
             if scope["path"].rstrip("/").endswith("/mcp"):  # the public MCP stays on its own API
                 await PlainTextResponse("not found", status_code=404)(scope, receive, send)

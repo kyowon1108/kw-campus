@@ -3,7 +3,7 @@
 Routes (everything else is 404):
   GET  /healthz                      readiness check for the adapter
   POST /c/<token>/mcp                MCP Streamable HTTP, stateless, JSON responses
-  GET  /c/<token>/api/notices        JSON for the local kw-mcp (latest or ?q= search)
+  GET  /c/<token>/api/notices        JSON for the local kw-mcp (latest or ?q= search; ?source= boards)
   GET  /c/<token>/api/menu           cafeteria menu (?date=YYYY-MM-DD, default today KST)
   GET  /c/<token>/api/calendar       academic calendar (?from=&to=, default next 30 days)
 
@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import time
@@ -24,6 +25,7 @@ from typing import Any
 
 import boto3
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.requests import Request
@@ -37,24 +39,40 @@ _PATH = re.compile(r"^/c/([A-Za-z0-9_-]{20,80})(/mcp|/api/notices|/api/menu|/api
 
 INSTRUCTIONS = """\
 광운대학교 공개 공지(www.kw.ac.kr 메인 공지·취업게시판·종합 FAQ, 학과 게시판)를 조회합니다. 비공식 도구이며 제목·날짜·분류·부서·링크만 있습니다.
-- 분류는 일반, 학사, 학생, 봉사, 등록/장학, 입학, 시설, 병무, 외부, 국제교류, 국제학생(메인 공지), 취업(취업게시판), FAQ, 학과 이름(인공지능융합대학, 전자정보공과대학, 전자공학과 등)입니다. "장학", "채용", "국제"도 받습니다.
+- 분류는 일반, 학사, 학생, 봉사, 등록/장학, 입학, 시설, 병무, 외부, 국제교류, 국제학생(메인 공지), 취업(취업게시판), FAQ, 학과 이름(인공지능융합대학, 전자정보공과대학, 전자공학과 등)입니다. "장학금", "채용", "국제", "학과"(모든 학과), 이름 일부("건축")도 받습니다. 없는 분류는 unknown_category 오류와 쓸 수 있는 분류 목록을 돌려줍니다.
+- 분류 없이 받은 최신 목록에는 FAQ가 빠집니다. 여러 학과가 같이 올린 공지는 하나로 묶고 나머지 post_id를 also에 넣습니다.
 - 본문은 없으니 자세한 내용은 url 링크를 안내하세요. 날짜는 한국 시간 기준입니다.
 - 학식(함지마루 주간 식단)과 학사일정(학교 학사일정 페이지)도 조회할 수 있습니다.
 """
 READ_ONLY = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False)
 
-mcp = MCPServer("kw-campus-public", instructions=INSTRUCTIONS)
+mcp = MCPServer("kw-campus-public", instructions=INSTRUCTIONS, log_level="WARNING")
+# The SDK logs every failed tool call at INFO with its arguments' error text. Set explicitly: only
+# the first MCPServer's log_level reaches basicConfig, and this module is imported first.
+logging.getLogger("mcp").setLevel(logging.WARNING)
+
+# Years of calendar the store keeps around today; asking for more never reads more.
+CALENDAR_YEARS_AROUND = 1
 
 
 def _table():
     return boto3.resource("dynamodb").Table(PUBLIC_TABLE)
 
 
-def _date(value: str | None) -> date | None:
-    try:
-        return date.fromisoformat(value) if value else None
-    except ValueError:
+class BadDate(ToolError):
+    """A date that was given but isn't YYYY-MM-DD (never silently treated as "no date")."""
+
+
+def _date(value: str | None, name: str = "date") -> date | None:
+    v = (value or "").strip()
+    if not v:
         return None
+    try:
+        if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", v):
+            return date.fromisoformat(v)
+    except ValueError:
+        pass
+    raise BadDate(f"{name}는 YYYY-MM-DD 형식이어야 합니다(예: 2026-11-01).")
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -66,13 +84,19 @@ def list_notice_categories() -> list[dict[str, Any]]:
 @mcp.tool(annotations=READ_ONLY)
 def latest_notices(category: str | None = None, limit: int = 10, include_pinned: bool = True) -> list[dict[str, Any]]:
     """최신 공지(게시일 역순). category로 분류를 거르고(예: "학사", "장학"), include_pinned=False면 상단 고정 글을 뺍니다."""
-    return public_data.latest(_table(), category, limit, include_pinned)
+    try:
+        return public_data.latest(_table(), category, limit, include_pinned)
+    except public_data.UnknownCategory as e:  # the model should see which labels exist
+        raise ToolError(str(e)) from None
 
 
 @mcp.tool(annotations=READ_ONLY)
 def search_notices(query: str, category: str | None = None, since: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
     """제목·부서에서 검색합니다. 띄어쓴 단어가 모두 들어간 공지만 찾습니다. since는 YYYY-MM-DD(그날 이후 게시)."""
-    return public_data.search(_table(), query, category, _date(since), limit)
+    try:
+        return public_data.search(_table(), query, category, _date(since, "since"), limit)
+    except public_data.UnknownCategory as e:
+        raise ToolError(str(e)) from None
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -91,15 +115,19 @@ def _resolve_day(value: str | None) -> date:
         return today
     if v in ("내일", "tomorrow"):
         return today + timedelta(days=1)
-    if v[0] in _WEEKDAYS:
-        return today - timedelta(days=today.weekday()) + timedelta(days=_WEEKDAYS[v[0]])
-    return _date(v) or today
+    if m := re.fullmatch(r"([월화수목금토일])(?:요일)?", v):  # the next such day, today included
+        return today + timedelta(days=(_WEEKDAYS[m.group(1)] - today.weekday()) % 7)
+    return _date(v, "day")  # not empty here, so a date or BadDate
 
 
 def _events_between(start: date, end: date, query: str | None = None) -> list[dict[str, Any]]:
+    """Events overlapping start..end. One stored item per year, and only years around today are
+    read, so a span like 0001-01-01..9999-12-31 costs three reads, not ten thousand."""
     table = _table()
+    this_year = datetime.now(UTC).astimezone(KST).year
     events = []
-    for year in range(start.year, end.year + 1):
+    for year in range(max(start.year, this_year - CALENDAR_YEARS_AROUND),
+                      min(end.year, this_year + CALENDAR_YEARS_AROUND) + 1):
         events.extend(campus.calendar_events(table, year))
     terms = [t.casefold() for t in (query or "").split()]
     return [e for e in events
@@ -109,7 +137,8 @@ def _events_between(start: date, end: date, query: str | None = None) -> list[di
 
 @mcp.tool(annotations=READ_ONLY)
 def cafeteria_menu(day: str | None = None) -> dict[str, Any]:
-    """함지마루 학식 메뉴. day는 "오늘"(기본), "내일", "월"~"금", 또는 YYYY-MM-DD. 이번 주(또는 저장된 주) 메뉴만 있습니다."""
+    """함지마루 학식 메뉴. day는 "오늘"(기본), "내일", "월"~"금"(오늘부터 가장 가까운 그 요일), 또는 YYYY-MM-DD.
+    이번 주(또는 저장된 주) 메뉴만 있습니다."""
     target = _resolve_day(day)
     found = campus.menu_for(_table(), target)
     return found or {"date": target.isoformat(), "meals": [], "note": "이 날짜의 식단이 없습니다(주말·공휴일이거나 아직 수집 전)."}
@@ -118,10 +147,9 @@ def cafeteria_menu(day: str | None = None) -> dict[str, Any]:
 @mcp.tool(annotations=READ_ONLY)
 def academic_calendar(start: str | None = None, end: str | None = None, query: str | None = None) -> list[dict[str, Any]]:
     """학사일정. start~end(YYYY-MM-DD, 기본: 오늘부터 30일) 사이에 걸친 일정을 돌려줍니다. query로 제목을 거릅니다(예: "수강신청", "기말")."""
-    s = _date(start) or datetime.now(UTC).astimezone(KST).date()
-    e = _date(end) or s + timedelta(days=30)
+    s = _date(start, "start") or datetime.now(UTC).astimezone(KST).date()
+    e = _date(end, "end") or s + timedelta(days=30)
     return _events_between(s, e, query)
-
 
 
 # (loaded_at, hashes); None until the first load. monotonic() can be near 0 in a fresh
@@ -137,23 +165,41 @@ def _token_ok(token: str) -> bool:
     return any(hmac.compare_digest(digest, known) for known in _tokens[1])
 
 
+_BAD_DATE = {"error": "bad_date", "expected": "YYYY-MM-DD"}
+
+
 def _campus_api(kind: str, request: Request) -> JSONResponse:
     q = request.query_params
-    if kind == "/api/menu":
-        return JSONResponse(cafeteria_menu(q.get("date")))
-    return JSONResponse({"events": academic_calendar(q.get("from"), q.get("to"), q.get("q"))})
+    try:
+        if kind == "/api/menu":
+            return JSONResponse(cafeteria_menu(q.get("date")))
+        return JSONResponse({"events": academic_calendar(q.get("from"), q.get("to"), q.get("q"))})
+    except BadDate:
+        return JSONResponse(_BAD_DATE, status_code=400)
 
 
 def _notices_api(request: Request) -> JSONResponse:
     q = request.query_params
     table = _table()
-    limit = int(q.get("limit", "20")) if q.get("limit", "20").isdigit() else 20
-    if q.get("q"):
-        rows = public_data.search(table, q["q"], q.get("category"), _date(q.get("since")), limit)
-    else:  # `since` must hold here too: kw-mcp's "new notices" ask without a query
-        rows = public_data.latest(table, q.get("category"), limit, q.get("pinned", "true") != "false",
-                                  _date(q.get("since")))
-    return JSONResponse({"notices": rows, "source": "www.kw.ac.kr 메인 공지", "unofficial": True})
+    raw_limit = q.get("limit", "")
+    # ASCII digits only: str.isdigit() also passes "²", which int() rejects (a 500 before).
+    limit = int(raw_limit) if re.fullmatch(r"[0-9]{1,3}", raw_limit) else 20
+    # ?source=kw-notice (repeatable) keeps only those boards, before the limit (campus alerts want the main board)
+    sources = tuple(q.getlist("source")) or None
+    if sources and not set(sources) <= set(public_data.SOURCES):
+        return JSONResponse({"error": "unknown_source", "valid": list(public_data.SOURCES)}, status_code=400)
+    try:
+        if q.get("q"):
+            rows = public_data.search(table, q["q"], q.get("category"), _date(q.get("since"), "since"), limit,
+                                      sources=sources)
+        else:  # `since` must hold here too: kw-mcp's "new notices" ask without a query
+            rows = public_data.latest(table, q.get("category"), limit, q.get("pinned", "true") != "false",
+                                      _date(q.get("since"), "since"), sources=sources)
+    except public_data.UnknownCategory as e:
+        return JSONResponse(e.as_dict(), status_code=400)
+    except BadDate:
+        return JSONResponse(_BAD_DATE, status_code=400)
+    return JSONResponse({"notices": rows, "source": "광운대 공개 공지(메인·학과·취업 게시판)", "unofficial": True})
 
 
 def build_app():

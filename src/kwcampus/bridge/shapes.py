@@ -13,8 +13,14 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from kw_mcp.service import CLASS_CHANGE_WORDS as CLASS_CHANGE_WORDS  # re-exported for app.py
-from kw_mcp.service import is_lecture, period_time, schedule_note  # shared with the PC agent: one definition
+from kw_mcp.service import (  # shared with the PC agent: one definition
+    is_lecture,
+    parse_due,  # "23:59" is open through 23:59:59, as in kw-mcp
+    period_time,
+    schedule_note,
+)
+from kw_mcp.text import html_to_text
+from mcp.server.mcpserver.exceptions import ToolError
 
 from kwcampus.config import KST
 
@@ -60,15 +66,30 @@ def _int(value: Any) -> int | None:
         return None
 
 
+def _norm(text: str | None) -> str:
+    return re.sub(r"\s+", "", text or "").casefold()
+
+
 def _matches(name: str | None, course: str | None) -> bool:
-    return course is None or course.casefold() in (name or "").casefold()
+    """kw_mcp.service's rule: case- and space-insensitive substring; None matches everything."""
+    return course is None or _norm(course) in _norm(name)
+
+
+def _courses(snap: dict, course: str | None) -> list[dict]:
+    """The snapshot's courses matching `course`. A filter that matches none is an error naming the
+    courses there are (kw-mcp says the same), never an empty list the model takes as "nothing due"."""
+    all_courses = snap.get("courses", [])
+    found = [c for c in all_courses if _matches(c.get("subjNm"), course)]
+    if course and not found:
+        names = ", ".join(c.get("subjNm") or "?" for c in all_courses)
+        raise ToolError(f"'{course}'와 일치하는 과목이 없습니다. 이 학기 과목: {names}")
+    return found
 
 
 def _rows(snap: dict, key: str, course: str | None):
-    for c in snap.get("courses", []):
-        if _matches(c.get("subjNm"), course):
-            for row in (snap.get("sections", {}).get(c.get("subj"), {}) or {}).get(key, []) or []:
-                yield c, row
+    for c in _courses(snap, course):
+        for row in (snap.get("sections", {}).get(c.get("subj"), {}) or {}).get(key, []) or []:
+            yield c, row
 
 
 def courses(snap: dict) -> list[dict]:
@@ -132,7 +153,8 @@ def quizzes(snap: dict, course: str | None = None, pending_only: bool = False) -
 
 
 def course_posts(snap: dict, course: str | None = None) -> list[dict]:
-    return [{"course": n.get("subjNm"), "board": n.get("typeNm"), "title": n.get("title"),
+    _courses(snap, course)  # an unknown course is an error; a known one with no posts is just []
+    return [{"course": n.get("subjNm"), "board": n.get("typeNm"), "title": html_to_text(n.get("title")),
              "posted": fmt_kst(n.get("registDt"))}
             for n in snap.get("course_posts", []) if _matches(n.get("subjNm"), course)]
 
@@ -142,7 +164,7 @@ def deadlines(snap: dict, now: datetime, days: int = 7) -> dict:
     until = now + timedelta(days=days)
     items = []
     for a in assignments(snap, pending_only=True):
-        due, late_due = parse_kst(a["due"]), parse_kst(a["late_due"])
+        due, late_due = parse_due(a["due"]), parse_due(a["late_due"])
         if due and now <= due <= until:
             items.append({"kind": "assignment", **a})
         elif due and late_due and due < now <= late_due:
@@ -151,7 +173,7 @@ def deadlines(snap: dict, now: datetime, days: int = 7) -> dict:
                        ("quiz", quizzes(snap, pending_only=True)),
                        ("team_project", [p for p in projects(snap) if not p["submitted"]])):
         for row in rows:
-            due, late_due = parse_kst(row["due"]), parse_kst(row.get("late_due"))
+            due, late_due = parse_due(row["due"]), parse_due(row.get("late_due"))
             if due and now <= due <= until:
                 items.append({"kind": kind, **row})
             elif due and late_due and due < now <= late_due:  # team projects have late windows too

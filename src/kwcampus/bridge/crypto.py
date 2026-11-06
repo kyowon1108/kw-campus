@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 
 from cryptography.exceptions import InvalidSignature, InvalidTag
@@ -24,6 +25,15 @@ def b64u_decode(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
+def b64u_decode_strict(text: object) -> bytes | None:
+    """Only the one spelling b64u() writes: no '=' padding, no '+' or '/', no stray low bits in
+    the last character. Anything else is None, so one value can't arrive in several forms."""
+    if not isinstance(text, str) or not re.fullmatch(r"[A-Za-z0-9_-]*", text) or len(text) % 4 == 1:
+        return None
+    raw = base64.b64decode(text + "=" * (-len(text) % 4), altchars=b"-_", validate=True)
+    return raw if b64u(raw) == text else None
+
+
 def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -35,23 +45,44 @@ def random_token(nbytes: int = 32) -> str:
 # --- device signatures (WebCrypto ECDSA P-256 / SHA-256, raw r||s) ---------------
 
 def public_key_from_jwk(jwk: dict) -> ec.EllipticCurvePublicKey:
-    if jwk.get("kty") != "EC" or jwk.get("crv") != "P-256":
+    if not isinstance(jwk, dict) or jwk.get("kty") != "EC" or jwk.get("crv") != "P-256":
         raise ValueError("expected an EC P-256 public key")
-    x = int.from_bytes(b64u_decode(jwk["x"]), "big")
-    y = int.from_bytes(b64u_decode(jwk["y"]), "big")
-    return ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1()).public_key()
+    x, y = b64u_decode_strict(jwk.get("x")), b64u_decode_strict(jwk.get("y"))
+    if x is None or y is None or len(x) != 32 or len(y) != 32:
+        raise ValueError("x and y must be 32-byte base64url values")
+    return ec.EllipticCurvePublicNumbers(int.from_bytes(x, "big"), int.from_bytes(y, "big"),
+                                         ec.SECP256R1()).public_key()
 
 
-def verify_device_signature(jwk: dict, message: str, signature_b64u: str) -> bool:
-    raw = b64u_decode(signature_b64u)
-    if len(raw) != 64:
+def _signature_rs(signature_b64u: object) -> tuple[int, int] | None:
+    """(r, s) of a raw r||s signature: exactly 86 base64url characters, canonical spelling."""
+    if not isinstance(signature_b64u, str) or len(signature_b64u) != 86:
+        return None
+    raw = b64u_decode_strict(signature_b64u)
+    if raw is None or len(raw) != 64:
+        return None
+    return int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big")
+
+
+def verify_device_signature(jwk: dict, message: str, signature_b64u: object) -> bool:
+    rs = _signature_rs(signature_b64u)
+    if rs is None:
         return False
-    der = encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big"))
     try:
-        public_key_from_jwk(jwk).verify(der, message.encode(), ec.ECDSA(hashes.SHA256()))
+        public_key_from_jwk(jwk).verify(encode_dss_signature(*rs), message.encode(), ec.ECDSA(hashes.SHA256()))
         return True
-    except (InvalidSignature, ValueError):
+    except (InvalidSignature, ValueError, TypeError):
         return False
+
+
+def signature_replay_key(signature_b64u: str) -> str:
+    """Replay-guard key of a verified signature: a hash of its r value. r is the same for every
+    spelling of the signature and for its (r, n - s) twin, which also verifies (WebCrypto signs
+    high-s too, so s can't simply be required low)."""
+    rs = _signature_rs(signature_b64u)
+    if rs is None:
+        raise ValueError("not a device signature")
+    return hashlib.sha256(b"kw-sig-r:" + rs[0].to_bytes(32, "big")).hexdigest()
 
 
 # --- per-request result encryption (AES-256-GCM) ----------------------------------

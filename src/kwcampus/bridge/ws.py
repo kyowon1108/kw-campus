@@ -1,40 +1,37 @@
-"""Lambda for the bridge WebSocket API: the extension's always-on connection.
+"""Lambda for the bridge WebSocket API: the PC agent's always-on connection.
 
-$connect requires ?uid=&ts=&sig= where sig is the device's ECDSA signature over
-"kw-connect:<uid>:<ts>" and ts is within five minutes. $default answers pings.
+$connect requires ?uid=&ts=&sig=&v= where sig is the device's ECDSA signature over
+"kw-connect:<uid>:<ts>:<v>" (v is the agent's protocol version) and ts is within five minutes.
+Refusals use the status codes in signing.py. $default answers pings.
 """
 
 from __future__ import annotations
 
-import time
-
-from kwcampus.bridge import crypto, store
+from kwcampus.bridge import signing, store
 from kwcampus.obs import log
 
-MAX_SKEW_S = 300
 
-
-def handler(event, context):  # noqa: ARG001
+def handler(event, context):
     ctx = event.get("requestContext", {})
     route, conn = ctx.get("routeKey"), ctx.get("connectionId")
     t = store.table()
     if route == "$connect":
         q = event.get("queryStringParameters") or {}
-        uid, ts, sig = q.get("uid", ""), q.get("ts", ""), q.get("sig", "")
+        uid, ts, v = q.get("uid", ""), q.get("ts", ""), q.get("v", "")
+        # TODO(2027-03-01): drop the unversioned form. Agents before 1.0 sign "kw-connect:<uid>:<ts>",
+        # leaving v outside the signature; they update themselves within a day of a release.
+        messages = [f"kw-connect:{uid}:{ts}:{v}", f"kw-connect:{uid}:{ts}"]
         try:
-            fresh = abs(time.time() - int(ts)) <= MAX_SKEW_S
-        except ValueError:
-            fresh = False
-        jwk = store.device_key(t, uid) if fresh else None
-        if not jwk or not crypto.verify_device_signature(jwk, f"kw-connect:{uid}:{ts}", sig) \
-                or not store.use_once(t, crypto.sha256_hex(sig), MAX_SKEW_S * 2):
-            log("ws_connect_denied", fresh=fresh, known_device=bool(jwk))
-            return {"statusCode": 401}
+            signing.check(t, uid, ts, q.get("sig", ""), messages)
+        except signing.Refused as e:
+            log("ws_connect_denied", reason=e.error)
+            return {"statusCode": e.status}
         try:
-            version = max(1, min(int(q.get("v", "1")), 99))
+            version = max(1, min(int(v or "1"), 99))
         except ValueError:
             version = 1
         store.add_connection(t, uid, conn, version)
+        store.touch_device(t, uid)
         log("ws_connected")
         return {"statusCode": 200}
     if route == "$disconnect":
