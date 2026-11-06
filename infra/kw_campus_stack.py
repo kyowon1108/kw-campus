@@ -20,10 +20,9 @@ from constructs import Construct
 
 # Weekdays 09:00-18:59 KST, every 20 minutes (30 runs a day).
 COLLECT_SCHEDULE = "cron(0/20 9-18 ? * MON-FRI *)"
-# One more look on weekday evenings and weekend noons: closures and class cancellations are often
-# posted the evening before (에브리타임, 2026-11), and a Friday-evening notice otherwise waits until Monday.
-EXTRA_COLLECT_SCHEDULES = {"CollectEveningSchedule": ("kw-collector-evening", "cron(0 21 ? * MON-FRI *)"),
-                           "CollectWeekendSchedule": ("kw-collector-weekend", "cron(0 12 ? * SAT,SUN *)")}
+# One more look on weekday evenings: closures and class cancellations are often posted the evening
+# before (에브리타임, 2026-11). No weekend run: none of the first 309 notices was posted on a weekend.
+EXTRA_COLLECT_SCHEDULES = {"CollectEveningSchedule": ("kw-collector-evening", "cron(0 21 ? * MON-FRI *)")}
 # Weekdays 07:30 KST: cafeteria menu / academic calendar refresh (0-2 requests).
 CAMPUS_SCHEDULE = "cron(30 7 ? * MON-FRI *)"
 # Lambda Web Adapter (arm64) in ap-northeast-2; serves uvicorn behind Lambda.
