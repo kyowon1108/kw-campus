@@ -24,8 +24,10 @@ CHANNELS = {"notice": "201", "academic": "202", "scholarship": "203", "career": 
 class FakeDiscord:
     """Just enough of a guild for discord_setup: roles, channels, overwrites, messages."""
 
-    def __init__(self, bot_perms: int = ds.BOT_RUNTIME | ds.MANAGE_CHANNELS, notifications: int = 1):
+    def __init__(self, bot_perms: int = ds.BOT_RUNTIME | ds.MANAGE_CHANNELS, notifications: int = 1,
+                 shift: bool = True):
         self.notifications = notifications
+        self.shift = shift  # False: new roles share position 1 with whatever is there, as the live server did
         self.roles = [
             {"id": GUILD, "name": "@everyone", "permissions": str(EVERYONE_PERMS), "position": 0},
             {"id": BOT_ROLE, "name": "KW Campus", "permissions": str(bot_perms), "position": 2, "managed": True},
@@ -68,7 +70,7 @@ class FakeDiscord:
         if (method, path) == ("GET", f"/guilds/{GUILD}/members/{BOT}"):
             return {"user": {"id": BOT}, "roles": [BOT_ROLE]}
         if (method, path) == ("POST", f"/guilds/{GUILD}/roles"):
-            for r in self.roles[1:]:
+            for r in self.roles[1:] if self.shift else []:
                 r["position"] += 1  # new roles go to the bottom, just above @everyone
             role = {"id": self._id(), "position": 1, "managed": False, **body}
             self.roles.append(role)
@@ -236,6 +238,25 @@ def test_an_unsafe_existing_role_stops_everything(ssm):
     assert "'취업 알림' (960)은 버튼으로 나눠 줄 수 없습니다" in out
     with pytest.raises(ssm.exceptions.ParameterNotFound):
         ssm.get_parameter(Name="/kw/discord/roles")
+
+
+def test_roles_sharing_the_bots_position_rank_by_id(ssm):
+    # the live server: the bot role at 1, every new role also at 1 (newer, so below the bot role)
+    api = FakeDiscord(shift=False)
+    api.roles[1]["position"] = 1
+    code, out = run(api, ssm, apply=True)
+    assert code == 0, out
+    assert {r["position"] for r in api.roles if r["name"].endswith("알림")} == {1}
+    api.writes.clear()
+    code, out = run(api, ssm, apply=True)
+    assert code == 0 and api.writes == [] and "바꿀 것이 없습니다" in out, out
+
+    # a role at the same position but older than the bot role ranks above it
+    api = FakeDiscord()
+    api.roles[1]["position"] = 1
+    api.roles.append({"id": "800", "name": "학사 알림", "permissions": "0", "position": 1})
+    code, out = run(api, ssm, apply=True)
+    assert code == 1 and "'학사 알림' (800)은 버튼으로 나눠 줄 수 없습니다" in out
 
 
 def test_a_channel_hidden_from_everyone_stays_hidden(ssm):

@@ -145,6 +145,12 @@ def _get_param(ssm, name: str, decrypt: bool = False) -> str | None:
         return None
 
 
+def _rank(role: dict) -> tuple[int, int]:
+    """Discord's role order: a higher position is above; at the same position the older role (smaller id) is.
+    New roles can land at the bot role's own position, which still leaves them below it."""
+    return int(role.get("position", 0)), -int(role["id"])
+
+
 def _merge(existing: dict | None, allow: int, deny: int) -> tuple[int, int]:
     """The overwrite after setup: our bits forced, every other bit left as it was."""
     old_allow = int(existing["allow"]) if existing else 0
@@ -203,7 +209,7 @@ class Setup:
         own = 0
         for r in bot_roles:
             own |= int(r["permissions"])
-        top = max((int(r["position"]) for r in bot_roles), default=0)
+        top = max((_rank(r) for r in bot_roles), default=(0, 0))
         mode = "적용(--apply)" if self.apply else "계획만 보기(dry-run)"
         self.out(f"Discord 서버: {guild.get('name')} ({guild_id}) · 봇: {me.get('username')} ({bot_id}) · {mode}")
 
@@ -266,7 +272,7 @@ class Setup:
             self.out(f"    aws ssm put-parameter --region {REGION} --name {name} --type String --overwrite "
                      f"--value '{value}'")
 
-    def _roles(self, guild_id: str, roles: list[dict], saved: dict, top: int) -> dict[str, str] | None:
+    def _roles(self, guild_id: str, roles: list[dict], saved: dict, top: tuple[int, int]) -> dict[str, str] | None:
         """Topic → role id. None (and nothing written) when an existing role is unsafe to hand out:
         anyone who clicks its button would get it."""
         self.out("\n[구독 역할]")
@@ -275,7 +281,7 @@ class Setup:
         found = {t.key: by_id.get(str((saved.get("roles") or {}).get(t.key))) or by_name.get(t.role) for t in TOPICS}
         unsafe = [(t, r) for t in TOPICS if (r := found[t.key]) and (
             int(r.get("permissions", 0)) or r.get("managed") or str(r["id"]) == guild_id
-            or int(r.get("position", 0)) >= top)]
+            or _rank(r) >= top)]
         for topic, role in unsafe:
             self.step("!", f"'{role['name']}' ({role['id']})은 버튼으로 나눠 줄 수 없습니다: 권한이 있거나, 연동 역할이거나, "
                            f"봇 역할보다 위에 있습니다. 권한을 비우고 봇 역할 아래로 내리거나 이름을 바꾼 뒤 다시 실행하세요.")
