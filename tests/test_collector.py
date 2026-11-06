@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from kwcampus import collector, politeness
 from kwcampus.fetch import FetchResult
 from kwcampus.kwnotice.source import NOTICE_HOST
@@ -81,3 +83,62 @@ def test_daily_cap(aws):
         assert politeness.acquire(aws["public"], "example.org", t, daily_cap=3).granted
         t += timedelta(minutes=2)
     assert politeness.acquire(aws["public"], "example.org", t, daily_cap=3).reason == "daily_cap"
+
+
+def test_rows_with_an_unknown_category_are_counted_and_never_block_www(aws, capsys):
+    enable(aws)
+    relabelled = FIXTURE
+    for label in ("학사", "일반", "학생", "봉사", "등록/장학", "입학", "시설", "병무", "외부", "국제교류", "국제학생"):
+        relabelled = relabelled.replace(f"[{label}]", "[코로나19]")
+    t = NOW
+    for _ in range(4):  # a week where page 1 is all the new label: www must stay on
+        result = collector.run(t, aws["public"], fetch=lambda u: FetchResult(relabelled, None, 200))
+        assert result == {"status": "no_rows", "issues": 4}
+        t += timedelta(minutes=20)
+    out = capsys.readouterr().out
+    assert '"collector_row_issues"' in out and '"unknown_category": 4' in out and '"RowIssues": 4' in out
+    assert politeness.acquire(aws["public"], NOTICE_HOST, t, daily_cap=44).granted
+
+
+def test_a_missing_main_page_backs_off_the_main_board_only(aws):
+    enable(aws)
+    result = collector.run(NOW, aws["public"], fetch=lambda u: FetchResult(None, "http_failure", 404))
+    assert result == {"status": "blocked", "reason": "http_failure"}
+    assert politeness.acquire(aws["public"], NOTICE_HOST, NOW + timedelta(minutes=2), daily_cap=44).granted
+    calls = []
+    later = collector.run(NOW + timedelta(minutes=20), aws["public"], fetch=lambda u: calls.append(u))
+    assert later == {"status": "skipped", "reason": "backing_off"} and calls == []
+
+
+def test_a_main_board_error_still_lets_the_other_servers_run(aws, monkeypatch):
+    from kwcampus import aicon, deptboards, wixfeeds, wwwboards
+
+    enable(aws)
+    seen = {}
+
+    def boom(now, table, **kw):
+        raise RuntimeError("DynamoDB InternalServerError")
+
+    def extra(name):
+        def collect(now, table, clock=None, time_left=None):
+            seen[name] = (clock() - now).total_seconds() < 5
+            return {"status": "ok"}
+        return collect
+
+    monkeypatch.setattr(collector, "run", boom)
+    for name, module in (("aicon", aicon), ("dept", deptboards), ("wix", wixfeeds), ("www", wwwboards)):
+        monkeypatch.setattr(module, "collect", extra(name))
+    monkeypatch.setattr(collector.boto3, "resource", lambda name: type("R", (), {"Table": lambda self, n: aws["public"]})())
+    out = collector.handler({}, None)
+    assert out == {"status": "error", "aicon": {"status": "ok"}, "dept": {"status": "ok"}, "wix": {"status": "ok"},
+                   "www": {"status": "ok"}}
+    assert seen == dict.fromkeys(("aicon", "dept", "wix", "www"), True)  # each got the real clock
+
+
+def test_without_the_kill_switch_a_main_board_error_runs_nothing_else(aws, monkeypatch):
+    from kwcampus import aicon
+
+    monkeypatch.setattr(collector, "run", lambda now, table, **kw: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr(aicon, "collect", lambda *a, **kw: pytest.fail("ran without the switch"))
+    monkeypatch.setattr(collector.boto3, "resource", lambda name: type("R", (), {"Table": lambda self, n: aws["public"]})())
+    assert collector.handler({}, None) == {"status": "error"}

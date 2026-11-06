@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from kwcampus import dispatcher, politeness, public_data, wwwboards
-from kwcampus.config import KST
+from kwcampus.config import KST, WWW_DAILY_CAP
 from kwcampus.fetch import FetchResult
 from kwcampus.kwnotice.source import NOTICE_HOST
 
@@ -104,7 +104,7 @@ def test_a_block_cools_down_www_for_the_main_board_too(aws):
                             sleep=clock.sleep)
     assert out == {"status": "blocked", "board": "kw-job", "reason": "forbidden"}
     later = NOW + timedelta(minutes=20)
-    assert politeness.acquire(table, NOTICE_HOST, later, daily_cap=40).reason == "cooldown"
+    assert politeness.acquire(table, NOTICE_HOST, later, daily_cap=WWW_DAILY_CAP).reason == "cooldown"
 
 
 def test_job_posts_alert_the_career_channel_and_faq_never_alerts(aws):
@@ -156,8 +156,59 @@ def test_an_old_job_post_coming_back_is_not_announced_again(aws):
     first = [i for i in table.scan()["Items"] if i["PK"] == "SRC#kw-job" and i["SK"].startswith("N#")]
     victim = first[-1]
     table.delete_item(Key={"PK": victim["PK"], "SK": victim["SK"]})  # as if its TTL ran out
-    later = NOW + timedelta(hours=3)
+    later = NOW + timedelta(days=121)  # ... 120 days after it was first seen, so it was posted long ago
     clock.now = later
     wwwboards.collect(later, table, fetch=site([]), clock=clock, sleep=clock.sleep)
     back = table.get_item(Key={"PK": victim["PK"], "SK": victim["SK"]})["Item"]
     assert back["seed"] is True  # stored quietly, no second Discord alert
+
+
+def test_a_blocked_job_path_escalates_and_switches_off_while_the_main_board_goes_on(aws):
+    table, at = aws["public"], NOW
+    outcomes = []
+
+    def blocked_job(url):
+        return FetchResult(None, "forbidden", 403) if "job.jsp" in url else FetchResult(PAGES["faq"], None, 200)
+
+    for _ in range(40):  # the WAF blocks /ko/life/job.jsp only; the main board succeeds every run
+        main_board_request(table, at)
+        politeness.record_success(table, NOTICE_HOST)
+        clock = Clock(at + timedelta(seconds=61))
+        out = wwwboards.collect(at, table, fetch=blocked_job, clock=clock, sleep=clock.sleep)
+        outcomes.append(out["status"] if out.get("board") != "kw-faq" else "faq")
+        at += timedelta(hours=1)
+    assert outcomes.count("blocked") == 3  # 2 h, then 4 h of rest between tries; the third switches it off
+    state = table.get_item(Key={"PK": "SRC#kw-job", "SK": "STATE"})["Item"]
+    assert state["disabled"] is True and state["hard_blocks"] == 3
+
+
+def test_a_missing_job_page_does_not_pause_www(aws):
+    table = aws["public"]
+    clock = Clock(NOW)
+    out = wwwboards.collect(NOW, table, fetch=lambda url: FetchResult(None, "http_failure", 404), clock=clock,
+                            sleep=clock.sleep)
+    assert out == {"status": "failed", "board": "kw-job", "reason": "http_failure"}
+    assert politeness.acquire(table, NOTICE_HOST, NOW + timedelta(minutes=2), daily_cap=WWW_DAILY_CAP).granted
+
+
+def test_a_weekday_stays_well_under_the_www_cap(aws, monkeypatch):
+    """A December weekday (the busiest: menu, calendar and next year's calendar due) with every run."""
+    from kwcampus import campus, collector
+
+    aws["ssm"].put_parameter(Name="/kw/collector/enabled", Value="true", Type="String")
+    table = aws["public"]
+    main_page = (FIXTURES / "board_list_live_shape_sanitized.html").read_text()
+    monkeypatch.setattr(campus, "fetch_list_page", lambda url, form=None: FetchResult(
+        (FIXTURES / "cafeteria_week.html").read_text() if "facility11" in url
+        else (FIXTURES / "academic_calendar_2026.html").read_text(), None, 200))
+    day = datetime(2026, 11, 30, 15, 0, tzinfo=UTC)  # Tuesday 1 December 00:00 KST
+    clock = Clock(day + timedelta(hours=7, minutes=30))
+    campus.run(clock(), table, clock=clock, sleep=clock.sleep)
+    runs = [day + timedelta(hours=9, minutes=20 * n) for n in range(30)] + [day + timedelta(hours=21)]
+    for at in runs:
+        clock = Clock(at)
+        collector.run(at, table, fetch=lambda url: FetchResult(main_page, None, 200), clock=clock)
+        clock.sleep(1)
+        wwwboards.collect(at, table, fetch=site([]), clock=clock, sleep=clock.sleep)
+    used = int(politeness.state(table, NOTICE_HOST)["day_count"])
+    assert used <= 40 < WWW_DAILY_CAP

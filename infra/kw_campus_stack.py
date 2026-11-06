@@ -23,7 +23,7 @@ COLLECT_SCHEDULE = "cron(0/20 9-18 ? * MON-FRI *)"
 # One more look on weekday evenings: closures and class cancellations are often posted the evening
 # before (에브리타임, 2026-11). No weekend run: none of the first 309 notices was posted on a weekend.
 EXTRA_COLLECT_SCHEDULES = {"CollectEveningSchedule": ("kw-collector-evening", "cron(0 21 ? * MON-FRI *)")}
-# Weekdays 07:30 KST: cafeteria menu / academic calendar refresh (0-2 requests).
+# Weekdays 07:30 KST: cafeteria menu / academic calendar refresh (0-2 www requests a run).
 CAMPUS_SCHEDULE = "cron(30 7 ? * MON-FRI *)"
 # Lambda Web Adapter (arm64) in ap-northeast-2; serves uvicorn behind Lambda.
 LWA_LAYER = "arn:aws:lambda:ap-northeast-2:753240598075:layer:LambdaAdapterLayerArm64:30"
@@ -77,7 +77,8 @@ class KwCampusStack(cdk.Stack):
         env = {"KW_PUBLIC_TABLE": public.table_name, "KW_DELIVERY_TABLE": delivery.table_name}
 
         def fn(name: str, handler: str, timeout: int, extra_env: dict | None = None,
-               memory: int = 256, layers: list | None = None, retries: int | None = None) -> lambda_.Function:
+               memory: int = 256, layers: list | None = None, retries: int | None = None,
+               concurrency: int | None = None, max_event_age: cdk.Duration | None = None) -> lambda_.Function:
             log_group = logs.LogGroup(
                 self, f"{name}Logs",
                 log_group_name=f"/aws/lambda/kw-{name.lower()}",
@@ -97,11 +98,17 @@ class KwCampusStack(cdk.Stack):
                 log_group=log_group,
                 layers=layers,
                 retry_attempts=retries,
+                reserved_concurrent_executions=concurrency,
+                max_event_age=max_event_age,
             )
 
-        # up to four 15 s fetches plus the 61 s wait before www's second request
-        # retries=0: a failed or slow run must not hit the school's servers again a minute later
-        collector = fn("Collector", "kwcampus.collector.handler", 150, retries=0)
+        # Up to 8 requests a run (www, E1-E4, two Wix hosts, www again after a 61 s wait), each
+        # bounded by fetch.WORST_CASE_S; a collector with less time left than that skips its request.
+        # retries=0: a failed or slow run must not hit the school's servers again a minute later.
+        # One at a time: a manual run can never overlap a scheduled one (the 60 s gap holds), and a
+        # run held back by that is dropped after 5 minutes instead of retried for hours.
+        collector = fn("Collector", "kwcampus.collector.handler", 150, retries=0, concurrency=1,
+                       max_event_age=cdk.Duration.minutes(5))
         dispatcher = fn("Dispatcher", "kwcampus.dispatcher.handler", 30, {"KW_DISCORD_QUEUE_URL": queue.queue_url})
         sender = fn("DiscordSender", "kwcampus.discord.handler", 60)
         campus = fn("Campus", "kwcampus.campus.handler", 150, retries=0)
@@ -251,8 +258,25 @@ class KwCampusStack(cdk.Stack):
         five_min = cdk.Duration.minutes(5)
         for f in (collector, dispatcher, sender, interactions, campus, public_mcp, bridge, bridge_ws):
             alarm(f"{f.node.id.lower()}-errors", f.metric_errors(period=five_min))
+        # hard blocks only (403, 429, a challenge page); transient failures go to NeedsHuman after 6 in a row
         alarm("collector-blocked", cw.Metric(namespace="KwCampus", metric_name="Blocked",
                                              statistic="Sum", period=cdk.Duration.minutes(20)))
+        # every run that skips a switched-off origin counts, so this stays in ALARM until a human
+        # re-enables it (scripts/collector_admin.py reenable)
+        alarm("collector-origin-disabled", cw.Metric(namespace="KwCampus", metric_name="OriginDisabled",
+                                                     statistic="Sum", period=cdk.Duration.hours(1)))
+        # a switched-off source, a robots.txt Disallow, or six transient failures in a row
+        alarm("collector-needs-human", cw.Metric(namespace="KwCampus", metric_name="NeedsHuman",
+                                                 statistic="Sum", period=cdk.Duration.hours(1)))
+        # one board's own failures (404, a redirect, a changed page) back off that board only
+        alarm("collector-source-failed", cw.Metric(namespace="KwCampus", metric_name="SourceFailed",
+                                                   statistic="Sum", period=cdk.Duration.hours(6)), threshold=3)
+        # a board's highest post number went down: its newest post was deleted, or it renumbered
+        alarm("collector-uid-regressed", cw.Metric(namespace="KwCampus", metric_name="UidRegressed",
+                                                   statistic="Sum", period=cdk.Duration.hours(6)))
+        # main-board rows with a 분류 the parser doesn't know (a new category): not stored until handled
+        alarm("collector-row-issues", cw.Metric(namespace="KwCampus", metric_name="RowIssues",
+                                                statistic="Sum", period=cdk.Duration.hours(3)))
         # a board that answers but parses to nothing: its layout changed, or a block page we don't recognise
         alarm("collector-parse-empty", cw.Metric(namespace="KwCampus", metric_name="ParseEmpty",
                                                  statistic="Sum", period=cdk.Duration.hours(3)), threshold=3)

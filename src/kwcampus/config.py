@@ -21,14 +21,27 @@ DISCORD_PUBLIC_KEY_PARAM = "/kw/discord/public-key"  # the app's Ed25519 public 
 # Written by scripts/discord_setup.py: {"guild": id, "roles": {topic: role_id}, "menu": {"channel", "message"}}
 DISCORD_ROLES_PARAM = "/kw/discord/roles"
 
+# Lambda requests leave from shared AWS addresses, so this is how a school admin finds us: what the
+# project is and a page with the contact and opt-out. Never a personal e-mail address here.
+COLLECTOR_VERSION = "1.0"
+CONTACT_URL = "https://l9doaodgw6.execute-api.ap-northeast-2.amazonaws.com/privacy"
 USER_AGENT = (
-    "kw-campus/0.1 (+https://github.com/kyowon1108/kw-notice-mcp; "
+    f"kw-campus/{COLLECTOR_VERSION} (+https://github.com/kyowon1108/kw-campus; contact {CONTACT_URL}; "
     "student non-commercial notice alerts)"
 )
 
 NOTICE_SOURCE = "kw-notice"  # the www.kw.ac.kr main notice board
 NOTICE_TTL = timedelta(days=120)
-DELIVERY_TTL = timedelta(days=120)
+# Longer than the notices themselves, so a takedown can still find the Discord message of a notice
+# until the notice is gone (scripts/collector_admin.py takedown).
+DELIVERY_TTL = timedelta(days=150)
+# After the first seed, a post not stored before is new if it was posted this recently, whatever its
+# number (boards renumber, a row can fail to parse once); older ones are stored quietly.
+NEW_POST_WINDOW = timedelta(days=14)
+# www.kw.ac.kr's requests a KST day, shared by the main board, the 취업게시판/FAQ and the campus
+# Lambda. A weekday uses at most 41: main board 31 (30 daytime runs + 21:00), job board 6, FAQ 1,
+# campus 1-2 (3 on the first December weekday before the calendar runs drift apart).
+WWW_DAILY_CAP = 44
 # A pinned post seen for the first time is only announced if it is this recent.
 PINNED_MAX_AGE = timedelta(days=3)
 

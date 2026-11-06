@@ -98,3 +98,17 @@ def test_discord_interactions_have_their_own_api_and_least_privilege(tmp_path):
     assert "ssm:GetParameters" in policy  # one call for all three
     t.has_resource_properties("AWS::CloudWatch::Alarm", {"AlarmName": "kw-discord-buttons-failed",
                                                          "MetricName": "InteractionFailed"})
+
+
+def test_collector_runs_one_at_a_time_and_disabled_origins_alarm(tmp_path):
+    t = template(tmp_path)
+    t.has_resource_properties("AWS::Lambda::Function", {"FunctionName": "kw-collector",
+                                                        "ReservedConcurrentExecutions": 1})
+    t.has_resource_properties("AWS::Lambda::EventInvokeConfig", {"MaximumEventAgeInSeconds": 300,
+                                                                 "MaximumRetryAttempts": 0})
+    names = {a["Properties"]["AlarmName"]: a["Properties"].get("MetricName")
+             for a in t.find_resources("AWS::CloudWatch::Alarm").values()}
+    assert names["kw-collector-origin-disabled"] == "OriginDisabled"
+    assert names["kw-collector-needs-human"] == "NeedsHuman"
+    assert names["kw-collector-row-issues"] == "RowIssues" and names["kw-collector-uid-regressed"] == "UidRegressed"
+    assert names["kw-collector-source-failed"] == "SourceFailed"

@@ -5,13 +5,17 @@ A group: list `<page>.php?BoardMode=list&BOARD_CODE=<code>&CURRENT_PAGE=1`, post
 B group (the aicon-style engine): list `<page>.php`, post `?admin_mode=read&no=<n>`, rows in
 `table.board_list` or `table.board-list`, pinned rows without a number.
 Page 1 shows every pinned post plus the newest normal ones, and some departments post new items
-mostly as pinned, so pinned rows are read too and newness is decided by the post number: above the
-highest seen before means new; a lower one that turns up (a post sliding back onto page 1, or one
-re-added after the TTL) is stored quietly.
+mostly as pinned, so pinned rows are read too. A post not stored before is new when its number is
+above the highest on the last page read, or when it was posted in the last 14 days (a board that
+renumbered, a row that failed to parse once); an older one turning up (a post sliding back onto
+page 1, or one re-added after the TTL) is stored quietly. A page whose highest number went down is
+logged (UidRegressed): a deleted newest post or a renumbered board.
 
 The school sites sit on four outside servers, many host names each, so the politeness gate is per
 server: one request per collector run, to the server's board checked least recently (round-robin).
-E3 also serves the 인공지능융합대학 widget (aicon.py), which goes first and takes every other run.
+E3 also serves the 인공지능융합대학 widget (aicon.py); the widget and E3's boards take turns.
+A board's own trouble (404, a redirect, a changed page) backs off only that board; 403/429/a
+challenge page and connection failures or 5xx count for the server (politeness.py).
 
 Each board is its own source ("SRC#dept-<key>"): ids stay distinct and seeding is per board.
 The 전자정보공과대학 notice is mirrored on every department site; it is collected once, from ei.
@@ -21,13 +25,15 @@ To add a board, append a row to BOARDS. Department names live only there (they c
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from bs4 import BeautifulSoup
 
 from kwcampus import politeness, store
-from kwcampus.fetch import fetch_list_page
+from kwcampus.config import KST, NEW_POST_WINDOW
+from kwcampus.fetch import WORST_CASE_S, empty_reason, fetch_list_page
 from kwcampus.kwnotice.domain import CategoryId, CategoryName, NoticeSummary
 from kwcampus.kwnotice.redaction import redact_text
 from kwcampus.kwnotice.values import DUID, SourceURL
@@ -42,6 +48,7 @@ SERVER_E4 = "114.203.87.122"  # chemng, sports
 # <boards on its server> runs: E1 and E2 (8 boards) every 2h40m, E4 (2) every 40 min, and E3's
 # 5 boards share the runs the aicon widget leaves (every other one), so every 3h20m.
 DAILY_CAP = 32  # one request per server per run: 30 daytime weekday runs + 21:00 (+ a spare)
+BOARD_BACKOFF = timedelta(hours=2)  # a board's own failures: 2 h, 4 h, ... up to 24 h
 
 
 @dataclass(frozen=True)
@@ -171,6 +178,11 @@ def _state_key(board: Board) -> dict[str, str]:
     return {"PK": store.source_pk(board.source), "SK": "STATE"}
 
 
+def round_size(server: str) -> int:
+    """Requests in one full round of a server: its boards, plus the aicon widget on E3."""
+    return sum(b.server == server for b in BOARDS) + (1 if server == SERVER_E3 else 0)
+
+
 def _empty_streak(table, server: str, step: int | None) -> int:
     """Consecutive answers from `server` that parsed to no rows; step None resets it."""
     key = {"PK": f"DEPTSERVER#{server}", "SK": "STATE"}
@@ -182,52 +194,100 @@ def _empty_streak(table, server: str, step: int | None) -> int:
     return int(item["Attributes"]["empty_streak"])
 
 
-def collect(now: datetime, table, fetch=fetch_list_page) -> dict[str, object]:
-    """One request per server: {server: result}."""
-    return {server: _collect_server(server, now, table, fetch) for server in dict.fromkeys(b.server for b in BOARDS)}
+def note_empty(table, server: str, now: datetime) -> int:
+    """One more empty answer from `server` (a board or the aicon widget). A whole round of them is
+    likely a block page we don't recognise, so the server backs off (a transient failure)."""
+    streak = _empty_streak(table, server, +1)
+    if streak >= round_size(server):
+        _empty_streak(table, server, None)
+        politeness.record_block(table, server, now, "no_rows_everywhere")
+    return streak
 
 
-def _collect_server(server: str, now: datetime, table, fetch) -> dict[str, object]:
-    permit = politeness.acquire(table, server, now, daily_cap=DAILY_CAP)
+def note_answer(table, server: str) -> None:
+    _empty_streak(table, server, None)
+
+
+def collect(now: datetime, table, fetch=fetch_list_page, clock: Callable[[], datetime] | None = None,
+            time_left: Callable[[], float] | None = None) -> dict[str, object]:
+    """One request per server: {server: result}. clock gives the time of each request (the run's
+    start by default); time_left (Lambda seconds) skips a server rather than be cut off mid-request."""
+    clock = clock or (lambda: now)
+    out: dict[str, object] = {}
+    for server in dict.fromkeys(b.server for b in BOARDS):
+        try:
+            out[server] = _collect_server(server, now, table, fetch, clock, time_left)
+        except Exception as e:  # noqa: BLE001 - one server's trouble must not cost the others their turn
+            log("dept_error", server=server, error=e.__class__.__name__)
+            out[server] = {"status": "error"}
+    return out
+
+
+def _collect_server(server: str, now: datetime, table, fetch, clock, time_left) -> dict[str, object]:
+    if time_left is not None and time_left() < WORST_CASE_S:
+        return {"status": "skipped", "reason": "no_time"}
+    boards = [b for b in BOARDS if b.server == server]
+    states = {b.key: table.get_item(Key=_state_key(b), ConsistentRead=True).get("Item") or {} for b in boards}
+    for b in boards:
+        if states[b.key].get("disabled"):
+            politeness.source_skipped(b.source, states[b.key])
+    allowed = [b for b in boards if politeness.robots_allows(b.list_url)]
+    for b in set(boards) - set(allowed):
+        politeness.robots_skip(b.source, b.list_url)
+    ready = [b for b in allowed if not politeness.source_waiting(states[b.key], now)]
+    if not ready:
+        return {"status": "skipped", "reason": "no_board_due"}
+    permit = politeness.acquire(table, server, clock(), daily_cap=DAILY_CAP, by="board")
     if not permit.granted:
         log("dept_skip", server=server, reason=permit.reason)
         return {"status": "skipped", "reason": permit.reason}
-    boards = [b for b in BOARDS if b.server == server]
-    states = {b.key: table.get_item(Key=_state_key(b), ConsistentRead=True).get("Item") or {} for b in boards}
-    board = min(boards, key=lambda b: int(states[b.key].get("checked_at", 0)))  # ties: list order
+    board = min(ready, key=lambda b: int(states[b.key].get("checked_at", 0)))  # ties: list order
     state = states[board.key]
     table.update_item(Key=_state_key(board), UpdateExpression="SET checked_at = :now",
                       ExpressionAttributeValues={":now": int(now.timestamp())})
 
     result = fetch(board.list_url, encoding=board.encoding, errors="replace")
     records = parse_board(result.html, board) if result.html else []
-    if result.block_reason:
-        blocked = politeness.record_block(table, server, now, result.block_reason)
-        log("dept_blocked", board=board.key, reason=result.block_reason, status=result.status, **blocked)
-        metrics(DeptFetched=1, Blocked=1)
-        return {"status": "blocked", "board": board.key, "reason": result.block_reason}
-    if not records:  # this board's page changed; the server answered, so its other boards go on
-        streak = _empty_streak(table, server, +1)
+    reason = result.block_reason or (None if records else empty_reason(result.html))
+    if reason in politeness.HARD or (reason and not politeness.is_server_signal(reason)):
+        failed = politeness.source_failed(table, _state_key(board), state, now, reason, BOARD_BACKOFF)
+        log("dept_board_failed", board=board.key, reason=reason, status=result.status, **failed)
+    if reason in politeness.HARD or reason in ("transport_failure", "server_error", "slow"):
+        blocked = politeness.record_block(table, server, clock(), reason, result.retry_after)
+        log("dept_blocked", board=board.key, reason=reason, status=result.status, **blocked)
+        metrics(DeptFetched=1, Blocked=int(reason in politeness.HARD), Transient=int(reason not in politeness.HARD))
+        return {"status": "blocked", "board": board.key, "reason": reason}
+    if reason == "no_rows":  # this board's page changed; the server answered, so its other boards go on
+        streak = note_empty(table, server, clock())
         log("dept_no_rows", board=board.key, status=result.status, streak=streak)
         metrics(DeptFetched=1, ParseEmpty=1)
-        if streak >= len(boards):  # a whole round with nothing: likely a block page we don't recognise
-            _empty_streak(table, server, None)
-            politeness.record_block(table, server, now, "no_rows_everywhere")
         return {"status": "no_rows", "board": board.key}
-    _empty_streak(table, server, None)
+    if reason:  # 404, a redirect, an unexpected page: only this board waits (source_failed above)
+        metrics(DeptFetched=1)
+        return {"status": "failed", "board": board.key, "reason": reason}
+    note_answer(table, server)
 
     seeded = bool(state.get("seeded_at"))
     high = int(state.get("max_uid", 0))
+    today = now.astimezone(KST).date()
+    page_max = max(int(r.duid) for r in records)
     counts = {"inserted": 0, "updated": 0, "unchanged": 0}
+    quiet_inserts = 0
     for record in records:
-        quiet = not seeded or int(record.duid) <= high
-        counts[store.upsert(table, store.notice_item(board.source, record, now, seed=quiet))] += 1
+        quiet = not seeded or (int(record.duid) <= high and today - record.posted_date > NEW_POST_WINDOW)
+        outcome = store.upsert(table, store.notice_item(board.source, record, now, seed=quiet))
+        counts[outcome] += 1
+        quiet_inserts += int(outcome == "inserted" and quiet and seeded)
+    if seeded and page_max < high:  # the newest post is gone, or the board renumbered: start from this page
+        log("dept_uid_regressed", board=board.key, page_max=page_max, high=high)
+        metrics(UidRegressed=1)
     table.update_item(
         Key=_state_key(board),
         UpdateExpression="SET seeded_at = if_not_exists(seeded_at, :now), max_uid = :max",
-        ExpressionAttributeValues={":now": int(now.timestamp()), ":max": max(high, *(int(r.duid) for r in records))},
+        ExpressionAttributeValues={":now": int(now.timestamp()), ":max": page_max if seeded else max(high, page_max)},
     )
     politeness.record_success(table, server)
-    log("dept_ok", board=board.key, rows=len(records), seeded_now=not seeded, **counts)
+    politeness.source_ok(table, _state_key(board), state)
+    log("dept_ok", board=board.key, rows=len(records), seeded_now=not seeded, quiet_inserts=quiet_inserts, **counts)
     metrics(DeptFetched=1, Inserted=counts["inserted"])
     return {"status": "ok", "board": board.key, "rows": len(records), "seed_run": not seeded, **counts}

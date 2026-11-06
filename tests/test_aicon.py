@@ -47,6 +47,7 @@ def test_collect_seeds_quietly_then_inserts_new_posts(aws):
     assert len(items) == 5 and all(i["seed"] for i in items)  # baseline: no alerts for what was already there
 
     newer = WIDGET.replace("no=3516", "no=3517").replace("[공지] 2026년 졸업작품", "[공지] 새 공지")
+    deptboards.collect(NOW + timedelta(minutes=20), table, fetch=lambda url, **kw: FetchResult(BOARD_PAGE, None, 200))
     second = aicon.collect(NOW + timedelta(minutes=40), table, fetch=lambda url: FetchResult(newer, None, 200))
     assert second["inserted"] == 1 and second["seed_run"] is False
     new = table.get_item(Key={"PK": "SRC#aicon", "SK": "N#3517"})["Item"]
@@ -133,15 +134,88 @@ def test_department_alerts_fall_back_to_the_notice_channel():
 
 def test_scheduled_run_survives_a_department_site_failure(aws, monkeypatch):
     aws["ssm"].put_parameter(Name="/kw/collector/enabled", Value="true", Type="String")
-    monkeypatch.setattr(collector, "run", lambda now, table: {"status": "ok"})
+    monkeypatch.setattr(collector, "run", lambda now, table, **kw: {"status": "ok"})
 
-    def boom(now, table):
+    def boom(now, table, **kw):
         raise RuntimeError("aicon down")
 
     monkeypatch.setattr(aicon, "collect", boom)
-    monkeypatch.setattr(deptboards, "collect", lambda now, table: {"status": "ok"})
-    monkeypatch.setattr(wixfeeds, "collect", lambda now, table: {"status": "not_due"})
-    monkeypatch.setattr(wwwboards, "collect", lambda now, table: {"status": "not_due"})
+    monkeypatch.setattr(deptboards, "collect", lambda now, table, **kw: {"status": "ok"})
+    monkeypatch.setattr(wixfeeds, "collect", lambda now, table, **kw: {"status": "not_due"})
+    monkeypatch.setattr(wwwboards, "collect", lambda now, table, **kw: {"status": "not_due"})
     monkeypatch.setattr(collector.boto3, "resource", lambda name: type("R", (), {"Table": lambda self, n: aws["public"]})())
     assert collector.handler({}, None) == {"status": "ok", "aicon": {"status": "error"}, "dept": {"status": "ok"},
                                            "wix": {"status": "not_due"}, "www": {"status": "not_due"}}
+
+
+def test_a_broken_widget_backs_off_alone_and_never_stops_e3(aws):
+    # The widget answers 404 all day; E3's boards answer normally.
+    table, calls = aws["public"], []
+
+    def fake(url, **kw):
+        calls.append(url)
+        return FetchResult(None, "http_failure", 404) if url == aicon.WIDGET_URL else FetchResult(BOARD_PAGE, None, 200)
+
+    at = NOW
+    for _ in range(12):  # four hours of runs, the widget first as in the collector
+        aicon.collect(at, table, fetch=fake)
+        deptboards.collect(at, table, fetch=fake)
+        at += timedelta(minutes=20)
+    widget = [n for n, u in enumerate(calls) if u == aicon.WIDGET_URL]
+    boards = [u for u in calls if u in {b.list_url for b in E3}]
+    assert len(widget) == 3 and len(boards) == 9  # the widget waits 40, then 80 min; the boards take the rest
+    gate = politeness.state(table, aicon.SERVER)
+    assert not gate.get("disabled") and not gate.get("blocks") and not gate.get("cooldown_until")
+    state = table.get_item(Key={"PK": "SRC#aicon", "SK": "STATE"})["Item"]
+    assert state["fails"] == 3 and state["last_fail"] == "http_failure"
+
+
+def test_widget_and_boards_alternate_on_evening_runs_too(aws):
+    table, calls = aws["public"], []
+
+    def fake(url, **kw):
+        calls.append(url)
+        return FetchResult(WIDGET if url == aicon.WIDGET_URL else BOARD_PAGE, None, 200)
+
+    evening = datetime(2026, 11, 5, 12, 0, tzinfo=UTC)  # 21:00 KST
+    for day in range(4):  # four weekday evenings, 2h20m+ after the last daytime run
+        at = evening + timedelta(days=day)
+        aicon.collect(at, table, fetch=fake)
+        deptboards.collect(at, table, fetch=fake)
+    e3 = [u for u in calls if u == aicon.WIDGET_URL or u in {b.list_url for b in E3}]
+    assert e3 == [aicon.WIDGET_URL, E3[0].list_url, aicon.WIDGET_URL, E3[1].list_url]
+
+
+def test_a_server_block_still_counts_for_e3(aws):
+    table = aws["public"]
+    out = aicon.collect(NOW, table, fetch=lambda url: FetchResult(None, "rate_limit", 429, 3600))
+    assert out == {"status": "blocked", "reason": "rate_limit"}
+    assert politeness.acquire(table, aicon.SERVER, NOW + timedelta(minutes=50), daily_cap=32).reason == "cooldown"
+
+
+def test_empty_widget_counts_toward_e3s_empty_round(aws):
+    table, at = aws["public"], NOW
+    empty = FetchResult("<html><body>점검 중</body></html>", None, 200)
+    for _ in range(3):  # the widget and E3's boards all come back empty: a whole round is 6 answers
+        aicon.collect(at, table, fetch=lambda url: empty)
+        deptboards.collect(at, table, fetch=lambda url, **kw: empty)
+        at += timedelta(minutes=20)
+        aicon.collect(at, table, fetch=lambda url: empty)
+        deptboards.collect(at, table, fetch=lambda url, **kw: empty)
+        at += timedelta(minutes=20)
+    assert politeness.acquire(table, aicon.SERVER, at, daily_cap=32).reason == "cooldown"
+
+
+def test_only_this_sites_notice_links_count_and_urls_are_rebuilt():
+    rows = (
+        '<li><a href="https://evil.example/x/administration/notice.php?admin_mode=read&no=99">컴퓨터정보공학부 가짜 2026.11.05</a></li>'
+        '<li><a href="//evil.example/administration/notice.php?admin_mode=read&no=98">로봇학부 가짜 2026.11.05</a></li>'
+        '<li><a href="javascript:alert(1)//administration/notice.php?admin_mode=read&no=97">가짜 2026.11.05</a></li>'
+        '<li><a href="../administration/notice.php?admin_mode=read&no=96">소프트웨어학부 날짜 오류 2026.02.30</a></li>'
+        '<li><a href="../administration/notice.php?admin_mode=read&no=95">소프트웨어학부 진짜 공지 2026.11.05</a></li>'
+        '<li><a href="https://aicon.kw.ac.kr/administration/notice.php?admin_mode=read&no=94">정보융합학부 진짜 2026.11.04</a></li>'
+    )
+    parsed = aicon.parse_widget(f"<html><body><ul>{rows}</ul></body></html>")
+    assert [(r.duid, r.source_url) for r in parsed] == [
+        ("95", "https://aicon.kw.ac.kr/administration/notice.php?admin_mode=read&no=95"),
+        ("94", "https://aicon.kw.ac.kr/administration/notice.php?admin_mode=read&no=94")]

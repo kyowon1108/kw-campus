@@ -7,12 +7,16 @@ www.envkw.com (환경공학과) is a Wix site too but has no /blog-feed.xml (404
 An <item> gives the Wix post id (guid, 24 hex digits), title, link and pubDate. The feed lists
 the newest 20 posts, oldest from years ago, so newness is by pubDate: published after the newest
 item seen before means new; an older one (back after the 120-day TTL, say) is stored quietly.
+A pubDate ahead of the run (Wix lets authors edit it) is announced but never moves that mark past
+the run's own time, so it cannot silence the real new posts until its date; one more than a day
+ahead is logged (wix_future_date).
 Each feed is its own source ("SRC#dept-<key>"), and the first fetch only seeds.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -20,7 +24,7 @@ from xml.etree import ElementTree
 
 from kwcampus import politeness, store
 from kwcampus.config import KST
-from kwcampus.fetch import fetch_list_page
+from kwcampus.fetch import WORST_CASE_S, fetch_list_page
 from kwcampus.kwnotice.domain import CategoryId, CategoryName, NoticeSummary
 from kwcampus.kwnotice.redaction import redact_text
 from kwcampus.kwnotice.values import DUID, SourceURL
@@ -29,7 +33,8 @@ from kwcampus.obs import log, metrics
 EVERY = timedelta(hours=2)
 # The schedule fires every 20 minutes; a few seconds of start jitter must not push a check a slot later.
 SLACK = timedelta(minutes=5)
-DAILY_CAP = 7  # every 2 hours over the 09:00-18:40 runs is 5 a day, plus the 21:00 run
+DAILY_CAP = 7  # every 2 hours over the 09:00-18:40 runs is 5 a day, plus the 21:00 run (+ a spare)
+FUTURE_SLACK = timedelta(days=1)
 TYPES = ("application/rss+xml", "application/xml", "text/xml")
 _GUID = re.compile(r"[0-9a-f]{24}")
 
@@ -98,16 +103,31 @@ def _state_key(feed: Feed) -> dict[str, str]:
     return {"PK": store.source_pk(feed.source), "SK": "STATE"}
 
 
-def collect(now: datetime, table, fetch=fetch_list_page) -> dict[str, object]:
+def collect(now: datetime, table, fetch=fetch_list_page, clock: Callable[[], datetime] | None = None,
+            time_left: Callable[[], float] | None = None) -> dict[str, object]:
     """At most one request per feed host: {feed key: result}."""
-    return {feed.key: _collect_feed(feed, now, table, fetch) for feed in FEEDS}
+    clock = clock or (lambda: now)
+    out: dict[str, object] = {}
+    for feed in FEEDS:
+        try:
+            out[feed.key] = _collect_feed(feed, now, table, fetch, clock, time_left)
+        except Exception as e:  # noqa: BLE001 - one feed's trouble must not cost the other its turn
+            log("wix_error", feed=feed.key, error=e.__class__.__name__)
+            out[feed.key] = {"status": "error"}
+    return out
 
 
-def _collect_feed(feed: Feed, now: datetime, table, fetch) -> dict[str, object]:
+def _collect_feed(feed: Feed, now: datetime, table, fetch, clock, time_left) -> dict[str, object]:
     state = table.get_item(Key=_state_key(feed), ConsistentRead=True).get("Item") or {}
     if now.timestamp() - int(state.get("checked_at", 0)) < (EVERY - SLACK).total_seconds():
         return {"status": "not_due"}
-    permit = politeness.acquire(table, feed.host, now, daily_cap=DAILY_CAP)
+    if not politeness.robots_allows(feed.url):
+        return politeness.robots_skip(feed.source, feed.url)
+    if politeness.source_waiting(state, now):
+        return politeness.source_skipped(feed.source, state)
+    if time_left is not None and time_left() < WORST_CASE_S:
+        return {"status": "skipped", "reason": "no_time"}
+    permit = politeness.acquire(table, feed.host, clock(), daily_cap=DAILY_CAP)
     if not permit.granted:
         log("wix_skip", feed=feed.key, reason=permit.reason)
         return {"status": "skipped", "reason": permit.reason}
@@ -116,11 +136,18 @@ def _collect_feed(feed: Feed, now: datetime, table, fetch) -> dict[str, object]:
 
     result = fetch(feed.url, types=TYPES)
     items = parse_feed(result.html, feed) if result.html else []
-    if result.block_reason:
-        blocked = politeness.record_block(table, feed.host, now, result.block_reason)
-        log("wix_blocked", feed=feed.key, reason=result.block_reason, status=result.status, **blocked)
-        metrics(WixFetched=1, Blocked=1)
-        return {"status": "blocked", "reason": result.block_reason}
+    reason = result.block_reason
+    if reason in politeness.HARD or (reason and not politeness.is_server_signal(reason)):
+        politeness.source_failed(table, _state_key(feed), state, now, reason, EVERY)
+    if reason in politeness.HARD or reason in ("transport_failure", "server_error", "slow"):
+        blocked = politeness.record_block(table, feed.host, clock(), reason, result.retry_after)
+        log("wix_blocked", feed=feed.key, reason=reason, status=result.status, **blocked)
+        metrics(WixFetched=1, Blocked=int(reason in politeness.HARD), Transient=int(reason not in politeness.HARD))
+        return {"status": "blocked", "reason": reason}
+    if reason:  # 404, a redirect, not a feed: this feed waits (2 h, 4 h, ...)
+        log("wix_failed", feed=feed.key, reason=reason, status=result.status)
+        metrics(WixFetched=1)
+        return {"status": "failed", "reason": reason}
     if not items:
         log("wix_no_rows", feed=feed.key, status=result.status)
         metrics(WixFetched=1, ParseEmpty=1)
@@ -128,16 +155,21 @@ def _collect_feed(feed: Feed, now: datetime, table, fetch) -> dict[str, object]:
 
     seeded = bool(state.get("seeded_at"))
     high = int(state.get("max_published", 0))
+    cap = int(now.timestamp())
     counts = {"inserted": 0, "updated": 0, "unchanged": 0}
     for published, record in items:
+        if published > int((now + FUTURE_SLACK).timestamp()):
+            log("wix_future_date", feed=feed.key, post=str(record.duid), days_ahead=(published - int(now.timestamp())) // 86400)
         quiet = not seeded or published <= high
         counts[store.upsert(table, store.notice_item(feed.source, record, now, seed=quiet))] += 1
     table.update_item(
         Key=_state_key(feed),
         UpdateExpression="SET seeded_at = if_not_exists(seeded_at, :now), max_published = :max",
-        ExpressionAttributeValues={":now": int(now.timestamp()), ":max": max(high, *(p for p, _ in items))},
+        ExpressionAttributeValues={":now": int(now.timestamp()),
+                                   ":max": max(min(high, cap), *(min(p, cap) for p, _ in items))},
     )
     politeness.record_success(table, feed.host)
+    politeness.source_ok(table, _state_key(feed), state)
     log("wix_ok", feed=feed.key, rows=len(items), seeded_now=not seeded, **counts)
     metrics(WixFetched=1, Inserted=counts["inserted"])
     return {"status": "ok", "rows": len(items), "seed_run": not seeded, **counts}

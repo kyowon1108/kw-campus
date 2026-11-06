@@ -82,8 +82,11 @@ def test_euc_kr_board_decodes(monkeypatch):
     class Response:
         status, headers = 200, {"Content-Type": "text/html; charset=euc-kr"}
 
-        def read(self, limit):
-            return raw
+        done = False
+
+        def read1(self, limit):
+            body, self.done = (b"" if self.done else raw), True
+            return body
 
         def __enter__(self):
             return self
@@ -101,32 +104,44 @@ def test_euc_kr_board_decodes(monkeypatch):
     assert ENGLISH.list_url == "https://english.kw.ac.kr/new/bulletin/notice.php?BoardMode=list&BOARD_CODE=notice&CURRENT_PAGE=1"
 
 
-def test_a_cdnjs_stylesheet_is_not_a_challenge(monkeypatch):
-    # ingenium.kw.ac.kr's <head> loads Font Awesome from cdnjs.cloudflare.com; a real challenge still counts.
-    link = '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.1.2/css/all.min.css" />'
-    pages = {"ingenium": EE_PAGE.replace("<head>", "<head>" + link),
-             "challenge": EE_PAGE.replace("<head>", "<head><title>Just a moment...</title>" + link + "<p>cf-chl-opt</p>")}
+def _opener(body):
+    class Response:
+        status, headers = 200, {"Content-Type": "text/html; charset=utf-8"}
+        done = False
 
-    def opener(body):
-        class Response:
-            status, headers = 200, {"Content-Type": "text/html; charset=utf-8"}
+        def read1(self, limit):
+            chunk, self.done = (b"" if self.done else body.encode()), True
+            return chunk
 
-            def read(self, limit):
-                return body.encode()
+        def __enter__(self):
+            return self
 
-            def __enter__(self):
-                return self
+        def __exit__(self, *exc):
+            return False
 
-            def __exit__(self, *exc):
-                return False
+    return type("Opener", (), {"open": lambda self, request, timeout: Response()})()
 
-        return type("Opener", (), {"open": lambda self, request, timeout: Response()})()
 
-    monkeypatch.setattr(fetch, "_opener", opener(pages["ingenium"]))
+def test_challenge_markers_count_only_on_a_page_without_rows(aws, monkeypatch):
+    # ingenium.kw.ac.kr's <head> loads Font Awesome from cdnjs.cloudflare.com; another site may add
+    # Cloudflare Web Analytics or mention Akamai. A page that has its rows is never a challenge.
+    head = ('<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.1.2/css/all.min.css" />'
+            '<script defer src="https://static.cloudflareinsights.com/beacon.min.js"></script>'
+            '<meta name="description" content="security check, access denied, akamai, captcha 안내">')
+    monkeypatch.setattr(fetch, "_opener", _opener(EE_PAGE.replace("<head>", "<head>" + head)))
     result = fetch.fetch_list_page(BOARD["ingenium"].list_url, errors="replace")
     assert result.block_reason is None and deptboards.parse_board(result.html, BOARD["ingenium"])
-    monkeypatch.setattr(fetch, "_opener", opener(pages["challenge"]))
-    assert fetch.fetch_list_page(BOARD["ingenium"].list_url).block_reason == "captcha"
+
+    # A real challenge page has none of the board's rows: the collector names it a captcha (a hard block).
+    challenge = ("<html><head><title>Just a moment...</title></head><body>"
+                 "<div id='challenge-platform'></div><script>window._cf_chl_opt={cf-chl-opt}</script></body></html>")
+    assert fetch.is_challenge(challenge) and fetch.empty_reason(challenge) == "captcha"
+    assert fetch.empty_reason("<html><body>새 디자인</body></html>") == "no_rows"
+    monkeypatch.setattr(deptboards, "BOARDS", (BOARD["ingenium"],))
+    out = deptboards.collect(NOW, aws["public"], fetch=page(challenge))[deptboards.SERVER_E3]
+    assert out == {"status": "blocked", "board": "ingenium", "reason": "captcha"}
+    assert politeness.acquire(aws["public"], deptboards.SERVER_E3, NOW + timedelta(minutes=20),
+                              daily_cap=deptboards.DAILY_CAP).reason == "cooldown"
 
 
 def test_numbers_with_commas_are_normal_rows():
@@ -282,18 +297,18 @@ def test_handler_runs_the_main_board_first_and_isolates_each_collector(aws, monk
     aws["ssm"].put_parameter(Name="/kw/collector/enabled", Value="true", Type="String")
     order = []
 
-    def main(now, table):
+    def main(now, table, **kw):
         order.append("main")
         return {"status": "ok"}
 
     def failing(name):
-        def collect(now, table):
+        def collect(now, table, **kw):
             order.append(name)
             raise RuntimeError(f"{name} down")
         return collect
 
     def not_due(name):
-        def collect(now, table):
+        def collect(now, table, **kw):
             order.append(name)
             return {"status": "not_due"}
         return collect
@@ -326,3 +341,103 @@ def test_a_whole_round_of_empty_pages_backs_the_server_off(aws):
         deptboards.collect(at, table, fetch=empty)
         at += timedelta(minutes=20)
     assert not politeness.acquire(table, EE.server, at, daily_cap=deptboards.DAILY_CAP).granted  # cooling down
+
+
+def test_one_broken_board_does_not_cool_the_server_down(aws, monkeypatch):
+    # 화학공학과 moved its list page: a redirect, then 404s. 스포츠융합과학과 on the same server goes on.
+    monkeypatch.setattr(deptboards, "BOARDS", (CHEMNG, SPORTS))
+    table, calls = aws["public"], []
+
+    def fake(url, **kw):
+        calls.append(url)
+        return FetchResult(None, "redirect", 302) if url == CHEMNG.list_url else FetchResult(SPORTS_PAGE, None, 200)
+
+    at = NOW
+    for _ in range(6):
+        deptboards.collect(at, table, fetch=fake)
+        at += timedelta(minutes=20)
+    assert calls[:2] == [CHEMNG.list_url, SPORTS.list_url]
+    assert calls.count(CHEMNG.list_url) == 1 and calls.count(SPORTS.list_url) == 5  # chemng waits 2 h
+    gate = politeness.state(table, deptboards.SERVER_E4)
+    assert not gate.get("cooldown_until") and not gate.get("disabled")
+    chemng = table.get_item(Key={"PK": "SRC#dept-chemng", "SK": "STATE"})["Item"]
+    assert chemng["fails"] == 1 and chemng["last_fail"] == "redirect"
+
+
+def test_transient_failures_never_switch_a_server_off(aws, monkeypatch):
+    monkeypatch.setattr(deptboards, "BOARDS", (CHEMNG, SPORTS))
+    table, at = aws["public"], NOW
+    for _ in range(12):  # E4 unreachable for four hours
+        deptboards.collect(at, table, fetch=lambda url, **kw: FetchResult(None, "transport_failure", 0))
+        at += timedelta(minutes=20)
+    assert not politeness.state(table, deptboards.SERVER_E4).get("disabled")
+    at += timedelta(hours=6)
+    assert deptboards.collect(at, table, fetch=page(SPORTS_PAGE))[deptboards.SERVER_E4]["status"] == "ok"
+
+
+def test_new_posts_by_date_even_below_the_highest_number(aws, monkeypatch):
+    # A row whose date cell failed to parse once (UID 700) while a higher one (701) went in.
+    monkeypatch.setattr(deptboards, "BOARDS", (EE,))
+    table = aws["public"]
+    deptboards.collect(NOW, table, fetch=page(EE_PAGE))  # seed
+    first = EE_PAGE.replace("UID=646&", "UID=701&")
+    deptboards.collect(NOW + timedelta(minutes=20), table, fetch=page(first))
+    second = first.replace("UID=628&", "UID=700&").replace("2026-02-25", "2026-11-05")
+    deptboards.collect(NOW + timedelta(minutes=40), table, fetch=page(second))
+    rows = notices(table, "dept-ee")
+    assert rows["701"]["seed"] is False and rows["700"]["seed"] is False  # posted today: announced
+
+
+def test_a_renumbered_board_is_logged_and_rebased(aws, monkeypatch, capsys):
+    monkeypatch.setattr(deptboards, "BOARDS", (SPORTS,))
+    table = aws["public"]
+    deptboards.collect(NOW, table, fetch=page(SPORTS_PAGE))  # numbers up to 69
+    renumbered = (SPORTS_PAGE.replace("no=69&", "no=9&").replace("no=68&", "no=8&").replace("no=67&", "no=7&")
+                  .replace("no=66&", "no=6&").replace("2026-08-24", "2026-11-04"))
+    capsys.readouterr()
+    deptboards.collect(NOW + timedelta(minutes=40), table, fetch=page(renumbered))
+    out = capsys.readouterr().out
+    assert '"dept_uid_regressed"' in out and '"UidRegressed": 1' in out
+    assert table.get_item(Key={"PK": "SRC#dept-sports", "SK": "STATE"})["Item"]["max_uid"] == 9
+    rows = notices(table, "dept-sports")
+    assert rows["9"]["seed"] is False and rows["6"]["seed"] is True  # new post vs. an old one renumbered
+
+
+def test_a_reposted_pinned_post_refreshes_its_date_and_ttl(aws, monkeypatch):
+    # 전자공학과 re-uses UID 631 each term: new title, new 등록일.
+    monkeypatch.setattr(deptboards, "BOARDS", (EE,))
+    table = aws["public"]
+    deptboards.collect(NOW, table, fetch=page(EE_PAGE))
+    before = notices(table, "dept-ee")["631"]
+    assert before["norm_v"] == 2 and before["title_key"]
+    reposted = EE_PAGE.replace("2026-2학기", "2027-1학기").replace("2026-09-04", "2026-11-09")
+    later = NOW + timedelta(days=10)
+    out = deptboards.collect(later, table, fetch=page(reposted))[deptboards.SERVER_E1]
+    assert out["updated"] == 1
+    after = notices(table, "dept-ee")["631"]
+    assert after["posted_date"] == after["updated_date"] == "2026-11-09" and int(after["ttl"]) > int(before["ttl"])
+    assert after["title"] != before["title"] and after["norm_v"] == 2
+
+
+def test_one_servers_error_does_not_cost_the_others_their_turn(aws, monkeypatch):
+    calls = []
+
+    def fake(url, **kw):
+        calls.append(url)
+        if "ei.kw.ac.kr" in url:
+            raise RuntimeError("throttled")
+        return FetchResult(EE_PAGE if "BoardMode=list" in url else SPORTS_PAGE, None, 200)
+
+    out = deptboards.collect(NOW, aws["public"], fetch=fake)
+    assert out[deptboards.SERVER_E1] == {"status": "error"}
+    assert {s: r["status"] for s, r in out.items() if s != deptboards.SERVER_E1} == dict.fromkeys(
+        (deptboards.SERVER_E2, deptboards.SERVER_E3, deptboards.SERVER_E4), "ok")
+
+
+def test_the_gate_counts_from_each_request_not_the_runs_start(aws, monkeypatch):
+    monkeypatch.setattr(deptboards, "BOARDS", (SPORTS,))
+    table = aws["public"]
+    deptboards.collect(NOW, table, fetch=page(SPORTS_PAGE), clock=lambda: NOW + timedelta(seconds=90))
+    assert int(politeness.state(table, deptboards.SERVER_E4)["next_at"]) == int((NOW + timedelta(seconds=150)).timestamp())
+    late = deptboards.collect(NOW, table, fetch=page(SPORTS_PAGE), time_left=lambda: 20)
+    assert late[deptboards.SERVER_E4] == {"status": "skipped", "reason": "no_time"}

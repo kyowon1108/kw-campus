@@ -1,8 +1,10 @@
 """Lambda: campus data that changes rarely — the cafeteria week menu and the academic calendar.
 
 Runs once on weekday mornings (before the notice collection window). It fetches the
-cafeteria page only when this week's menu is missing or it is Monday, and the calendar
-only when the stored copy is older than a week, so most days make 0-1 requests.
+cafeteria page until this week's menu is stored (a week counts only with at least one meal on
+it, so last week's page fetched early on Monday is tried again the next morning), and the
+calendar only when the stored copy is older than a week, so most days make 0-1 requests and a
+run never makes more than two. A week is stored under the Monday of the dates it shows.
 
 Items in kw-public:
   PK "CAMPUS#cafeteria"  SK "W#<monday>"   {days: [{date, weekday, meals: [{name, price, time, menu}]}]}
@@ -20,15 +22,16 @@ import boto3
 from bs4 import BeautifulSoup
 
 from kwcampus import params, politeness
-from kwcampus.config import COLLECTOR_ENABLED_PARAM, KST, PUBLIC_TABLE
-from kwcampus.fetch import fetch_list_page
+from kwcampus.config import COLLECTOR_ENABLED_PARAM, KST, PUBLIC_TABLE, WWW_DAILY_CAP
+from kwcampus.fetch import WORST_CASE_S, fetch_list_page
 from kwcampus.kwnotice.source import NOTICE_HOST
 from kwcampus.obs import log, metrics
 
 CAFETERIA_URL = "https://www.kw.ac.kr/ko/life/facility11.jsp"
 CALENDAR_URL = "https://www.kw.ac.kr/KWBoard/list5_detail.jsp"
 CALENDAR_MAX_AGE = timedelta(days=7)
-DAILY_CAP = 44  # shared origin budget with the notice collector (collector.DAILY_CAP)
+DAILY_CAP = WWW_DAILY_CAP  # shared origin budget with the notice collector
+MAX_REQUESTS = 2  # per run
 
 _DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 _MD = re.compile(r"(\d{1,2})\.(\d{1,2})")
@@ -94,75 +97,119 @@ def parse_calendar(html: str, year: int) -> list[dict]:
     return events
 
 
-def _fetch(table, now: datetime, url: str, form: dict | None = None):
-    permit = politeness.acquire(table, NOTICE_HOST, now, daily_cap=DAILY_CAP)
-    if not permit.granted:
-        return None, permit.reason
-    result = fetch_list_page(url, form)
-    if result.block_reason:
-        politeness.record_block(table, NOTICE_HOST, now, result.block_reason)
-        return None, result.block_reason
-    politeness.record_success(table, NOTICE_HOST)
-    return result.html, "ok"
+def _monday(day: date) -> date:
+    return day - timedelta(days=day.weekday())
+
+
+def _has_meals(item: dict | None) -> bool:
+    return bool(item) and any(d.get("meals") for d in item.get("days") or [])
+
+
+class _Www:
+    """This run's www requests: at most MAX_REQUESTS, 61 s apart, and none once the gate says no."""
+
+    def __init__(self, table, clock, sleep, time_left):
+        self.table, self.clock, self.sleep, self.time_left = table, clock, sleep, time_left
+        self.sent_at: datetime | None = None
+        self.sent, self.stopped = 0, None
+
+    def fetch(self, url: str, form: dict | None = None) -> tuple[str | None, str]:
+        if self.stopped:
+            return None, self.stopped
+        if self.sent >= MAX_REQUESTS:
+            return None, "next_run"
+        wait = 0.0
+        if self.sent_at is not None:  # really wait; never two requests in a row
+            wait = max(0.0, (self.sent_at + politeness.MIN_INTERVAL - self.clock()).total_seconds() + 1)
+        if self.time_left is not None and self.time_left() < wait + WORST_CASE_S:
+            return None, "no_time"
+        if wait:
+            self.sleep(wait)
+        permit = politeness.acquire(self.table, NOTICE_HOST, self.clock(), daily_cap=DAILY_CAP)
+        if not permit.granted:
+            if permit.reason in ("cooldown", "disabled_after_blocks", "daily_cap"):
+                self.stopped = permit.reason  # nothing else this run either, and no sleeping for it
+            return None, permit.reason
+        self.sent_at, self.sent = self.clock(), self.sent + 1
+        result = fetch_list_page(url, form)
+        if result.block_reason:
+            if politeness.is_server_signal(result.block_reason):
+                politeness.record_block(self.table, NOTICE_HOST, self.clock(), result.block_reason, result.retry_after)
+                metrics(Blocked=int(result.block_reason in politeness.HARD),
+                        Transient=int(result.block_reason not in politeness.HARD))
+            log("campus_blocked", url=url.rsplit("/", 1)[-1], reason=result.block_reason, status=result.status)
+            return None, result.block_reason
+        politeness.record_success(self.table, NOTICE_HOST)
+        return result.html, "ok"
+
+
+def _calendar_due(item: dict | None, now: datetime) -> bool:
+    return not item or now.timestamp() - int(item.get("fetched_at", 0)) > CALENDAR_MAX_AGE.total_seconds()
 
 
 def run(now: datetime, table, clock: Callable[[], datetime] | None = None,
-        sleep: Callable[[float], None] = time.sleep) -> dict[str, object]:
+        sleep: Callable[[float], None] = time.sleep,
+        time_left: Callable[[], float] | None = None) -> dict[str, object]:
     clock = clock or (lambda: datetime.now(UTC))
     if not params.is_true(COLLECTOR_ENABLED_PARAM):
         return {"status": "disabled"}
     today = now.astimezone(KST).date()
-    monday = today - timedelta(days=today.weekday())
+    monday = _monday(today)
     out: dict[str, object] = {"status": "ok"}
+    www = _Www(table, clock, sleep, time_left)
 
     have_week = table.get_item(Key={"PK": "CAMPUS#cafeteria", "SK": f"W#{monday}"}).get("Item")
-    if not have_week or today.weekday() == 0:
-        html, reason = _fetch(table, now, CAFETERIA_URL)
+    if not _has_meals(have_week) and politeness.robots_allows(CAFETERIA_URL):
+        html, reason = www.fetch(CAFETERIA_URL)
         days = parse_cafeteria(html) if html else []
-        if days:
-            table.put_item(Item={"PK": "CAMPUS#cafeteria", "SK": f"W#{monday}", "days": days,
+        week = _monday(date.fromisoformat(days[0]["date"])) if days else None
+        if days and week is not None and week >= monday - timedelta(days=7):
+            table.put_item(Item={"PK": "CAMPUS#cafeteria", "SK": f"W#{week}", "days": days,
                                  "fetched_at": int(now.timestamp()),
                                  "ttl": int((now + timedelta(days=60)).timestamp())})
-        out["cafeteria"] = f"{len(days)} days" if days else reason if reason != "ok" else "no_table"
+        if not days:
+            out["cafeteria"] = reason if reason != "ok" else "no_table"
+        elif week != monday:  # last week's page still up: tried again tomorrow at 07:30
+            out["cafeteria"] = "stale_week"
+        elif not any(d["meals"] for d in days):
+            out["cafeteria"] = "no_meals"
+        else:
+            out["cafeteria"] = f"{len(days)} days"
 
-    stored = table.get_item(Key={"PK": "CAMPUS#calendar", "SK": f"Y#{today.year}"}).get("Item")
-    if not stored or now.timestamp() - int(stored.get("fetched_at", 0)) > CALENDAR_MAX_AGE.total_seconds():
-        if "cafeteria" in out:
-            sleep(politeness.MIN_INTERVAL.total_seconds() + 1)  # really wait; never two requests in a row
-        html, reason = _fetch(table, clock(), CALENDAR_URL, {"sy": str(today.year), "sm": ""})
-        events = parse_calendar(html, today.year) if html else []
+    # In December, also keep next year's calendar so "this week"/"next month" can see January. The
+    # two refreshes drift apart: next year's waits when this year's was read in the same run.
+    years = [today.year] + ([today.year + 1] if today.month == 12 else [])
+    for year in years:
+        if not politeness.robots_allows(CALENDAR_URL):
+            break
+        stored = table.get_item(Key={"PK": "CAMPUS#calendar", "SK": f"Y#{year}"}).get("Item")
+        if not _calendar_due(stored, now):
+            continue
+        key = "calendar" if year == today.year else "calendar_next_year"
+        if year != today.year and "calendar" in out:
+            out[key] = "next_run"
+            continue
+        html, reason = www.fetch(CALENDAR_URL, {"sy": str(year), "sm": ""})
+        events = parse_calendar(html, year) if html else []
         if events:
-            table.put_item(Item={"PK": "CAMPUS#calendar", "SK": f"Y#{today.year}", "events": events,
+            table.put_item(Item={"PK": "CAMPUS#calendar", "SK": f"Y#{year}", "events": events,
                                  "fetched_at": int(now.timestamp())})
-        out["calendar"] = f"{len(events)} events" if events else reason if reason != "ok" else "no_events"
+        out[key] = f"{len(events)} events" if events else reason if reason != "ok" else "no_events"
 
-    # In December, also keep next year's calendar so "this week"/"next month" can see January.
-    next_year = today.year + 1
-    upcoming = table.get_item(Key={"PK": "CAMPUS#calendar", "SK": f"Y#{next_year}"}).get("Item")
-    if today.month == 12 and (not upcoming or now.timestamp() - int(upcoming.get("fetched_at", 0))
-                              > CALENDAR_MAX_AGE.total_seconds()):
-        if "cafeteria" in out or "calendar" in out:
-            sleep(politeness.MIN_INTERVAL.total_seconds() + 1)
-        html, reason = _fetch(table, clock(), CALENDAR_URL, {"sy": str(next_year), "sm": ""})
-        events = parse_calendar(html, next_year) if html else []
-        if events:
-            table.put_item(Item={"PK": "CAMPUS#calendar", "SK": f"Y#{next_year}", "events": events,
-                                 "fetched_at": int(now.timestamp())})
-        out["calendar_next_year"] = f"{len(events)} events" if events else reason if reason != "ok" else "no_events"
-
-    log("campus_ok", **out)
-    metrics(CampusFetched=int("cafeteria" in out) + int("calendar" in out))
+    log("campus_ok", requests=www.sent, **out)
+    metrics(CampusFetched=www.sent)
     return out
 
 
-def handler(event, context):  # noqa: ARG001
-    return run(datetime.now(UTC), boto3.resource("dynamodb").Table(PUBLIC_TABLE))
+def handler(event, context):
+    time_left = (lambda: context.get_remaining_time_in_millis() / 1000) if context else None
+    return run(datetime.now(UTC), boto3.resource("dynamodb").Table(PUBLIC_TABLE), time_left=time_left)
 
 
 # --- read side for the MCP tools -------------------------------------------------
 
 def menu_for(table, day: date) -> dict | None:
-    monday = day - timedelta(days=day.weekday())
+    monday = _monday(day)
     item = table.get_item(Key={"PK": "CAMPUS#cafeteria", "SK": f"W#{monday}"}).get("Item")
     if not item:
         return None

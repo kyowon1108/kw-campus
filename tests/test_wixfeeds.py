@@ -61,8 +61,11 @@ def test_fetch_accepts_the_feed_content_type(monkeypatch):
     class Response:
         status, headers = 200, {"Content-Type": "text/xml; charset=UTF-8"}
 
-        def read(self, limit):
-            return FEED["media"].encode()
+        done = False
+
+        def read1(self, limit):
+            body, self.done = (b"" if self.done else FEED["media"].encode()), True
+            return body
 
         def __enter__(self):
             return self
@@ -141,3 +144,31 @@ def test_feed_posts_are_department_categories_and_searchable(aws):
     assert hits[0]["category"] == hits[0]["department"] == "건축학과"
     assert {r["category"] for r in public_data.latest(table, "미컴", 10)} == {"미디어커뮤니케이션학부"}
     assert public_data.get(table, "dept-media-6aea7dbf45f0aaa1eb83fc02")["posted_date"] == "2026-11-04"
+
+
+def test_a_future_pub_date_does_not_silence_later_posts(aws, capsys):
+    table = aws["public"]
+    wixfeeds.collect(NOW, table, fetch=feeds())  # seed
+    typo = FEED["media"].replace("6aea7dbf45f0aaa1eb83fc02", "6aeb1111aaaaaaaaaaaaaaaa").replace(
+        "Wed, 04 Nov 2026 00:47:13 GMT", "Fri, 05 Nov 2027 00:00:00 GMT")  # a year ahead
+    wixfeeds.collect(NOW + timedelta(hours=2), table, fetch=feeds(pages={"media": typo}))
+    assert '"wix_future_date"' in capsys.readouterr().out
+    state = table.get_item(Key={"PK": "SRC#dept-media", "SK": "STATE"})["Item"]
+    assert int(state["max_published"]) == int((NOW + timedelta(hours=2)).timestamp())  # the run's time at most
+    real = typo.replace("6ae0521818163c9dd52fd4e0", "6aec2222bbbbbbbbbbbbbbbb").replace(
+        "Tue, 27 Oct 2026 07:28:45 GMT", "Fri, 06 Nov 2026 01:00:00 GMT")
+    wixfeeds.collect(NOW + timedelta(days=1, hours=2), table, fetch=feeds(pages={"media": real}))
+    assert notices(table, "dept-media")["6aec2222bbbbbbbbbbbbbbbb"]["seed"] is False  # announced
+
+
+def test_a_missing_feed_backs_off_only_that_feed(aws):
+    table, calls = aws["public"], []
+
+    def fake(url, types=()):
+        calls.append(url)
+        return FetchResult(None, "http_failure", 404) if url == ARCH.url else FetchResult(FEED["media"], None, 200)
+
+    for hours in (0, 2, 4, 6):
+        wixfeeds.collect(NOW + timedelta(hours=hours), table, fetch=fake)
+    assert calls.count(ARCH.url) == 3 and calls.count(MEDIA.url) == 4  # 0 h, 2 h, then 4 h of rest: 6 h
+    assert politeness.acquire(table, ARCH.host, NOW + timedelta(hours=6, minutes=2), daily_cap=7).granted
