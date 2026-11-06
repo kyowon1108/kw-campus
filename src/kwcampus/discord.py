@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import json
 import re
-import urllib.error
-import urllib.request
 from datetime import UTC, datetime, timedelta
 
 import boto3
@@ -33,12 +31,11 @@ from kwcampus.config import (
     QUIET_FROM_HOUR,
     QUIET_UNTIL_HOUR,
 )
-from kwcampus.fetch import TLS
+from kwcampus.discordapi import NotFound, RetryLater, token_problem
+from kwcampus.discordapi import call as _discord
 from kwcampus.obs import log, metrics
 from kwcampus.routing import CATEGORY_LABEL, topic_for
 
-API = "https://discord.com/api/v10"
-USER_AGENT = "DiscordBot (https://github.com/kyowon1108/kw-notice-mcp, 0.1)"
 SUPPRESS_EMBEDS = 1 << 2
 MAX_LEN = 2000
 DISCORD_EPOCH_MS = 1420070400000
@@ -48,14 +45,6 @@ STALE_CLAIM = timedelta(seconds=90)
 NO_PINGS = {"parse": []}
 
 _MARKDOWN = re.compile(r"([\\*_~`|>\[\]()#])")
-
-
-class RetryLater(Exception):
-    """Discord asked us to slow down or failed transiently; let SQS redeliver."""
-
-
-class NotFound(Exception):
-    """Discord answered 404: the message (or member, role, channel) is gone."""
 
 
 def escape(text: str) -> str:
@@ -94,35 +83,6 @@ def posted_at(message_id: str) -> datetime | None:
     if not str(message_id).isdigit():
         return None
     return datetime.fromtimestamp(((int(message_id) >> 22) + DISCORD_EPOCH_MS) / 1000, UTC)
-
-
-def token_problem(token: str | None) -> str | None:
-    # Discord tokens are plain ASCII; anything else means the wrong text was pasted into SSM.
-    if not token:
-        return "bot token not set"
-    if not token.isascii() or " " in token.strip():
-        return "bot token is not a Discord token (non-ASCII or spaces)"
-    return None
-
-
-def _discord(method: str, path: str, token: str, body: dict | None = None, timeout: float = 10) -> dict:
-    request = urllib.request.Request(
-        f"{API}{path}",
-        data=None if body is None else json.dumps(body).encode(),
-        method=method,
-        headers={"Authorization": f"Bot {token}", "Content-Type": "application/json", "User-Agent": USER_AGENT},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout, context=TLS) as response:
-            return json.loads(response.read() or b"{}")
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            raise NotFound(f"discord 404 on {method}") from None
-        if e.code == 429 or e.code >= 500:
-            raise RetryLater(f"discord {e.code}") from None
-        raise RuntimeError(f"discord {e.code} on {method}") from None
-    except (urllib.error.URLError, TimeoutError) as e:
-        raise RetryLater("discord unreachable") from e
 
 
 def _claim_reply(delivery, dkey: dict, now: datetime) -> bool:

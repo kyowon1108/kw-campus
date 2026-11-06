@@ -29,10 +29,10 @@ from kwcampus.config import (
     DISCORD_ROLES_PARAM,
     DISCORD_TOKEN_PARAM,
 )
-from kwcampus.discord import API, USER_AGENT, NotFound, token_problem
+from kwcampus.discordapi import API, USER_AGENT, NotFound, token_problem
 from kwcampus.fetch import TLS
 from kwcampus.interactions import PREFIX, menu_message
-from kwcampus.routing import TOPICS
+from kwcampus.topics import TOPICS
 
 REGION = "ap-northeast-2"
 
@@ -227,7 +227,7 @@ class Setup:
         self.needed |= MANAGE_CHANNELS
         for *_, allow, deny, _who in overwrites:
             self.needed |= allow | deny
-        self.step("+", f"#{name} 만들기 (#{notice.get('name')}과 같은 분류, 읽기 전용 권한 포함)")
+        self.step("+", f"#{name} 만들기 (#{notice.get('name')} 채널과 같은 분류, 읽기 전용 권한 포함)")
         if not self.apply:
             return NEW, True
         made = self.api.call("POST", f"/guilds/{guild_id}/channels", {

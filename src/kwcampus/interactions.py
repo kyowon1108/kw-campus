@@ -24,9 +24,10 @@ from kwcampus.config import (
     DISCORD_ROLES_PARAM,
     DISCORD_TOKEN_PARAM,
 )
-from kwcampus.discord import NotFound, RetryLater, _discord, token_problem
+from kwcampus.discordapi import NotFound, RetryLater, token_problem
+from kwcampus.discordapi import call as _discord
 from kwcampus.obs import log, metrics
-from kwcampus.routing import TOPIC_BY_KEY, TOPICS
+from kwcampus.topics import TOPIC_BY_KEY, TOPICS
 
 PING, MESSAGE_COMPONENT = 1, 3
 PONG, CHANNEL_MESSAGE = 1, 4

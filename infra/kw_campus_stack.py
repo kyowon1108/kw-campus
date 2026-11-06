@@ -140,7 +140,8 @@ class KwCampusStack(cdk.Stack):
 
         # Discord buttons (#알림-설정): its own function and API, no table access, reads only the
         # three parameters it needs. Discord must get an answer within 3 s.
-        interactions = fn("DiscordInteractions", "kwcampus.interactions.handler", 5)
+        # 1024 MB for the CPU share: a cold start must still answer well inside those 3 s.
+        interactions = fn("DiscordInteractions", "kwcampus.interactions.handler", 5, memory=1024)
         interactions.add_to_role_policy(iam.PolicyStatement(
             actions=["ssm:GetParameter"],
             resources=[f"{ssm_arn}/kw/discord/{name}" for name in ("bot-token", "public-key", "roles")]))

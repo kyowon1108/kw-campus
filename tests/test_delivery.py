@@ -4,7 +4,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from boto3.dynamodb.types import TypeSerializer
 
-from kwcampus import discord, dispatcher
+from kwcampus import discord, discordapi, dispatcher
 from kwcampus.config import KST
 
 _ser = TypeSerializer()
@@ -230,3 +230,27 @@ def test_handler_reports_a_pasted_non_token_clearly(aws, monkeypatch, capsys):
         {"action": "post", "key": {"PK": NOTICE["PK"], "SK": NOTICE["SK"]}, "channel": "academic"})}]}
     assert discord.handler(event, None) == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
     assert "not a Discord token" in capsys.readouterr().out
+
+
+def test_rest_calls_carry_a_body_except_get_and_delete(monkeypatch):
+    import io
+    import urllib.error
+
+    sent = []
+
+    def fake_urlopen(request, timeout, context):
+        sent.append((request.get_method(), request.data, timeout))
+        if "missing" in request.full_url:
+            raise urllib.error.HTTPError(request.full_url, 404, "x", {}, io.BytesIO(b""))
+        if "busy" in request.full_url:
+            raise urllib.error.HTTPError(request.full_url, 429, "x", {}, io.BytesIO(b""))
+        return io.BytesIO(b"")  # 204 No Content
+
+    monkeypatch.setattr(discordapi.urllib.request, "urlopen", fake_urlopen)
+    assert discordapi.call("PUT", "/guilds/1/members/2/roles/3", "t", timeout=2) == {}
+    discordapi.call("DELETE", "/guilds/1/members/2/roles/3", "t")
+    assert sent == [("PUT", b"{}", 2), ("DELETE", None, 10)]
+    with pytest.raises(discordapi.NotFound):
+        discordapi.call("PATCH", "/missing", "t", {"content": "x"})
+    with pytest.raises(discordapi.RetryLater):
+        discordapi.call("POST", "/busy", "t", {"content": "x"})
