@@ -70,7 +70,7 @@ def posted(ops) -> list[dict]:
     return [json.loads(m["Body"]) for m in messages]
 
 
-def test_all_well_is_one_line(ops):
+def test_all_well_is_two_short_lines(ops):
     healthy(ops["public"], TUESDAY)
     notice(ops["public"], "kw-notice", "2", TUESDAY - timedelta(days=3), seed=False)  # before the period
     notice(ops["public"], "kw-notice", "3", TUESDAY - timedelta(hours=20), seed=True)  # a seed row
@@ -82,7 +82,9 @@ def test_all_well_is_one_line(ops):
     [job] = posted(ops)
     watched = len([s for s in public_data.SOURCES if s not in opsdigest.NOT_WATCHED])
     assert job == {"action": "ops", "channel": "ops", "id": "digest|2026-11-10",
-                   "content": f"✅ 어제 이상 없음 · 새 공지 {watched} · 초대 3"}
+                   "content": f"✅ 어제 이상 없음 · 새 공지 {watched} · 초대 3\n"
+                              f"읽기: 새 {watched} · 완료 0 · 일부 0 · 대기 {watched} · 제목만 0 · 큐 0(가장 오래 0시간) · "
+                              "못 읽고 만료 0"}
     [asked] = cw.asked
     assert asked["StartTime"] == datetime(2026, 11, 9, tzinfo=KST) and asked["EndTime"] == datetime(2026, 11, 10,
                                                                                                     tzinfo=KST)
@@ -101,13 +103,13 @@ def test_the_notice_query_asks_for_the_granted_attributes_only(ops):
             asked.append(kwargs)
             return real(**kwargs)
 
-    newest, fresh = opsdigest._seen(Spy(), "kw-notice", 0, 2**40)
-    assert (newest, fresh) == (int((TUESDAY - timedelta(hours=3)).timestamp()), 1)
+    newest, fresh, read = opsdigest._seen(Spy(), "kw-notice", 0, 2**40)
+    assert (newest, fresh, dict(read)) == (int((TUESDAY - timedelta(hours=3)).timestamp()), 1, {"pending": 1})
     [kwargs] = asked
     assert kwargs["Select"] == "SPECIFIC_ATTRIBUTES"
     names = kwargs["ExpressionAttributeNames"]
     assert sorted(names[n.strip()] for n in kwargs["ProjectionExpression"].split(",")) == sorted(
-        opsdigest.QUERY_ATTRIBUTES) == ["first_seen", "removed", "seed"]
+        opsdigest.QUERY_ATTRIBUTES) == ["extract_v", "first_seen", "read", "removed", "seed"]
     assert "title" not in json.dumps(real(**kwargs)["Items"], default=str)
 
 
@@ -118,7 +120,8 @@ def test_monday_covers_friday_to_sunday(ops):
     cw = FakeCloudWatch()
     opsdigest.run(MONDAY, ops["public"], ops["bridge"], cw, ops["sqs"])
     [job] = posted(ops)
-    assert job["content"].startswith("✅ 금~일 이상 없음 · ") and job["content"].endswith("· 초대 7")
+    first = job["content"].splitlines()[0]
+    assert first.startswith("✅ 금~일 이상 없음 · ") and first.endswith("· 초대 7")
     assert {q["MetricStat"]["Period"] for q in cw.asked[0]["MetricDataQueries"]} == {3 * 86400}
 
 
@@ -146,6 +149,7 @@ def test_problems_get_a_short_report_with_counts_and_names_only(ops):
         "⚠️ 어제 확인할 게 있어요",
         f"- 게시판: 꺼짐 1 (dept-ee) · 잠시 멈춤 2 (61.111.8.4, dept-law) · 조용한 게시판 1 · 새 공지 {new}",
         "- 공지 읽기: 완료 5 · 실패 3 · 한도로 미룸 0",
+        f"- 읽기 상태: 새 {new} · 완료 0 · 일부 0 · 대기 {new} · 제목만 0 · 큐 0(가장 오래 0시간) · 못 읽고 만료 0",
         "- 디스코드: 대기 0 · 실패 1 · 재시도 4",
         "- 초대: 1 (전체 1)",
         "- 알람: collector-needs-human, discord-dlq",
@@ -228,3 +232,95 @@ def test_quiet_boards_alone_are_not_a_warning():
                                     "DiscordRetries": 0},
                                    {"waiting": 0, "dead": 0}, {"period": 0, "total": 7}, [])
     assert fine and text.startswith("✅ 어제 이상 없음")
+
+
+def test_a_freshly_seeded_board_is_not_taken_for_a_live_one(ops):
+    """A board's first read stores its old posts as seed rows: they say nothing about the board posting now."""
+    notice(ops["public"], "council", "cl1", TUESDAY - timedelta(hours=20), seed=True)
+    assert opsdigest._seen(ops["public"], "council", 0, 2**40)[:2] == (None, 0)
+    notice(ops["public"], "council", "cl2", TUESDAY - timedelta(hours=10))
+    assert opsdigest._seen(ops["public"], "council", 0, 2**40)[:2] == (int((TUESDAY - timedelta(hours=10)).timestamp()), 1)
+
+
+
+def test_reading_health_counts_new_notices_by_how_they_were_read(ops, monkeypatch):
+    """Done, partial, pending (no record yet, or a retry planned), title only; the queue and its oldest row; a
+    notice whose queue row ran out unread makes the day worth a look."""
+    public, now = ops["public"], TUESDAY
+    public.put_item(Item={"PK": "MARK#read-records", "SK": "SINCE",  # read records began a month ago
+                          "at": int((TUESDAY - timedelta(days=30)).timestamp())})
+    healthy(public, now)
+    day = now - timedelta(hours=20)
+
+    def read(post: str, record: dict | None, at=day, source="kw-notice"):
+        public.put_item(Item={"PK": f"SRC#{source}", "SK": f"N#{post}", "seed": False, "first_seen": int(at.timestamp()),
+                              **({"read": record} if record else {})})
+
+    read("11", {"status": "complete"})
+    read("12", {"status": "body_only"})
+    read("13", {"status": "partial"})
+    read("14", {"status": "partial", "retry_at": int((now + timedelta(hours=1)).timestamp())})  # still to come
+    read("15", {"status": "title_only"}, source="internship")
+    read("16", {"status": "privacy_skip"})
+    read("17", {"status": "failed"})
+    read("18", None, at=now - timedelta(days=15))  # its queue row ran out yesterday: never read
+    read("19", {"status": "complete"}, at=now - timedelta(days=15))  # read in time: fine
+    public.put_item(Item={"PK": "BODYQ", "SK": "SRC#kw-notice|N#14", "queued_at": int((now - timedelta(hours=5)).timestamp()),
+                          "text": "never read by the digest"})
+    out = opsdigest.run(now, public, ops["bridge"], FakeCloudWatch(), ops["sqs"])
+    assert out["fine"] is False
+    [job] = posted(ops)
+    watched = len([s for s in public_data.SOURCES if s not in opsdigest.NOT_WATCHED])
+    line = next(x for x in job["content"].splitlines() if x.startswith("- 읽기 상태"))
+    assert line == (f"- 읽기 상태: 새 {watched + 7} · 완료 3 · 일부 2 · 대기 {watched + 1} · 제목만 1 · "
+                    "큐 1(가장 오래 5시간) · 못 읽고 만료 1")
+    assert opsdigest.queue_health(public, now) == {"queue": 1, "oldest_h": 5}
+
+
+
+def test_notices_from_before_read_records_are_neither_pending_nor_expired(ops):
+    """A notice read before read records existed (extract_v, no `read`) is done; one first seen before them and
+    never read (일반, the FAQ and the Wix feeds weren't queued then) never counts as expired."""
+    public, now = ops["public"], TUESDAY
+    healthy(public, now)
+    public.put_item(Item={"PK": "SRC#kw-notice", "SK": "N#21", "seed": False, "extract_v": 1,
+                          "first_seen": int((now - timedelta(hours=20)).timestamp())})
+    public.put_item(Item={"PK": "SRC#kw-notice", "SK": "N#22", "seed": False,  # 일반, 2026-10-26: never queued
+                          "first_seen": int((now - timedelta(days=15)).timestamp())})
+    since = int(datetime(2026, 11, 8, 15, tzinfo=KST).timestamp())  # the deploy: the first read record written
+    public.put_item(Item={"PK": "MARK#read-records", "SK": "SINCE", "at": since})
+    _, _, read = opsdigest._seen(public, "kw-notice", int((now - timedelta(days=1)).timestamp()), int(now.timestamp()),
+                                 since)
+    assert read["done"] == 1 and read["expired"] == 0
+    assert opsdigest.run(now, public, ops["bridge"], FakeCloudWatch(), ops["sqs"])["fine"] is True
+
+
+def test_expired_counts_only_after_read_records_began_and_never_without_them(ops):
+    """The cutoff is the first read record ever written (extract.mark_reads), not a date in the code: before
+    any, nothing counts as expired; after, only notices first seen since then that were never read."""
+    from kwcampus import extract
+
+    public, now = ops["public"], datetime(2026, 11, 30, 8, 40, tzinfo=KST)
+    healthy(public, now)
+    seen = int((now - timedelta(days=15)).timestamp())  # its queue row ran out yesterday
+    public.put_item(Item={"PK": "SRC#kw-notice", "SK": "N#31", "seed": False, "first_seen": seen})
+    start, end = int((now - timedelta(days=1)).timestamp()), int(now.timestamp())
+    assert extract.reads_since(public) is None
+    assert opsdigest._seen(public, "kw-notice", start, end, extract.reads_since(public))[2]["expired"] == 0
+    extract.mark_reads(public, now - timedelta(days=20))  # the deploy's first read record
+    extract._marked.clear()
+    extract.mark_reads(public, now)  # later ones never move it
+    assert extract.reads_since(public) == int((now - timedelta(days=20)).timestamp())
+    assert opsdigest._seen(public, "kw-notice", start, end, extract.reads_since(public))[2]["expired"] == 1
+    assert opsdigest.run(now, public, ops["bridge"], FakeCloudWatch(), ops["sqs"])["fine"] is False
+
+
+def test_a_retry_that_never_came_is_partial_not_pending(ops):
+    public, now = ops["public"], TUESDAY
+    fresh = int((now - timedelta(hours=20)).timestamp())
+    for post, retry in (("41", now + timedelta(hours=2)), ("42", now - timedelta(days=3))):
+        public.put_item(Item={"PK": "SRC#kw-notice", "SK": f"N#{post}", "seed": False, "first_seen": fresh,
+                              "read": {"status": "partial", "retry_at": int(retry.timestamp())}})
+    _, _, read = opsdigest._seen(public, "kw-notice", int((now - timedelta(days=1)).timestamp()), int(now.timestamp()),
+                                 None, now.timestamp())
+    assert (read["pending"], read["partial"]) == (1, 1)

@@ -31,7 +31,8 @@ def test_open_notices_first_then_the_recent_ones(monkeypatch):
         {"title": "국가장학금 신청", "posted": past, "url": "https://www.kw.ac.kr/1", "deadline": f"{soon} 18:00",
          "target": "재학생", "how_to_apply": "KLAS에서 신청"}]
     assert out["recent_notices_note"].startswith("최근 공지가 있으면")
-    assert calls == [("", "장학", None, True)]
+    # one search per kw-mcp notice_links.json query (장학: the category, and the 총동문회 board)
+    assert calls == [("", "장학", None, True), ("총동문회", None, None, True)]
 
     def recent_only(query, category=None, since=None, limit=20, open_only=False, deadline_after=None):
         calls.append((query, category, since, open_only))

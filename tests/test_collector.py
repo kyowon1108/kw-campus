@@ -111,7 +111,7 @@ def test_a_missing_main_page_backs_off_the_main_board_only(aws):
 
 
 def test_a_main_board_error_still_lets_the_other_servers_run(aws, monkeypatch):
-    from kwcampus import aicon, deptboards, wixfeeds, wwwboards
+    from kwcampus import aicon, deptboards, smallboards, wixfeeds, wwwboards
 
     enable(aws)
     seen = {}
@@ -126,13 +126,14 @@ def test_a_main_board_error_still_lets_the_other_servers_run(aws, monkeypatch):
         return collect
 
     monkeypatch.setattr(collector, "run", boom)
-    for name, module in (("aicon", aicon), ("dept", deptboards), ("wix", wixfeeds), ("www", wwwboards)):
+    for name, module in (("aicon", aicon), ("dept", deptboards), ("wix", wixfeeds), ("small", smallboards),
+                         ("www", wwwboards)):
         monkeypatch.setattr(module, "collect", extra(name))
     monkeypatch.setattr(collector.boto3, "resource", lambda name: type("R", (), {"Table": lambda self, n: aws["public"]})())
     out = collector.handler({}, None)
     assert out == {"status": "error", "aicon": {"status": "ok"}, "dept": {"status": "ok"}, "wix": {"status": "ok"},
-                   "www": {"status": "ok"}}
-    assert seen == dict.fromkeys(("aicon", "dept", "wix", "www"), True)  # each got the real clock
+                   "small": {"status": "ok"}, "www": {"status": "ok"}}
+    assert seen == dict.fromkeys(("aicon", "dept", "wix", "small", "www"), True)  # each got the real clock
 
 
 def test_without_the_kill_switch_a_main_board_error_runs_nothing_else(aws, monkeypatch):

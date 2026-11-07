@@ -387,12 +387,18 @@ def test_ops_digest_reads_only_what_it_counts(tmp_path):
     assert tables == [
         # the gate's and the sources' state rows
         {"Action": "dynamodb:GetItem", "Effect": "Allow", "Resource": public_arn,
-         "Condition": {"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["ORIGIN#*", "SRC#*"]}}},
-        # the notices: first_seen, seed and removed only (the keys are named by the key condition)
+         "Condition": {"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["ORIGIN#*", "SRC#*", "MARK#*"]}}},
+        # the notices: first_seen, seed, removed and the read record only (the keys are named by the key condition)
         {"Action": "dynamodb:Query", "Effect": "Allow", "Resource": public_arn,
          "Condition": {"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["SRC#*"]},
-                       "ForAllValues:StringEquals": {"dynamodb:Attributes": ["PK", "SK", "first_seen", "seed", "removed"]},
-                       "StringEqualsIfExists": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"}}},
+                       "ForAllValues:StringEquals": {"dynamodb:Attributes": ["PK", "SK", "first_seen", "seed", "removed",
+                                                                             "read", "extract_v"]},
+                       "StringEquals": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"}}},
+        # the page queue: when each row was queued, nothing else (no queued text)
+        {"Action": "dynamodb:Query", "Effect": "Allow", "Resource": public_arn,
+         "Condition": {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["BODYQ"],
+                                                     "dynamodb:Attributes": ["PK", "SK", "queued_at"]},
+                       "StringEquals": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"}}},
         {"Action": "dynamodb:GetItem", "Effect": "Allow", "Resource": bridge_arn,
          "Condition": {"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["DINVITES#*"]}}},
     ]

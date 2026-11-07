@@ -227,9 +227,13 @@ def test_each_board_layout_gives_its_main_text():
         "__접수기간", "2026.11.03(화) ~ 2026.11.18(수) 23:59", "학력 및 전공 무관"]
     assert extract.body_text("<html><body>바뀐 화면</body></html>", ".view_con") is None
     assert extract.page_for({"source": "dept-ee", "url": "https://evil.example.com/x"}) is None
-    assert not extract.wanted({"source": "kw-notice", "category_id": "general", "url": WWW_URL})  # 일반: not read
-    assert not extract.wanted({"source": "kw-faq", "category_id": "faq", "url": WWW_URL})
+    # every channel is read now: 일반 and the FAQ too; a source with no page to read is not
+    assert extract.wanted({"source": "kw-notice", "category_id": "general", "url": WWW_URL})
+    assert extract.wanted({"source": "kw-faq", "category_id": "faq", "url": WWW_URL.replace("notice", "faq")})
     assert extract.wanted({"source": "dept-ee", "category_id": "dept-ee", "url": EE_URL})
+    assert not extract.wanted({"source": "dept-media", "category_id": "dept-media", "url": "https://www.kwmedia.info/post/x"})
+    assert not extract.wanted({"source": "internship", "category_id": "office-internship",
+                               "url": "https://internship.kw.ac.kr/home/notice/view.do?bbsSeq=1"})
 
 
 def test_bodies_lose_contact_people_phones_and_addresses():
@@ -562,20 +566,23 @@ def test_the_json_api_and_mcp_tools_take_the_deadline_filters(aws, monkeypatch):
 
 # --- the backfill -------------------------------------------------------------------------------
 
-def answer_for(page_url, body, images=(), files=()):
+def answer_for(page_url, body, images=(), files=(), shown=True):
+    """The page's images are always listed (kw_mcp lists them from the page); fetched only when shown."""
     from kw_mcp.notices import Answer, Picture
     from kw_mcp.text import untrusted
 
     data = {"title": "t", "body": untrusted(body), "source_url": page_url,
             "attachments": [{"index": i, "name": name, "url": f"{page_url}&file={i}"} for i, (name, _) in enumerate(files, 1)],
             "images": [{"index": i, "url": f"{page_url}&img={i}", "alt": None} for i, _ in enumerate(images, 1)]}
-    return Answer(data, [Picture(i, f"{page_url}&img={i}", "image/png", raw) for i, raw in enumerate(images, 1)])
+    return Answer(data, [Picture(i, f"{page_url}&img={i}", "image/png", raw) for i, raw in enumerate(images, 1)] if shown else [])
 
 
 def fake_reader(pages, log):
     """kw_mcp.notices.read_notice's shape; every request goes through the gate first, as it does there."""
     from kw_mcp.notices import Answer
     from kw_mcp.text import untrusted
+
+    cached = set()
 
     async def read(url, attachment=None, images=False, part=1, *, gate=None, transport=None, limits=None):
         body, pictures, files = pages[url]
@@ -584,10 +591,12 @@ def fake_reader(pages, log):
             _, text = files[attachment - 1]
             await gate.before(f"{url}&file={attachment}")
             return Answer({"kind": "PDF", "text": untrusted(text), "total_parts": 1, "part": 1})
-        await gate.before(url)
+        if url not in cached:  # kw_mcp keeps a page it fetched (CACHE_S): a second call asks no one
+            await gate.before(url)
+            cached.add(url)
         for i, _ in enumerate(pictures if images else (), 1):
             await gate.before(f"{url}&img={i}")
-        return answer_for(url, body, pictures if images else (), files)
+        return answer_for(url, body, pictures, files, shown=images)
     return read
 
 
@@ -605,19 +614,22 @@ def test_backfill_picks_unread_notices_dry_runs_and_reads_images_and_files(aws):
     keys(aws)
     store.upsert(table, notice("kw-notice", 1001, "registration-scholarship", WWW_URL, posted=date(2026, 9, 1)))
     store.upsert(table, notice("dept-ee", 646, "dept-ee", EE_URL, title="[수상] 전자공학과 4학년 홍길동"))  # may name people
-    store.upsert(table, notice("kw-notice", 1002, "general", WWW_URL.replace("1001", "1002")))  # 일반: not read
+    general = WWW_URL.replace("1001", "1002")
+    store.upsert(table, notice("kw-notice", 1002, "general", general, posted=date(2026, 9, 2)))  # 일반: read too now
     table.put_item(Item={**notice("aicon", 3514, "dept-aicon", AICON_URL), "extract_v": extract.EXTRACT_V})  # done
     rows = admin.backfill_candidates(table, None, NOW)
-    assert [r["SK"] for r in rows] == ["N#646", "N#1001"]  # newest first
+    assert [r["SK"] for r in rows] == ["N#646", "N#1002", "N#1001"]  # newest first
     assert [r["SK"] for r in admin.backfill_candidates(table, 30, NOW)] == ["N#646"]
     plan = admin.backfill_plan(table, rows, NOW)
-    assert plan["candidates"] == 2 and plan["by_server"] == {"61.111.8.4": 1, "www.kw.ac.kr": 1}
+    assert plan["candidates"] == 3 and plan["by_server"] == {"61.111.8.4": 1, "www.kw.ac.kr": 2}
+    assert plan["why"] == {"no_facts": 3} and plan["requests_at_most"] == {"61.111.8.4": 9, "www.kw.ac.kr": 18}
     assert plan["spare_today"]["www.kw.ac.kr"] == 43  # Saturday: all of the cap but the FAQ's turn
 
     log, slept, clock = [], [], [NOW]
     pages = {WWW_URL: ("짧은 본문", [b"png-1", b"png-2"], [("안내문.pdf", "신청기간: 2026.11.10 ~ 11.18 문의 홍길동 010-1111-2222"),
                                                          ("합격자 명단.pdf", "명단")]),
-             EE_URL: ("수상을 축하합니다. 전자공학과 홍길동 학생이 대상을 받았습니다.", [b"png-x"], [("상장.pdf", "x")])}
+             EE_URL: ("수상을 축하합니다. 전자공학과 홍길동 학생이 대상을 받았습니다.", [b"png-x"], [("상장.pdf", "x")]),
+             general: ("도서관 휴관일을 알려 드립니다. 11월 20일은 정기 점검으로 문을 닫습니다.", [], [])}
 
     async def sleep(seconds):
         slept.append(seconds)
@@ -628,14 +640,21 @@ def test_backfill_picks_unread_notices_dry_runs_and_reads_images_and_files(aws):
     before = item(table, {"PK": "SRC#kw-notice", "SK": "N#1001"})
     counts = asyncio.run(admin.run_backfill(table, rows, 150, 25.0, spend, client=claude, now=lambda: clock[0],
                                             sleep=sleep, read=fake_reader(pages, log)))
-    assert counts["extracted"] == 2 and counts["with_images"] == 1 and counts["with_attachments"] == 1
+    assert counts["extracted"] == 3 and counts["with_images"] == 1 and counts["with_attachments"] == 1
+    assert (counts["read_complete"], counts["read_privacy_skip"], counts["read_body_only"]) == (1, 1, 1)
     assert (EE_URL, None, False) in log and not any(a for u, a, _ in log if u == EE_URL)  # body only
     assert (WWW_URL, None, True) in log and (WWW_URL, 1, False) in log and (WWW_URL, 2, False) not in log
     www = item(table, {"PK": "SRC#kw-notice", "SK": "N#1001"})
     assert www["extracted"]["sources_used"] == ["body", "images", "attachments"]
     # a backfill write is no notice edit: no Discord job, notifications on or off
     assert dispatcher.jobs_for([modify(before, www)], date(2026, 11, 7), notify=True) == []
-    assert {k for k in www if k not in before} == {"extracted", "extract_v", "extracted_at", "model", "body_hash"}
+    assert {k for k in www if k not in before} == {"extracted", "extract_v", "extracted_at", "model", "body_hash", "read",
+                                                   "body_hash_by"}
+    assert www["body_hash_by"] == "reader"  # kw_mcp's text, not the page's own
+    assert www["read"]["status"] == "complete" and www["read"]["files"] == {"found": 2, "read": 1, "skipped": {"roster": 1}}
+    assert www["read"]["images"] == {"found": 2, "read": 2, "skipped": {}}
+    ee = item(table, {"PK": "SRC#dept-ee", "SK": "N#646"})["read"]
+    assert ee["status"] == "privacy_skip" and ee["images"]["skipped"] == {"privacy": 1}
     request = next(c for c in claude.calls if len(c["messages"][0]["content"]) > 1)
     blocks = request["messages"][0]["content"]
     assert [b["type"] for b in blocks] == ["image", "image", "text"]
@@ -643,7 +662,7 @@ def test_backfill_picks_unread_notices_dry_runs_and_reads_images_and_files(aws):
     assert "홍길동" not in blocks[-1]["text"]
     assert spend.calls and all(c == (25.0, "notice-backfill") for c in spend.calls)
     # requests to one server went out a minute apart through the collectors' gate
-    assert slept and politeness.state(table, "www.kw.ac.kr")["day_count"] == 4  # page, 2 images, 1 file
+    assert slept and politeness.state(table, "www.kw.ac.kr")["day_count"] == 5  # 2 pages, 2 images, 1 file
     # stop and run again: nothing left to pick
     assert admin.backfill_candidates(table, None, NOW) == []
 
@@ -844,10 +863,14 @@ def test_a_title_that_may_name_people_sends_no_images_or_files(aws):
     log, claude = [], FakeClaude()
     out = extract.collect(NOW, table, fetch=fetcher([]), anthropic_client=claude,
                           read=page_reader(log, pictures=[PNG], files=[("안내.pdf", "x")]))
-    assert out == {"status": "ok", "extracted": 1} and log == []
+    assert out == {"status": "ok", "extracted": 1} and log == [(None, False)]  # its list, from memory: no request
     assert [b["type"] for b in claude.calls[0]["messages"][0]["content"]] == ["text"]
     state = politeness.state(table, "61.111.8.4")
     assert int(state["day_count"]) == 1 and int(state["next_at"]) == int(NOW.timestamp()) + 60  # the usual minute
+    read = item(table, {"PK": "SRC#dept-ee", "SK": "N#646"})["read"]
+    assert read["status"] == "privacy_skip" and "retry_at" not in read and not queue(table)  # final, not retried
+    assert read["images"] == {"found": 1, "read": 0, "skipped": {"privacy": 1}}
+    assert read["files"] == {"found": 1, "read": 0, "skipped": {"privacy": 1}}
 
 
 def test_without_spare_requests_for_every_image_and_file_the_body_goes_alone(aws, capsys):
@@ -859,9 +882,14 @@ def test_without_spare_requests_for_every_image_and_file_the_body_goes_alone(aws
     log, claude = [], FakeClaude()
     read = page_reader(log, pictures=[PNG] * 5, files=[("안내.pdf", "x"), ("양식.hwp", "y")])
     out = extract.collect(WEEKDAY, table, fetch=fetcher([]), anthropic_client=claude, read=read)
-    assert out == {"status": "ok", "extracted": 1, "assets_no_spare": 1}
+    assert out == {"status": "ok", "extracted": 1, "assets_no_spare": 1, "requeued": 1}
     assert log == [(None, False)]  # the page's list, from memory; nothing requested
-    assert item(table, {"PK": "SRC#kw-notice", "SK": "N#1001"})["extracted"]["sources_used"] == ["body"]
+    stored = item(table, {"PK": "SRC#kw-notice", "SK": "N#1001"})
+    assert stored["extracted"]["sources_used"] == ["body"]  # facts from the text now; the rest on another try
+    assert stored["read"]["status"] == "partial" and stored["read"]["retry_at"] == int((WEEKDAY + timedelta(hours=3)).timestamp())
+    assert stored["read"]["images"]["skipped"] == {"budget": 4, "cap": 1}
+    [row] = queue(table)
+    assert int(row["reads"]) == 1 and int(row["not_before"]) == stored["read"]["retry_at"]
     assert int(politeness.state(table, "www.kw.ac.kr")["day_count"]) == 6
     assert "ExtractAssetsSkipped" in capsys.readouterr().out
 

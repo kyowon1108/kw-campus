@@ -8,6 +8,7 @@
     uv run python scripts/collector_admin.py redaction-report               # notices the current masking would change
     uv run python scripts/collector_admin.py extract-backfill               # what a backfill would read (counts)
     uv run python scripts/collector_admin.py extract-backfill --days 45 --max 150 --budget 25 --apply
+    uv run python scripts/collector_admin.py extract-backfill --incomplete          # unread or unfinished reads too
 
 reenable puts an origin (or one source) back to the start: no blocks, no transient count, no cool-down,
 not disabled. Clearing only `disabled` by hand would leave the block count at 3, and the next single
@@ -22,9 +23,15 @@ exposed people, or when someone asks for a notice to be removed.
 redaction-report counts stored notices whose title or department the current redaction would change
 (no titles printed). It does not write anything; public_data masks again on the way out anyway.
 
-extract-backfill reads the pages of stored notices that have no extracted facts yet (학사, 장학, 취업,
-국제 and 학과 boards; every stored notice, or those posted in the last --days) and stores what Claude
-reads there (kwcampus/extract.py), newest first, at most --max notices. Unlike the collector's page
+extract-backfill reads the pages of stored notices that have no extracted facts yet (every board with a
+page to read; every stored notice, or those posted in the last --days) and stores what Claude reads there
+(kwcampus/extract.py), newest first, at most --max notices. --incomplete also picks the notices with no read
+record (read before reading was recorded) or an unfinished one (partial, failed): each gets its read record,
+and Claude is asked again only when this read brought images or files it hadn't seen. The dry run prints
+the candidates per server, why they were picked, and at most how many requests they take (a page each, and
+up to 6 images and files, and 2 for redirects or icons; each notice is held to it) next to what each server
+has to spare today. A notice that already has facts gets Claude again only when this read brought a source its
+facts didn't use (images, attachments) or its text changed. Unlike the collector's page
 runs it also shows Claude the notice's own images (up to 4: posters are what students miss most) and
 the text of up to 2 attachments (PDF, HWP, HWPX, DOCX, XLSX, read here by kw_mcp.attachments, about 30
 pages each). Text goes through kwnotice.redaction first; images can't be, so a notice whose title may
@@ -35,8 +42,8 @@ so on a weekday it may read little. --extra-today N lifts that cap by N per serv
 list run is left today (the collectors check the plain cap); the minute between requests stays. Every Claude call goes into the spend ledger
 (../claude-spend/ledger.py) as "notice-backfill"; the run stops once --budget USD is used up. Only the
 extraction fields are written (extracted, extract_v, extracted_at, model, body_hash), which the
-dispatcher never turns into a Discord job. Stop it any time and run it again: a notice is written only
-when it is done, and done notices are not picked again.
+dispatcher never turns into a Discord job, and the read record. Stop it any time and run it again: a
+notice is written only when it is done, and done notices are not picked again.
 """
 
 from __future__ import annotations
@@ -59,6 +66,7 @@ from kwcampus.config import (
     DISCORD_TOKEN_PARAM,
     KST,
     NOTICE_SOURCE,
+    NOTICE_TTL,
     PUBLIC_TABLE,
 )
 from kwcampus.discordapi import NotFound, call, clean_token, token_problem
@@ -165,8 +173,18 @@ def redaction_report(public) -> dict[str, int]:
 
 PIPELINE = "notice-backfill"
 MIN_LEFT_USD = 0.3  # stop before a call when the budget has less than this left
-def backfill_candidates(public, days: int | None, now: datetime) -> list[dict]:
-    """Stored notices without facts of the current extraction version, newest first."""
+def _needs_read(item: dict, incomplete: bool) -> bool:
+    """No facts of the current extraction version; with --incomplete also no read record, or one that is not
+    done (partial, failed): the notices read before reading was recorded, and the ones it left short."""
+    if int(item.get("extract_v") or 0) < extract.EXTRACT_V:
+        return True
+    read = item.get("read") if isinstance(item.get("read"), dict) else None
+    return incomplete and (read is None or read.get("status") in ("partial", "failed"))
+
+
+def backfill_candidates(public, days: int | None, now: datetime, incomplete: bool = False) -> list[dict]:
+    """Stored notices with a page to read (every channel) that still need a read, newest first: without
+    facts of the current extraction version, or (incomplete) without a finished read record."""
     since = (now.astimezone(KST).date() - timedelta(days=days)).isoformat() if days else ""
     found = []
     for source in public_data.SOURCES:
@@ -175,8 +193,8 @@ def backfill_candidates(public, days: int | None, now: datetime) -> list[dict]:
             page = public.query(**kwargs)
             for item in page["Items"]:
                 if (item.get("removed") or (item.get("ttl") and int(item["ttl"]) <= now.timestamp())
-                        or int(item.get("extract_v") or 0) >= extract.EXTRACT_V
-                        or str(item.get("posted_date") or "") < since or not extract.wanted(item)):
+                        or not _needs_read(item, incomplete)
+                        or str(item.get("posted_date") or "") < since or extract.page_for(item) is None):
                     continue
                 found.append(item)
             if "LastEvaluatedKey" not in page:
@@ -188,11 +206,12 @@ def backfill_candidates(public, days: int | None, now: datetime) -> list[dict]:
 async def run_backfill(public, candidates: list[dict], max_notices: int, budget: float, spend, client=None,
                        now: Callable[[], datetime] = lambda: datetime.now(UTC), sleep=asyncio.sleep,
                        read=None, inner_transport=None, extra_today: int = 0, gap_s: float | None = None) -> Counter:
-    """One worker per server, each reading its notices in turn; Claude-only (the run is for its budget)."""
+    """One worker per server, each reading its notices in turn; Claude-only (the run is for its budget). Each
+    notice gets its read record; Claude is asked only when there is something it hasn't seen: no facts yet,
+    or images or files read this time."""
     from kw_mcp import notices
 
     read = read or notices.read_notice
-    gate = PoliteGate(public, now, sleep, refused=notices.Refused, extra_today=extra_today, gap_s=gap_s)
     counts: Counter = Counter()
     done = asyncio.Event()
 
@@ -200,32 +219,49 @@ async def run_backfill(public, candidates: list[dict], max_notices: int, budget:
         return WatchedTransport(public, now, inner_transport() if inner_transport else None)
 
     async def one(notice: dict) -> None:
+        tries = int((notice.get("read") or {}).get("tries") or 0) + 1
+        mine = PoliteGate(public, now, sleep, refused=notices.Refused, extra_today=extra_today, gap_s=gap_s,
+                          budget=request_bound(notice))  # this notice's requests: at most what the plan said
         try:
-            body, images, files = await notice_assets.read_parts(notice, read, gate, transport)
+            body, got = await notice_assets.read_parts(notice, read, mine, transport)
         except notices.Refused:
             raise
         except notices.NoticeError:  # 404, an empty page, a block (the transport noted it for the gate)
+            extract.store_read(public, notice, extract.read_record("failed", "failed", extract.no_assets(), tries,
+                                                                   now(), "page_error"))
             counts["page_error"] += 1
             return
-        sent, original = extract.compose(body, files)
-        sources = extract.sources_of(body, images, files)
-        if len(body.strip()) < extract.MIN_BODY_CHARS and not images and not files:
-            extract.store_facts(public, notice, None, extract.body_hash(original), "", now())
+        sent, original = extract.compose(body, got.files)
+        state = "ok" if len(body.strip()) >= extract.MIN_BODY_CHARS else "empty"
+        record = extract.read_record(extract.read_status(state, got), state, got, tries, now(), got.first_reason())
+        counts[f"read_{record['status']}"] += 1
+        if state == "empty" and not got.images and not got.files:
+            extract.store_facts(public, notice, None, extract.body_hash(original), "", now(), read=record,
+                                hashed_by="reader")
             counts["nothing_to_read"] += 1
+            return
+        used = set((notice.get("extracted") or {}).get("sources_used") or []) if isinstance(
+            notice.get("extracted"), dict) else None
+        if used is not None and set(extract.sources_of(body, got.images, got.files)) <= used and _unchanged(
+                notice, extract.body_hash(original)):
+            extract.store_read(public, notice, record)  # its facts stand: Claude would see nothing new
+            counts["recorded_only"] += 1
             return
         if spend.remaining(budget, PIPELINE) <= MIN_LEFT_USD:
             counts["budget_used"] += 1
             done.set()
             return
         try:
-            raw, _, model = await asyncio.to_thread(extract.ask_anthropic, notice, sent, client, tuple(images), PIPELINE)
+            raw, _, model = await asyncio.to_thread(extract.ask_anthropic, notice, sent, client, tuple(got.images),
+                                                    PIPELINE)
         except extract.ModelError as e:
             counts[f"model_{e.kind}"] += 1
             if e.kind in ("auth", "retry_later"):  # a key problem or Claude busy: stop, run again later
                 done.set()
             return
-        facts, _ = extract.validate(raw, notice, sent, original, sources)
-        if extract.store_facts(public, notice, facts, extract.body_hash(original), model, now()):
+        facts, _ = extract.validate(raw, notice, sent, original, extract.sources_of(body, got.images, got.files))
+        if extract.store_facts(public, notice, facts, extract.body_hash(original), model, now(), read=record,
+                               hashed_by="reader"):
             counts["extracted"] += 1
             counts.update(f"with_{s}" for s in facts["sources_used"] if s != "body")
 
@@ -247,11 +283,58 @@ async def run_backfill(public, candidates: list[dict], max_notices: int, budget:
     return counts
 
 
+def _hashed_by(notice: dict) -> str:
+    """Whose text the stored body_hash is of: "page" (a page run hashes the page's own text) or "reader" (this
+    backfill hashes kw_mcp's). Notices from before body_hash_by: the page runs answered with OpenAI's models."""
+    if notice.get("body_hash_by"):
+        return str(notice["body_hash_by"])
+    return "page" if str(notice.get("model") or "").startswith("gpt-") else "reader"
+
+
+def _unchanged(notice: dict, digest: str) -> bool:
+    """The text Claude would read is the one the stored facts came from. The same hash when it was made the
+    same way; a hash of the page run's text can't be compared, so then only if the notice has no recorded edit
+    since its facts were stored (store.upsert moves the ttl on every change). No stored hash: unknown."""
+    stored = notice.get("body_hash")
+    if not stored or not notice.get("extracted_at"):
+        return False
+    if _hashed_by(notice) == "reader":
+        return stored == digest
+    changed_at = int(notice.get("ttl") or 0) - int(NOTICE_TTL.total_seconds())
+    return int(notice["extracted_at"]) >= changed_at
+
+
+def request_bound(notice: dict) -> int:
+    """At most this many requests for one notice: its page, its images and files (what its read record found,
+    capped; the caps when unknown) and ASSET_SLACK. The backfill's gate holds each notice to it."""
+    cap = notice_assets.MAX_IMAGES + notice_assets.MAX_ATTACHMENTS
+    read = notice.get("read") if isinstance(notice.get("read"), dict) else None
+    if read and ("images" in read or "files" in read):
+        found = min(int((read.get("images") or {}).get("found") or 0), notice_assets.MAX_IMAGES) + min(
+            int((read.get("files") or {}).get("found") or 0), notice_assets.MAX_ATTACHMENTS)
+        cap = min(cap, found)
+    return 1 + cap + notice_assets.ASSET_SLACK
+
+
+def _why(item: dict) -> str:
+    if int(item.get("extract_v") or 0) < extract.EXTRACT_V:
+        return "no_facts"
+    read = item.get("read") if isinstance(item.get("read"), dict) else None
+    return "no_read_record" if read is None else str(read.get("status"))
+
+
 def backfill_plan(public, candidates: list[dict], now: datetime) -> dict[str, object]:
-    """Counts only: candidates per server and what each server has to spare today."""
+    """Counts only: candidates per server and why they were picked, the requests they may take at most (the
+    page, the images and files their read record found or the caps, and ASSET_SLACK each: request_bound, which
+    the run enforces), and what each server has to spare today."""
     per: Counter = Counter(extract.page_for(n)[0].origin for n in candidates)
     pages = {extract.page_for(n)[0].origin: extract.page_for(n)[0] for n in candidates}
+    bound: Counter = Counter()
+    for n in candidates:
+        bound[extract.page_for(n)[0].origin] += request_bound(n)
     return {"candidates": len(candidates), "by_server": dict(per),
+            "why": dict(sorted(Counter(_why(n) for n in candidates).items())),
+            "requests_at_most": dict(bound),
             "spare_today": {origin: extract.spare(public, page, now) for origin, page in pages.items()}}
 
 
@@ -278,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
                            "today (weekends, or after the last weekday run); still one request per server a minute")
     back.add_argument("--gap", type=float, default=None,
                       help="seconds between requests to one server for this run (at least 1; default: the collectors' 60)")
+    back.add_argument("--incomplete", action="store_true",
+                      help="also notices with no read record or an unfinished one (partial, failed), within the TTL")
     back.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
 
@@ -299,12 +384,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "extract-backfill":
         os.environ.setdefault("AWS_DEFAULT_REGION", args.region)  # SSM: the Claude key, in Seoul
         now = datetime.now(UTC)
-        candidates = backfill_candidates(public, args.days, now)
+        candidates = backfill_candidates(public, args.days, now, incomplete=args.incomplete)
         spend = extract.ledger()
         plan = backfill_plan(public, candidates, now)
         left = spend.remaining(args.budget, PIPELINE) if spend else None
-        print(" ".join(f"{k}={v}" for k, v in plan.items()), f"budget_left_usd={left if left is None else round(left, 2)}",
+        print(f"candidates={plan['candidates']} why={plan['why']}", f"budget_left_usd={left if left is None else round(left, 2)}",
               f"model={extract.MODELS['anthropic']}")
+        for origin, n in sorted(plan["by_server"].items()):
+            print(f"  {origin}: notices={n} requests_at_most={plan['requests_at_most'][origin]} "
+                  f"spare_today={plan['spare_today'][origin]}")
         if not args.apply:
             print("dry run: nothing read or written (add --apply)")
             return 0

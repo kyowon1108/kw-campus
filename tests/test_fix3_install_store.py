@@ -4,6 +4,7 @@ S41), and build_lambda.sh refuses a release cut from other kw-mcp code (C4). The
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -156,9 +157,22 @@ def _tree_and_release(tmp_path: Path, version: str = "1.0.0") -> tuple[Path, Pat
     return tree, release
 
 
-def _check(release: Path, tree: Path) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, "-", str(release), str(tree)], input=_release_check(), capture_output=True,
-                          text=True, timeout=60, check=False)
+def _check(release: Path, tree: Path, data: Path | None = None) -> subprocess.CompletedProcess:
+    data = data or tree / "dist" / "data"  # build_lambda passes $DATA_RELEASE whether it exists or not
+    return subprocess.run([sys.executable, "-", str(release), str(tree), str(data)], input=_release_check(),
+                          capture_output=True, text=True, timeout=60, check=False)
+
+
+def _data_release(tmp_path: Path, files: dict[str, bytes]) -> Path:
+    """A dist/data folder: the files under their package paths and data.json listing them (unsigned; the
+    signature is check-data's job, run before this check)."""
+    data = tmp_path / "data"
+    for name, body in files.items():
+        (data / name).parent.mkdir(parents=True, exist_ok=True)
+        (data / name).write_bytes(body)
+    listed = {name: {"sha256": hashlib.sha256(body).hexdigest(), "size": len(body)} for name, body in files.items()}
+    (data / "data.json").write_text(json.dumps({"files": listed}))
+    return data
 
 
 def test_build_lambda_accepts_a_release_of_exactly_the_tree(tmp_path):
@@ -189,5 +203,27 @@ def test_build_lambda_refuses_another_version_or_other_code(tmp_path):
 def test_build_lambda_runs_the_tree_check_before_building():
     script = BUILD_LAMBDA.read_text()
     signature = script.index('python -m kw_mcp.release check "$RELEASE"')
-    tree_check = script.index('python - "$RELEASE" "$KW_MCP_DIR" <<\'PY\'')
+    tree_check = script.index('python - "$RELEASE" "$KW_MCP_DIR" "$DATA_RELEASE" <<\'PY\'')
     assert signature < tree_check < script.index('rm -rf "$TMP" && mkdir -p "$TMP/lambda"')
+
+
+def test_build_lambda_takes_knowledge_and_rules_from_a_data_release(tmp_path):
+    """A data-only change: the tree's knowledge/ and rules/ files differ from the wheel but equal the data
+    release, so the build goes on; the code must still equal the wheel, and the data must equal the release."""
+    tree, release = _tree_and_release(tmp_path)
+    (tree / "src" / "kw_mcp" / "knowledge").mkdir()
+    (tree / "src" / "kw_mcp" / "knowledge" / "faq.json").write_bytes(b'{"entries": [2]}')
+    done = _check(release, tree)
+    assert done.returncode == 1 and "kw_mcp/knowledge/faq.json" in done.stderr  # no data release: wheel rules
+
+    data = _data_release(tmp_path, {"knowledge/faq.json": b'{"entries": [2]}'})
+    done = _check(release, tree, data)
+    assert done.returncode == 0, done.stderr
+
+    stale = _data_release(tmp_path / "stale", {"knowledge/faq.json": b'{"entries": [1]}'})
+    done = _check(release, tree, stale)
+    assert done.returncode == 1 and "kw_mcp/knowledge/faq.json" in done.stderr
+
+    (tree / "src" / "kw_mcp" / "service.py").write_bytes(b"def f():\n    return 2\n")
+    done = _check(release, tree, data)
+    assert done.returncode == 1 and "kw_mcp/service.py" in done.stderr  # code still needs a release

@@ -33,7 +33,7 @@ from datetime import date, datetime, timedelta
 import boto3
 from boto3.dynamodb.types import TypeDeserializer
 
-from kwcampus import params
+from kwcampus import params, smallboards
 from kwcampus.config import DISCORD_QUEUE_URL, KST, NOTIFY_ENABLED_PARAM, PINNED_MAX_AGE
 from kwcampus.kwnotice.redaction import NAME, redact_text
 from kwcampus.obs import log, metrics
@@ -91,9 +91,23 @@ def _edit_job(key: dict, old: dict, new: dict, channel: str) -> dict | None:
     posted_in = channel_for(str(old.get("category_id", ""))) or channel
     job = {"action": "edit", "key": key, "channel": posted_in, "changed": changed}
     school = any(field in changed for field in SCHOOL_FIELDS)
-    if not school or _our_redaction(old, new):
+    if not school or _our_redaction(old, new) or _our_date_fix(old, new):
         job["quiet"] = True
     return job
+
+
+# Boards whose list shows dates without a year (smallboards: gnuboard): a page run may correct the guessed year
+# (extract._fix_posted_date), moving the posting and updated dates together; the school edited nothing.
+GUESSED_DATES = frozenset(f"SRC#{b.source}" for b in smallboards.BOARDS if b.kind == "gnuboard")
+
+
+def _our_date_fix(old: dict, new: dict) -> bool:
+    """Exactly what extract._fix_posted_date writes: on a board in GUESSED_DATES, the posting and updated dates
+    equal before and after and moved together; the title and category untouched."""
+    return (str(new.get("PK")) in GUESSED_DATES and old.get("title") == new.get("title")
+            and old.get("category_id") == new.get("category_id")
+            and old.get("posted_date") == old.get("updated_date") and new.get("posted_date") == new.get("updated_date")
+            and old.get("posted_date") != new.get("posted_date"))
 
 
 def _undone_name(new_title: str, position: int, literal: str) -> int | None:

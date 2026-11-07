@@ -1,8 +1,9 @@
-from kwcampus import deptboards, routing, wixfeeds
+from kwcampus import deptboards, routing, smallboards, wixfeeds
 from kwcampus.routing import (
     CATEGORY_TO_CHANNEL,
     TOPIC_BY_KEY,
     TOPICS,
+    channel_for,
     is_urgent,
     name_risk,
     topic_for,
@@ -12,6 +13,9 @@ from kwcampus.routing import (
 
 def test_every_announced_category_has_a_topic():
     for category in CATEGORY_TO_CHANNEL:
+        if category == "office-alumni":  # the 학과 channel without a college: posted there, nobody pinged
+            assert topic_for(category) is None and channel_for(category) == "department"
+            continue
         assert topic_for(category) in TOPIC_BY_KEY, category
     assert topic_for("faq") is None  # never announced, so nothing to subscribe to
     assert topic_for("something-new") == "general"  # unknown categories go to 학교-공지
@@ -101,3 +105,15 @@ def test_titles_that_may_carry_a_name():
     assert name_risk("dept-biz", "2026 경영경진대회 수상자 명단") and name_risk("dept-media", "故 교수 부고")
     assert not name_risk("general", "2026학년도 국가장학금 선발 결과 안내")  # school-wide titles carry no names
     assert not name_risk("dept-ee", "[필독*] 수강신청 안내") and not name_risk("dept-ee", "제○회 학술제")
+
+
+def test_small_boards_channels():
+    """총동문회 goes to the 학과 channel (channels follow categories, not titles, so its 장학 posts can't go to
+    #장학 alone) and is read for extraction there; 총학생회 is 일반, 현장실습 취업. None rings 긴급."""
+    assert {b.category_id: channel_for(b.category_id) for b in smallboards.BOARDS} == {
+        "office-alumni": "department", "office-council": "notice", "office-internship": "career"}
+    assert topic_for("office-council") == "general" and topic_for("office-internship") == "career"
+    assert routing.CATEGORY_LABEL["office-alumni"] == "총동문회" and routing.CATEGORY_LABEL["office-council"] == "총학생회"
+    assert routing.CATEGORY_LABEL["office-internship"] == "현장실습"
+    assert not any(urgent_source(b.category_id) for b in smallboards.BOARDS)
+    assert not urgent_source("office-council") and is_urgent("귀향버스 운행 중단 안내")

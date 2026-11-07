@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from botocore.exceptions import ClientError
 
@@ -257,6 +257,7 @@ class RobotsCheck:
     result: str  # what came back
     disallow: tuple[str, ...] = ()  # rules for "User-agent: *" (none names kw-campus); * and $ as in RFC 9309
     crawl_delay: float = 0  # Crawl-delay seconds: the least gap after a request to this host (crawl_delay())
+    allow: tuple[str, ...] = ()  # Allow rules; the longest matching rule wins, Allow on a tie (RFC 9309)
 
 
 _NO_FILE = "no robots.txt (404)"
@@ -310,12 +311,42 @@ ROBOTS: dict[str, RobotsCheck] = {
     # E4
     "chemng.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
     "sports.kw.ac.kr": RobotsCheck("2026-11-06", "User-agent: * / Allow: /"),
+    # smallboards.py, each its own server: 총동문회 (www.kwuaa.com, the same server as http-only
+    # dongmoon.kw.ac.kr, whose robots.txt is a 404 too), 총학생회, and 현장실습지원팀, whose robots.txt allows
+    # /index.do only: its notice pages (/home/notice/view.do) are linked, never fetched.
+    "www.kwuaa.com": RobotsCheck("2026-11-07", _NO_FILE),
+    "www.kwu-studentcouncil.co.kr": RobotsCheck("2026-11-07", _NO_FILE),
+    # 총학생회's posters on Supabase storage (notice_assets.read_thumbnail: /storage/v1/object/public/uploads/images/)
+    "lqptfesfsgpdjlzwxhbt.supabase.co": RobotsCheck("2026-11-08", "no robots.txt (404 with a JSON error)"),
+    # Its "allow: /index.do" is kept exact here ($): the home page itself, nothing under or after it.
+    "internship.kw.ac.kr": RobotsCheck("2026-11-07", "User-agent: * / Disallow: / / allow: /index.do", ("/",),
+                                       allow=("/index.do$",)),
     # Wix (auto-generated files: everything but lightbox URLs; only AdsBot and PetalBot get more)
     "www.kwuarchitecture.com": RobotsCheck("2026-11-06", "User-agent: * / Allow: / / Disallow: *?lightbox=",
                                            ("*?lightbox=",)),
     "www.kwmedia.info": RobotsCheck("2026-11-06", "User-agent: * / Allow: / / Disallow: *?lightbox=",
                                     ("*?lightbox=",)),
 }
+
+
+def _resolved(path: str) -> str:
+    """The path as the server reads it: %-escapes decoded, then "." and ".." segments removed as in RFC 3986
+    5.2.4, a last "." or ".." keeping its "/" (/internship/%2e is /internship/, /a/b/.. is /a/)."""
+    segments = unquote(path).split("/")
+    out: list[str] = []
+    for i, segment in enumerate(segments):
+        last = i == len(segments) - 1
+        if segment in (".", ".."):
+            if segment == ".." and len(out) > 1:
+                out.pop()
+            if last:
+                out.append("")
+        else:
+            out.append(segment)
+    return "/".join(out) or "/"
+
+
+_ODD_PATH = re.compile(r";|//|%2e", re.IGNORECASE)
 
 
 def _rule(pattern: str) -> re.Pattern[str]:
@@ -331,14 +362,33 @@ def crawl_delay(url: str) -> float:
 
 
 def robots_allows(url: str) -> bool:
-    """False for a host never checked by hand, or a path its robots.txt disallows (fail closed)."""
-    parts = urlsplit(url)
-    check = ROBOTS.get(parts.hostname or "")
+    """False for a host never checked by hand, or a path its robots.txt disallows (fail closed). The longest
+    matching rule decides, an Allow on a tie: "Disallow: /" with "Allow: /index.do$" lets /index.do through only.
+    The path is judged both as written and as the server resolves it (%-escapes, dot segments); a Disallow
+    either one meets refuses it. On a host with Allow rules a path with ";", "//" or an escaped dot is refused
+    outright: an Allow must never let a disguised path through."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+    except ValueError:
+        return False
+    check = ROBOTS.get(host)
     if check is None:
         return False
-    target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
-    # "*?lightbox=" style rules match anywhere after the first character, like Google's reading
-    return not any(_rule(rule if rule.startswith("/") else "/" + rule).match(target) for rule in check.disallow)
+    path, query = parts.path or "/", f"?{parts.query}" if parts.query else ""
+    if check.allow and _ODD_PATH.search(path):
+        return False
+
+    def longest(rules: tuple[str, ...], target: str) -> int:
+        # "*?lightbox=" style rules match anywhere after the first character, like Google's reading
+        return max((len(rule) for rule in rules if _rule(rule if rule.startswith("/") else "/" + rule).match(target)),
+                   default=-1)
+
+    def judged(target: str) -> bool:
+        blocked = longest(check.disallow, target)
+        return blocked < 0 or longest(check.allow, target) >= blocked
+
+    return judged(path + query) and judged(_resolved(path) + query)
 
 
 def robots_skip(source: str, url: str) -> dict[str, object]:

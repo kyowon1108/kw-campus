@@ -35,15 +35,18 @@ if [ -f "$DATA_RELEASE/data.json" ]; then
 fi
 # The released version is the tree's pyproject.toml version, and the wheel's kw_mcp code and data
 # (*.py, and the rules/knowledge *.json) equal the tree's src/kw_mcp byte for byte (the comparison
-# release.sign_mcpb makes for the extension).
-uv run --project "$KW_MCP_DIR" --frozen --quiet python - "$RELEASE" "$KW_MCP_DIR" <<'PY'
+# release.sign_mcpb makes for the extension). With a data release, the tree's knowledge/ and rules/
+# files are compared with that release instead of the wheel: a data-only change ships through
+# dist/data without a new app release, and the tests still ran on the same data the bridge serves.
+uv run --project "$KW_MCP_DIR" --frozen --quiet python - "$RELEASE" "$KW_MCP_DIR" "$DATA_RELEASE" <<'PY'
 import json
 import sys
 import tomllib
 import zipfile
 from pathlib import Path
 
-release, tree = Path(sys.argv[1]), Path(sys.argv[2])
+release, tree, data_release = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+DATA_DIRS = ("kw_mcp/knowledge/", "kw_mcp/rules/")
 manifest = json.loads((release / "latest.json").read_text(encoding="utf-8"))
 version = tomllib.loads((tree / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 if manifest["version"] != version:
@@ -55,6 +58,11 @@ in_tree = {p.relative_to(src).as_posix(): p.read_bytes() for p in (src / "kw_mcp
            if p.is_file() and p.name.endswith(compared) and "__pycache__" not in p.parts}
 with zipfile.ZipFile(release / manifest["wheel"]) as wheel:
     in_wheel = {n: wheel.read(n) for n in wheel.namelist() if n.startswith("kw_mcp/") and n.endswith(compared)}
+if (data_release / "data.json").is_file():
+    # check-data above verified the signature and that the folder holds exactly the listed files
+    listed = json.loads((data_release / "data.json").read_text(encoding="utf-8"))["files"]
+    in_wheel = {n: b for n, b in in_wheel.items() if not n.startswith(DATA_DIRS)}
+    in_wheel.update({f"kw_mcp/{name}": (data_release / name).read_bytes() for name in listed})
 if in_wheel != in_tree:
     differ = sorted(n for n in in_tree.keys() | in_wheel.keys() if in_tree.get(n) != in_wheel.get(n))
     sys.exit(f"error: the code in {manifest['wheel']} differs from {src}/kw_mcp ({', '.join(differ[:5])}). "

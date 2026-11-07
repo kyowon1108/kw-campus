@@ -151,8 +151,9 @@ class KwCampusStack(cdk.Stack):
                 max_event_age=max_event_age,
             )
 
-        # Up to 8 requests a run (www, E1-E4, two Wix hosts, www again after a 61 s wait), each
-        # bounded by fetch.WORST_CASE_S; a collector with less time left than that skips its request.
+        # Up to 11 requests a run (www, E1-E4, two Wix hosts, the 총동문회, 총학생회 and 현장실습 servers, www
+        # again after a 61 s wait), each bounded by fetch.WORST_CASE_S; a collector with less time left than
+        # that skips its request (most runs need far fewer: the Wix hosts and smallboards come every 2-4 hours).
         # retries=0: a failed or slow run must not hit the school's servers again a minute later.
         # One at a time: a manual run can never overlap a scheduled one (the 60 s gap holds), and a
         # run held back by that is dropped after 5 minutes instead of retried for hours.
@@ -224,20 +225,29 @@ class KwCampusStack(cdk.Stack):
         reminders.add_to_role_policy(iam.PolicyStatement(
             actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/collector/notify"]))
 
-        # ops digest: only what the message counts. kw-public: the gate and source state rows and the notices'
-        # first_seen (ORIGIN#*, SRC#*); kw-bridge: the invite counters (DINVITES#*); the two Discord queues'
+        # ops digest: only what the message counts. kw-public: the gate and source state rows, the notices'
+        # first_seen and read record (ORIGIN#*, SRC#*), when read records began (MARK#*), the page queue's ages
+        # (BODYQ); kw-bridge: the invite counters (DINVITES#*); the two Discord queues'
         # sizes and one send to the first; the KwCampus metrics and the kw-* alarms. No SSM, no table writes.
         ops_digest.add_to_role_policy(iam.PolicyStatement(
             actions=["dynamodb:GetItem"], resources=[public.table_arn],
-            conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["ORIGIN#*", "SRC#*"]}}))
-        # The notices' Query may return only what opsdigest.QUERY_ATTRIBUTES projects (no titles). AWS wants
-        # the key attributes in dynamodb:Attributes too: the key condition names them.
+            conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["ORIGIN#*", "SRC#*", "MARK#*"]}}))
+        # The notices' Query may return only what opsdigest.QUERY_ATTRIBUTES projects (no titles; `read` is the
+        # read record: counts and reasons, no text). AWS wants the key attributes in dynamodb:Attributes too:
+        # the key condition names them.
         ops_digest.add_to_role_policy(iam.PolicyStatement(
             actions=["dynamodb:Query"], resources=[public.table_arn],
             conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["SRC#*"]},
                         "ForAllValues:StringEquals": {"dynamodb:Attributes": [
-                            "PK", "SK", "first_seen", "seed", "removed"]},
-                        "StringEqualsIfExists": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"}}))
+                            "PK", "SK", "first_seen", "seed", "removed", "read", "extract_v"]},
+                        "StringEquals": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"}}))
+        # The page queue's length and age: queued_at only (opsdigest.QUEUE_ATTRIBUTES), never the rows' text. The
+        # projection is required (Select must be SPECIFIC_ATTRIBUTES, not merely allowed to be).
+        ops_digest.add_to_role_policy(iam.PolicyStatement(
+            actions=["dynamodb:Query"], resources=[public.table_arn],
+            conditions={"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["BODYQ"],
+                                                      "dynamodb:Attributes": ["PK", "SK", "queued_at"]},
+                        "StringEquals": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"}}))
         ops_digest.add_to_role_policy(iam.PolicyStatement(
             actions=["dynamodb:GetItem"], resources=[bridge_table.table_arn],
             conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["DINVITES#*"]}}))

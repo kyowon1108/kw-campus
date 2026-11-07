@@ -18,7 +18,15 @@ from kw_mcp import notices
 from mcp.server.mcpserver.exceptions import ToolError
 from test_bridge import FakeDevice, mcp_call, oauth, register, tool
 
-from kwcampus import aicon, deptboards, politeness, public_data, wixfeeds, wwwboards
+from kwcampus import (
+    aicon,
+    deptboards,
+    politeness,
+    public_data,
+    smallboards,
+    wixfeeds,
+    wwwboards,
+)
 from kwcampus.bridge import app as bridge
 from kwcampus.bridge import notice_reader, store
 from kwcampus.config import KST
@@ -95,6 +103,11 @@ def _count(env, host: str) -> dict:
     return env["table"].get_item(Key={"PK": f"NOTICEHOST#{host}", "SK": f"DAY#{_day()}"}).get("Item") or {}
 
 
+GNU_ROW = """<div class="clearfix pr bl"><div class="e_num">71</div><div class="e_subject">
+<a href="https://www.kwuaa.com/bbs/board.php?bo_table=notice&amp;wr_id=86">장학생 선발 안내</a></div>
+<div class="m_view"><div class="e_date">08-28</div></div></div>"""
+
+
 # --- one list of hosts ----------------------------------------------------------------------------
 
 # Boards kw-campus collects ahead of the released extension (kw-mcp 1.1.0, whose tables the bridge also
@@ -110,8 +123,10 @@ def test_allowed_hosts_are_the_collectors_hosts():
     assert notices.DEPT_BOARDS == {b.key: (b.name, b.host, b.path, b.group) for b in known}
     assert notices.WIX_SITES == {f.key: (f.name, f.host) for f in wixfeeds.FEEDS}
     assert {notices.WWW_BOARDS[b.source] for b in wwwboards.BOARDS} == {b.path for b in wwwboards.BOARDS}
+    gnu = [b for b in smallboards.BOARDS if b.kind == "gnuboard"]  # 총동문회; 총학생회 and 현장실습 are never read
+    assert notices.GNU_BOARDS == {b.key: (b.name, b.host, b.path.split("bo_table=")[1]) for b in gnu}
     assert notices.PAGE_HOSTS == {"www.kw.ac.kr", aicon.HOST, *(b.host for b in known),
-                                  *(f.host for f in wixfeeds.FEEDS)}
+                                  *(f.host for f in wixfeeds.FEEDS), *(b.host for b in gnu)}
     assert notices.DEPARTMENT_OF_HOST[aicon.HOST] == aicon.CATEGORY_NAME
     assert all(host in politeness.ROBOTS for host in notices.PAGE_HOSTS)  # every page host was checked by hand
     assert "job.kw.ac.kr" in politeness.ROBOTS and "job.kw.ac.kr" in notices.PAGE_HOSTS  # 경력개발팀 (Crawl-delay 10)
@@ -128,8 +143,14 @@ def test_every_collected_notice_link_is_readable():
     links = [b.post_url("123") for b in deptboards.BOARDS if b not in ahead] + [b.post_url("456") for b in wwwboards.BOARDS]
     links += [str(build_detail_url(DUID("53151"))), f"https://{aicon.HOST}/administration/notice.php?admin_mode=read&no=3525"]
     links += [f"https://{f.host}/post/some-post" for f in wixfeeds.FEEDS]
+    links += [smallboards.parse_gnuboard(GNU_ROW, smallboards.ALUMNI, datetime(2026, 11, 7).date())[0].source_url]
     for link in links:
         assert notices.check_url(link) == link
+    assert notices.url_for_post_id("alumni-86") == "https://www.kwuaa.com/bbs/board.php?bo_table=notice&wr_id=86"
+    for link in ("https://www.kwu-studentcouncil.co.kr/notices/cl1789744612718sbnrjp7",
+                 "https://internship.kw.ac.kr/home/notice/view.do?bbsSeq=689", "https://internship.kw.ac.kr/index.do"):
+        with pytest.raises(notices.NoticeError):  # 총학생회 and 현장실습 notices are links only
+            notices.check_url(link)
     for source, raw in [("kw-notice", "53151"), ("dept-ee", "646"), ("dept-chemng", "78"), ("aicon", "3525"), ("kw-job", "9")]:
         url = (str(build_detail_url(DUID(raw))) if source == "kw-notice" else
                f"https://{aicon.HOST}/administration/notice.php?admin_mode=read&no={raw}" if source == "aicon" else
@@ -234,6 +255,85 @@ def test_interval_is_shared_by_every_instance(env):
     day = datetime.fromtimestamp(now[0], UTC).astimezone(KST).strftime("%Y-%m-%d")
     item = env["table"].get_item(Key={"PK": "NOTICEHOST#electric.kw.ac.kr", "SK": f"DAY#{day}"})["Item"]
     assert item["n"] == 2
+
+
+def test_a_hosts_crawl_delay_spaces_the_connectors_requests(env):
+    """job.kw.ac.kr's robots.txt asks for Crawl-delay: 10. The connector waits that long between two requests
+    there (from any instance), and keeps its own interval elsewhere."""
+    now, waits = [1_800_000_000.0], []
+
+    async def sleep(seconds):
+        waits.append(round(seconds, 2))
+        now[0] += seconds
+
+    job = "https://job.kw.ac.kr/community/notice.php?BoardMode=view&UID=12631"
+    assert notice_reader.gap_s(job) == politeness.crawl_delay(job) == 10 and notice_reader.gap_s(PAGE_URL) == 3.0
+    first = notice_reader.BridgeGate(env["table"], clock=lambda: now[0], sleep=sleep)
+    second = notice_reader.BridgeGate(env["table"], clock=lambda: now[0], sleep=sleep)
+    for gate in (first, second, first):
+        asyncio.run(gate.before(job))
+    assert sum(waits) == 20.0 and max(waits) <= 10  # 10 s before each of the second and third requests
+    waits.clear()
+    asyncio.run(first.before(PAGE_URL))
+    asyncio.run(second.before(PAGE_URL))
+    assert waits == [notice_reader.MIN_INTERVAL_S]
+
+
+def test_internship_notices_are_links_only_on_the_connector(env, school):
+    """현장실습's robots.txt allows /index.do only: the connector refuses its notices without a request."""
+    for url in ("https://internship.kw.ac.kr/home/notice/view.do?bbsSeq=689", "https://internship.kw.ac.kr/index.do",
+                "https://internship.kw.ac.kr/download.do?fileSn=1"):
+        with pytest.raises(ToolError):
+            asyncio.run(notice_reader.read_notice(url=url))
+    gate = notice_reader.BridgeGate(env["table"])
+    with pytest.raises(notices.Refused, match="robots"):  # even if kw-mcp ever listed the host
+        asyncio.run(gate.before("https://internship.kw.ac.kr/home/notice/view.do?bbsSeq=689"))
+    assert school.requests == []
+
+
+ALUMNI_POST_URL = "https://www.kwuaa.com/bbs/board.php?bo_table=notice&wr_id=86"
+ALUMNI_POSTER = "https://www.kwuaa.com/data/editor/2608/thumb-2ff575866c189d75c8e21d9ea9d579ca_1787893581_0391_835x1181.jpg"
+
+
+def test_alumni_posts_are_read_with_their_poster_but_never_their_files(env, school):
+    """총동문회's download.php wants the session that viewed the post: the connector never asks for a file there."""
+    from pathlib import Path
+
+    school.pages[ALUMNI_POST_URL] = html((Path(__file__).parent / "fixtures" / "gnuboard_kwuaa_notice_86.html").read_text())
+    school.pages[ALUMNI_POSTER] = httpx.Response(200, content=png(835, 1181))
+    blocks = asyncio.run(notice_reader.read_notice(url=ALUMNI_POST_URL, images=True))
+    data = json.loads(blocks[0].text)
+    assert data["title"] == "2026년도 광운대학교 총동문회 장학생 선발 안내" and data["attachments"] == []
+    assert "첨부 파일 2개" in data["note"] and [b.type for b in blocks].count("image") == 1
+    with pytest.raises(ToolError, match="브라우저로만"):
+        asyncio.run(notice_reader.read_notice(url=ALUMNI_POST_URL, attachment=1))
+    assert [str(r.url) for r in school.requests] == [ALUMNI_POST_URL, ALUMNI_POSTER]  # no download.php, ever
+    assert _count(env, "www.kwuaa.com")["n"] == 2
+
+
+def test_small_sites_keep_their_own_daily_cap_on_the_connector(env, school):
+    cap = notice_reader.cap_for("www.kwuaa.com")
+    assert cap == smallboards.ALUMNI.daily_cap == 12 and notice_reader.cap_for("electric.kw.ac.kr") == notice_reader.DAILY_CAP
+    assert notice_reader.HOST_CAPS == {b.host: b.daily_cap for b in smallboards.BOARDS}
+    env["table"].put_item(Item={"PK": "NOTICEHOST#www.kwuaa.com", "SK": f"DAY#{_day()}", "n": cap, "next_at": 0,
+                                "ttl": 2**31 - 1})
+    with pytest.raises(ToolError, match="12번"):
+        asyncio.run(notice_reader.read_notice(url=ALUMNI_POST_URL))
+    assert school.requests == []
+
+
+@pytest.mark.parametrize("state", [{"cooldown_until": 2**31 - 1}, {"disabled": True}])
+def test_a_server_the_collectors_rest_is_not_read_by_the_connector(env, school, state):
+    """403/429 or repeated failures cooled the collectors' gate for that server down (or a human switched it
+    off): the connector leaves it alone too."""
+    origin = deptboards.SERVER_E1  # electric.kw.ac.kr
+    env["public"].put_item(Item={"PK": f"ORIGIN#{origin}", "SK": "STATE", **state})
+    with pytest.raises(ToolError, match="쉬는 중"):
+        asyncio.run(notice_reader.read_notice(url=PAGE_URL))
+    assert school.requests == []
+    env["public"].delete_item(Key={"PK": f"ORIGIN#{origin}", "SK": "STATE"})
+    asyncio.run(notice_reader.read_notice(url=PAGE_URL))  # back to normal
+    assert len(school.requests) == 1
 
 
 def test_waiting_past_the_deadline_gives_up(env):

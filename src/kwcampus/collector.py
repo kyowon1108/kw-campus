@@ -2,7 +2,8 @@
 
 Runs on a schedule, only when the kill switch is on and each server's gate allows it. The main
 board goes first with one request to www.kw.ac.kr; the department servers get one request each
-(the 인공지능융합대학 widget shares its server's), and the Wix blog feeds one per host every 2 hours.
+(the 인공지능융합대학 widget shares its server's), the Wix blog feeds one per host every 2 hours, and
+총동문회, 총학생회 and 현장실습 one each every 2 or 4 hours (smallboards, each on its own server).
 Every couple of hours a second www request reads the 취업게시판 or the FAQ, 61 s after the first.
 
 The page runs (event {"phase": "pages"}, 10 minutes after each daytime list run) read queued notice
@@ -23,6 +24,7 @@ from kwcampus import (
     extract,
     params,
     politeness,
+    smallboards,
     store,
     wixfeeds,
     wwwboards,
@@ -129,7 +131,8 @@ def handler(event, context):
             return out
     if out.get("status") != "disabled":  # same kill switch; each server keeps its own gate
         # www's extra boards go last: they may wait out the 60 s gap after the main board's request.
-        for name, source in (("aicon", aicon), ("dept", deptboards), ("wix", wixfeeds), ("www", wwwboards)):
+        for name, source in (("aicon", aicon), ("dept", deptboards), ("wix", wixfeeds), ("small", smallboards),
+                             ("www", wwwboards)):
             try:
                 out = {**out, name: source.collect(now, table, clock=clock, time_left=time_left)}
             except Exception as e:  # noqa: BLE001 - one site's trouble must not fail the main run or the others

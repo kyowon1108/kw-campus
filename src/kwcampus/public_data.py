@@ -16,7 +16,9 @@ and for the department, the department's copy comes back; other departments' cop
 
 A notice whose page was read (extract.py) also carries "extracted" (deadlines, 대상, 자격, 신청 방법,
 금액, 문의 부서, as a model read them) and "deadline": the earliest 신청마감 still ahead, else the
-earliest deadline still ahead, else the earliest one. Rows without them keep their old shape.
+earliest deadline still ahead, else the earliest one. One read only in part also carries "read":
+{"status": partial | pending | failed | title_only | privacy_skip, "missing": [body, images, files]}, so an
+assistant can send students to the original poster. Rows without them keep their old shape.
 open_only / deadline_after keep only notices whose deadline is today or later (KST) / on or after a day.
 search also looks in those facts as served (masked), title and department matches first.
 """
@@ -31,7 +33,7 @@ from datetime import UTC, date, datetime
 from boto3.dynamodb.conditions import Key
 from kw_mcp.combined import COLLEGE_OF_DEPARTMENT
 
-from kwcampus import deptboards, extract, wixfeeds, wwwboards
+from kwcampus import deptboards, extract, smallboards, wixfeeds, wwwboards
 from kwcampus.config import KST, NOTICE_SOURCE
 from kwcampus.kwnotice.redaction import redact_text
 from kwcampus.routing import CATEGORY_LABEL, QUIET_CATEGORIES
@@ -64,9 +66,13 @@ _ALIASES: dict[str, frozenset[str]] = {
     "전정대": frozenset({"dept-ei"}), "전자정보공대": frozenset({"dept-ei"}), "인사대": frozenset({"dept-chss"}),
     "경영대": frozenset({"dept-biz"}), "참빛": frozenset({"dept-kwlife"}), "인제니움": frozenset({"dept-ingenium"}),
     "미컴": frozenset({"dept-media"}),
+    "동문회": frozenset({"office-alumni"}), "동문": frozenset({"office-alumni"}),
+    "학생회": frozenset({"office-council"}), "실습": frozenset({"office-internship"}),
 }
-# Every collected board: the main notice board, department boards and feeds, the 취업게시판 and the FAQ.
-SOURCES = (NOTICE_SOURCE, "aicon", *(b.source for b in (*deptboards.BOARDS, *wixfeeds.FEEDS, *wwwboards.BOARDS)))
+# Every collected board: the main notice board, department boards and feeds, the 취업게시판, the FAQ, and
+# 총동문회, 총학생회 and 현장실습 (smallboards).
+SOURCES = (NOTICE_SOURCE, "aicon", *(b.source for b in (*deptboards.BOARDS, *wixfeeds.FEEDS, *wwwboards.BOARDS,
+                                                         *smallboards.BOARDS)))
 
 
 class UnknownCategory(ValueError):
@@ -247,6 +253,8 @@ def public_view(item: dict) -> dict:
         facts = extract.public_facts(item)
         row["deadline"] = extract.deadline_of(facts, _today())
         row["extracted"] = facts
+    if gaps := extract.read_gaps(item):  # read only in part: the original may hold more (a poster, a form)
+        row["read"] = gaps
     return row
 
 

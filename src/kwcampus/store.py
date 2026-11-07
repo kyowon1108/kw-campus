@@ -48,6 +48,13 @@ def content_hash(n: NoticeSummary) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
+def item_hash(item: dict) -> str:
+    """content_hash of a stored notice item (its fields as notice_item wrote them)."""
+    raw = "\x1f".join([str(item.get("title", "")), str(item.get("category_id", "")), str(item.get("department", "")),
+                       str(item.get("updated_date", "")), str(bool(item.get("pinned")))])
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
 def title_key(title: str) -> str:
     """"[대학혁신지원사업] 2026 광운대학교 취업박람회 개최 안내" -> "2026광운대학교취업박람회개최안내"."""
     return _NOT_WORD.sub("", _TAGS.sub("", title)).casefold()
@@ -85,6 +92,25 @@ def queue_body(table, item: dict[str, object]) -> None:
         "notice_pk": item["PK"], "notice_sk": item["SK"], "queued_at": at,
         "ttl": at + int(BODY_QUEUE_TTL.total_seconds()),
     })
+
+
+def queue_extra(table, item: dict[str, object], fields: dict[str, object]) -> bool:
+    """Add `fields` to the notice's page-queue row, if it has one (smallboards: 총학생회's masked text, which
+    comes with its list and has no page of its own). The row and the fields go once the notice is read."""
+    names = {f"#f{i}": k for i, k in enumerate(fields)}
+    try:
+        table.update_item(
+            Key={"PK": BODY_QUEUE, "SK": f"{item['PK']}|{item['SK']}"},
+            UpdateExpression="SET " + ", ".join(f"#f{i} = :f{i}" for i in range(len(fields))),
+            ConditionExpression="attribute_exists(PK)",
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues={f":f{i}": v for i, v in enumerate(fields.values())},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        raise
+    return True
 
 
 def upsert(table, item: dict[str, object]) -> str:

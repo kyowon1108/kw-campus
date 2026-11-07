@@ -33,7 +33,7 @@ from starlette.responses import (
     Response,
 )
 
-from kwcampus import deptboards, invites, politeness, wixfeeds
+from kwcampus import deptboards, invites, politeness, smallboards, wixfeeds
 from kwcampus.bridge import signing, store
 from kwcampus.config import DELIVERY_TTL, NOTICE_TTL, WWW_DAILY_CAP
 
@@ -197,10 +197,10 @@ KLAS는 사용자 본인의 PC에서 본인 계정으로 읽기만 하며, 제�
 
 <h3>3. 학교 공지 수집과 Discord 알림 채널</h3>
 <p><b>수집하는 곳과 방식</b>: 학교 홈페이지(www.kw.ac.kr)의 공지·취업게시판·FAQ·학식·학사일정, 인공지능융합대학(aicon.kw.ac.kr)과 학과·단과대·학교 부서·사업단 사이트(*.kw.ac.kr)의 공지 게시판 첫 페이지,
-학과 블로그 피드(__FEED_HOSTS__)를 읽습니다. 로그인이 필요한 페이지는 읽지 않습니다. 학사·장학·취업·국제·학과 공지는 새 글이 올라오면 그 글의 본문·첨부·포스터 이미지를 한 번 더 읽어 마감·대상·신청 방법을 뽑고, 뽑은 내용과 본문의 해시만 저장합니다(본문은 저장하지 않음). 이 요약은 OpenAI의 API로 만들고 일부는 Anthropic의 Claude API로 만들며, 보내기 전에 본문과 첨부 글의 연락처·학번·사람 이름을 가립니다(이미지 속 글자는 가릴 수 없음). 명단·합격·수상처럼 사람 이름이 들어갈 수 있는 공지는 본문만 보내고 이미지와 첨부는 보내지 않습니다. 그 글의 이미지와 첨부 파일은 브라우저가 글을 열 때처럼 본문 바로 뒤에 __ASSET_GAP_S__초 간격으로 받으며, 이 요청도 하루 상한에 들어갑니다. 커넥터에서 학생이 공지 하나를 직접 읽어 달라고 하면 그때 그 글을 읽어 답하고 저장하지 않습니다.
+학과 블로그 피드(__FEED_HOSTS__), __SMALL_SITES__의 공지 목록을 읽습니다. 현장실습 사이트는 robots.txt가 허용하는 첫 화면(/index.do)만 읽고, 공지 글과 첨부는 열지 않습니다. 로그인이 필요한 페이지는 읽지 않습니다. 새 공지가 올라오면 그 글의 본문·첨부·포스터 이미지를 한 번 더 읽어 마감·대상·신청 방법을 뽑고, 뽑은 내용과 본문의 해시, 무엇을 읽었는지(이미지·첨부의 개수, 못 읽은 이유, 주소의 해시)만 저장합니다(본문은 저장하지 않음). 글을 열 수 없는 곳(현장실습, 학과 블로그)은 제목만 남깁니다. 총학생회 글은 목록에 본문이 함께 와서, 연락처·이름을 가린 본문을 읽을 때까지만(길어야 __QUEUE_DAYS__일) 임시로 두고 읽으면 지우며, 포스터는 총학생회 사이트의 저장소(__THUMB_HOST__)에서 하루 __THUMB_CAP__번까지 받습니다. 이 요약은 OpenAI의 API로 만들고 일부는 Anthropic의 Claude API로 만들며, 보내기 전에 본문과 첨부 글의 연락처·학번·사람 이름을 가립니다(이미지 속 글자는 가릴 수 없음). 명단·합격·수상처럼 사람 이름이 들어갈 수 있는 공지는 본문만 보내고 이미지와 첨부는 보내지 않습니다. 그 글의 이미지와 첨부 파일은 브라우저가 글을 열 때처럼 본문 바로 뒤에 __ASSET_GAP_S__초 간격으로 받으며, 이 요청도 하루 상한에 들어갑니다. 커넥터에서 학생이 공지 하나를 직접 읽어 달라고 하면 그때 그 글을 읽어 답하고 저장하지 않습니다. 커넥터의 요청은 수집기의 요청과 따로 셉니다: 사이트마다 하루 __BRIDGE_CAP__번까지, __SMALL_CAPS__까지이고(수집기도 같은 수를 따로 씁니다. 예를 들어 총동문회 사이트에는 수집기 하루 __ALUMNI_CAP__번, 커넥터 하루 __ALUMNI_CAP__번), 수집이 쉬고 있는 서버에는 보내지 않습니다.
 요청은 AWS 서울 리전에서 평일 09:00~18:40에 20분마다와 21:00에 보냅니다(학식·학사일정은 평일 07:30). 한 번 돌 때 서버마다 한 번 요청합니다.
 학교 홈페이지만 예외로, 취업게시판이나 FAQ를 볼 때(한 번에 둘 중 하나)와 평일 07:30에 학식과 학사일정을 함께 받을 때 __GAP_S__초 넘게 기다렸다가 한 번 더 요청합니다.
-같은 서버에는 __GAP_S__초 이상 간격을 두고, 하루 상한(학교 홈페이지 __WWW_CAP__번, 학과·부서 사이트는 서버마다 __DEPT_CAP__번, 블로그 피드는 호스트마다 __FEED_CAP__번)을 넘기지 않습니다. 403·429·보안문자 화면을 받으면 그 서버를 쉬고, 세 번 연속이면 운영자가 다시 켤 때까지 요청하지 않습니다.
+같은 서버에는 __GAP_S__초 이상 간격을 두고, 하루 상한(학교 홈페이지 __WWW_CAP__번, 학과·부서 사이트는 서버마다 __DEPT_CAP__번, 블로그 피드는 호스트마다 __FEED_CAP__번, __SMALL_NAMES__ 사이트는 서버마다 __SMALL_CAP__번)을 넘기지 않습니다. __SMALL_NAMES__ 사이트는 __SMALL_EVERY__시간마다 한 번만 봅니다. 403·429·보안문자 화면을 받으면 그 서버를 쉬고, 세 번 연속이면 운영자가 다시 켤 때까지 요청하지 않습니다.
 요청의 User-Agent에 이 페이지 주소를 적어 둡니다. 사이트 관리자께서 수집을 원하지 않으시면 아래 보호책임자 이메일로 알려 주세요. 그 사이트 수집을 멈추고 회신합니다.</p>
 <p><b>공지 제목 속 이름</b>: 합격자·수상자 명단처럼 공지 제목에 사람 이름이 들어 있을 수 있습니다. 저장하기 전에 규칙으로 이름·연락처·학번을 가리지만 빠지는 경우가 있습니다.
 내 이름이 나온 공지를 지우고 싶으면 보호책임자에게 이메일로 알려 주세요. 저장된 공지, Discord 메시지, 전달 기록을 지우고 다음 수집에서 다시 올리지 않습니다.</p>
@@ -256,6 +256,12 @@ PC 에이전트의 답은 그 서비스로 전달됩니다. 전달된 답은 해
 def privacy_page() -> str:
     """/privacy with each retention period read from the constant that enforces it, so the notice
     can't drift from the code (as "180일" once did while grants ran 120 days)."""
+    # the connector's notice reader (kw_mcp), only for its cap; the poster reader (httpx), only for its cap
+    from kwcampus.bridge import notice_reader
+    from kwcampus.extract import READ_WINDOW, TTL_MARGIN
+    from kwcampus.notice_assets import THUMB_DAILY_CAP
+    from kwcampus.store import BODY_QUEUE_TTL
+
     periods = {
         "__GRANT_DAYS__": store.GRANT_TTL // 86400,
         "__CLIENT_PENDING_DAYS__": store.CLIENT_PENDING_TTL // 86400,
@@ -278,6 +284,18 @@ def privacy_page() -> str:
         "__WWW_CAP__": WWW_DAILY_CAP,
         "__DEPT_CAP__": deptboards.DAILY_CAP,
         "__FEED_CAP__": wixfeeds.DAILY_CAP,
+        "__BRIDGE_CAP__": notice_reader.DAILY_CAP,
+        "__SMALL_SITES__": "·".join(f"{b.name}({b.host})" for b in smallboards.BOARDS),
+        # a queue row's life, and the longest a retry can keep it (extract: READ_WINDOW, TTL_MARGIN)
+        "__QUEUE_DAYS__": BODY_QUEUE_TTL.days + READ_WINDOW.days + TTL_MARGIN.days,
+        "__SMALL_CAPS__": "·".join(f"{b.name} {b.daily_cap}번" for b in smallboards.BOARDS),
+        "__ALUMNI_CAP__": smallboards.ALUMNI.daily_cap,
+        "__THUMB_HOST__": smallboards.THUMB_HOST,
+        "__THUMB_CAP__": THUMB_DAILY_CAP,
+        "__SMALL_NAMES__": "·".join(b.name for b in smallboards.BOARDS),
+        "__SMALL_CAP__": max(b.daily_cap for b in smallboards.BOARDS),
+        "__SMALL_EVERY__": "~".join(dict.fromkeys(str(int(h)) for h in sorted(
+            b.every.total_seconds() / 3600 for b in smallboards.BOARDS))),
     }
     page = PRIVACY_TEMPLATE
     for marker, value in periods.items():

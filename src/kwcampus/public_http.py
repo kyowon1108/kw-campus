@@ -108,7 +108,9 @@ def search_notices(query: str, category: str | None = None, since: str | None = 
 
 @mcp.tool(annotations=READ_ONLY)
 def get_notice(post_id: str) -> dict[str, Any]:
-    """post_id로 공지 하나를 봅니다(제목·분류·부서·날짜·링크, 있으면 deadline과 extracted)."""
+    """post_id로 공지 하나를 봅니다(제목·분류·부서·날짜·링크, 있으면 deadline과 extracted).
+    read가 있으면 공지를 다 읽지 못한 것입니다(missing: body·images·files). 그때는 학생에게 원문의 포스터나 글을
+    직접 확인하라고 알려 주세요."""
     return public_data.get(_table(), post_id) or {"error": "not_found", "post_id": post_id}
 
 

@@ -10,6 +10,7 @@ from kwcampus import (
     dispatcher,
     politeness,
     public_data,
+    smallboards,
     wixfeeds,
     wwwboards,
 )
@@ -142,10 +143,12 @@ def test_scheduled_run_survives_a_department_site_failure(aws, monkeypatch):
     monkeypatch.setattr(aicon, "collect", boom)
     monkeypatch.setattr(deptboards, "collect", lambda now, table, **kw: {"status": "ok"})
     monkeypatch.setattr(wixfeeds, "collect", lambda now, table, **kw: {"status": "not_due"})
+    monkeypatch.setattr(smallboards, "collect", lambda now, table, **kw: {"status": "not_due"})
     monkeypatch.setattr(wwwboards, "collect", lambda now, table, **kw: {"status": "not_due"})
     monkeypatch.setattr(collector.boto3, "resource", lambda name: type("R", (), {"Table": lambda self, n: aws["public"]})())
     assert collector.handler({}, None) == {"status": "ok", "aicon": {"status": "error"}, "dept": {"status": "ok"},
-                                           "wix": {"status": "not_due"}, "www": {"status": "not_due"}}
+                                           "wix": {"status": "not_due"}, "small": {"status": "not_due"},
+                                           "www": {"status": "not_due"}}
 
 
 def test_a_broken_widget_backs_off_alone_and_never_stops_e3(aws):

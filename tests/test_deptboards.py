@@ -12,6 +12,7 @@ from kwcampus import (
     politeness,
     public_data,
     routing,
+    smallboards,
     wixfeeds,
     wwwboards,
 )
@@ -394,11 +395,13 @@ def test_handler_runs_the_main_board_first_and_isolates_each_collector(aws, monk
     monkeypatch.setattr(aicon, "collect", failing("aicon"))
     monkeypatch.setattr(deptboards, "collect", failing("dept"))
     monkeypatch.setattr(wixfeeds, "collect", not_due("wix"))
+    monkeypatch.setattr(smallboards, "collect", not_due("small"))
     monkeypatch.setattr(wwwboards, "collect", not_due("www"))
     monkeypatch.setattr(collector.boto3, "resource", lambda name: type("R", (), {"Table": lambda self, n: aws["public"]})())
     assert collector.handler({}, None) == {"status": "ok", "aicon": {"status": "error"}, "dept": {"status": "error"},
-                                           "wix": {"status": "not_due"}, "www": {"status": "not_due"}}
-    assert order == ["main", "aicon", "dept", "wix", "www"]
+                                           "wix": {"status": "not_due"}, "small": {"status": "not_due"},
+                                           "www": {"status": "not_due"}}
+    assert order == ["main", "aicon", "dept", "wix", "small", "www"]  # www last: it may wait out its 60 s gap
 
 
 def test_a_changed_page_does_not_hold_up_the_other_boards(aws):

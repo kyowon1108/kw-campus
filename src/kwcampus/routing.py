@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from kwcampus import deptboards, wixfeeds, wwwboards
+from kwcampus import deptboards, smallboards, wixfeeds, wwwboards
 from kwcampus.kwnotice.redaction import may_name_someone
 from kwcampus.topics import TOPIC_BY_KEY, TOPICS, URGENT, Topic
 
@@ -45,8 +45,15 @@ CATEGORY_TO_CHANNEL: dict[str, str] = {
     "office-startup": "notice",
     "office-career": "career",  # 경력개발팀: 채용설명회, 취업박람회, 직무특강
     "office-oia": "international",  # 국제처's notices for international students
+    # smallboards: outside boards on their own servers.
+    # 총동문회: mostly alumni events, plus the yearly 장학생 선발 call. Channels follow the category only (no title
+    # keywords), so the whole board goes to the 학과 channel: no college topic, so nobody is pinged.
+    "office-alumni": "department",
+    "office-council": "notice",  # 총학생회: 학생총회, 귀향버스, 공동구매, 행사
+    "office-internship": "career",  # 현장실습지원팀: 인턴 채용, 현장실습 신청
 }
 OFFICE_CATEGORIES = frozenset(b.category_id for b in deptboards.BOARDS if b.office)
+SMALL_CATEGORIES = frozenset(b.category_id for b in smallboards.BOARDS)
 # Searchable but never announced: FAQ entries are reference pages, not news.
 QUIET_CATEGORIES = frozenset({"faq"})
 
@@ -65,6 +72,7 @@ CATEGORY_LABEL: dict[str, str] = {
     "dept-aicon": "인공지능융합대학",
     **{b.category_id: b.name for b in (*deptboards.BOARDS, *wixfeeds.FEEDS)},
     **{b.category_id: b.name for b in wwwboards.BOARDS},
+    **{b.category_id: b.name for b in smallboards.BOARDS},
 }
 
 
@@ -125,8 +133,9 @@ def is_urgent(title: str) -> bool:
 
 # The main board's 외부 category carries outside organisations' notices (a certificate exam moved to
 # another hall, a closed exhibition): they are not about our campus, so they never ring 긴급. Nor do the
-# offices' and programs' own boards: a moved class or closed room there concerns one program's students.
-_NOT_URGENT_SOURCES = frozenset({"external"}) | OFFICE_CATEGORIES
+# offices' and programs' own boards: a moved class or closed room there concerns one program's students;
+# nor 총동문회, 총학생회 or 현장실습 (a 귀향버스 운행 중단 is the council's, not the school's).
+_NOT_URGENT_SOURCES = frozenset({"external"}) | OFFICE_CATEGORIES | SMALL_CATEGORIES
 
 
 def urgent_source(category_id: str) -> bool:
