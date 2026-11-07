@@ -21,7 +21,7 @@ admin_script = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(admin_script)
 
 env = test_bridge.env
-GUILD = "1567793602120261653"
+GUILD = "123456789012345678"
 CFG = {"guild": GUILD, "roles": {}}
 TOKEN = "MTIzNDU2Nzg5MDEyMzQ1Njc4.GabcDE.fake_token_value_for_tests_only_xx"
 ADMIN, MEMBER, OTHER = "111111111111111111", "123456789012345678", "223456789012345678"

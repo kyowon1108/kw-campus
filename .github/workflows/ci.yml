@@ -1,6 +1,5 @@
 # Unit tests on every push and pull request. kw-campus uses kw-mcp as a path dependency (../kw-mcp),
-# so both repositories are checked out side by side. kw-mcp is private: the KW_MCP_READ_TOKEN secret
-# is a fine-grained token with read-only "Contents" access to kyowon1108/kw-mcp and nothing else.
+# so both repositories are checked out side by side (kw-mcp is public: no token needed).
 name: CI
 
 on:
@@ -28,7 +27,6 @@ jobs:
         with:
           repository: kyowon1108/kw-mcp
           path: kw-mcp
-          token: ${{ secrets.KW_MCP_READ_TOKEN }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:

@@ -4,6 +4,7 @@ assets too, 총학생회's text and poster, what readers are told, and the backf
 
 import asyncio
 from datetime import UTC, date, datetime, timedelta
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -220,7 +221,8 @@ def test_a_notice_with_no_text_waits_for_its_poster_before_any_model_call(aws):
         "status": "ok", "requeued": 1, "assets_no_spare": 1}
     read = item(table, KEY)["read"]
     assert claude.calls == [] and read["body"] == "empty" and "retry_at" in read and "extracted" not in item(table, KEY)
-    assert public_data.public_view(item(table, KEY))["read"] == {"status": "pending", "missing": ["images"]}
+    with patch("kwcampus.extract.time.time", return_value=NOW.timestamp()):  # readers use the wall clock
+        assert public_data.public_view(item(table, KEY))["read"] == {"status": "pending", "missing": ["images"]}
     later = NOW + timedelta(hours=3, minutes=1)
     leave_spare(table, later, spare=5)
     assert run(table, later, {WWW_URL: EMPTY_PAGE}, [(POSTER_A, PNG)], claude=claude) == {"status": "ok", "extracted": 1}

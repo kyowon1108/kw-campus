@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CDK app for kw-campus. Deploy: npx aws-cdk@2.1147.0 deploy (see README)."""
+"""CDK app for kw-campus. Deploy: npx aws-cdk@2.1147.0 deploy (see docs/operations.md)."""
 
 from pathlib import Path
 

@@ -13,7 +13,7 @@ from kwcampus.routing import TOPICS
 
 BRIDGE = "https://bridge.example.com"
 
-GUILD = "1567793602120261653"
+GUILD = "123456789012345678"
 TOKEN = "MTIzNDU2Nzg5MDEyMzQ1Njc4.GabcDE.fake_token_value_for_tests_only_xx"
 USER = "123456789012345678"
 CFG = {"guild": GUILD, "roles": {"academic": "700000000000000001", "career": "700000000000000003"}}
