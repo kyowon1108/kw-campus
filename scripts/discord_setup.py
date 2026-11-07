@@ -5,12 +5,18 @@
 
 What --apply does, each step only when something is missing or different (safe to run again):
 1. one role per topic (routing.TOPICS): no permissions, not mentionable by members
-2. #알림-설정 next to #학교-공지 (and #학과-공지 with --department-channel)
-3. notice channels read-only for @everyone (no messages, no threads), the bot may post and
-   mention roles there; other permission bits already set on those channels are kept
-4. the button message in #알림-설정, posted once and edited when the buttons change
-5. /kw/discord/roles in SSM (guild, role ids, menu message); with --department-channel also the
-   "department" key of /kw/discord/channels
+2. #알림-설정 and #설치-안내 next to #학교-공지 (and #학과-공지 with --department-channel)
+3. notice channels, #알림-설정 and #설치-안내 read-only for @everyone (no messages, no threads), the
+   bot may post there and mention roles in the notice channels; other permission bits already set on
+   those channels are kept
+4. the button message in #알림-설정 and the 설치하기 message in #설치-안내, each posted once and edited
+   when it changes
+5. #제보-검토, hidden from @everyone, and the /제보 and /설치 guild commands
+6. /kw/discord/roles in SSM (guild, role ids, menu, install and report channels); with
+   --department-channel also the "department" key of /kw/discord/channels
+
+The #설치-안내 message links to the bridge's install page: --bridge-url, else env KW_BRIDGE_BASE_URL,
+else the KwCampus stack's BridgeUrl output. Without one that channel is skipped.
 
 The bot token is read from SSM and never printed. Channel ids come from /kw/discord/channels.
 """
@@ -19,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -31,10 +38,18 @@ from kwcampus.config import (
 )
 from kwcampus.discordapi import API, USER_AGENT, NotFound, clean_token, token_problem
 from kwcampus.fetch import TLS
-from kwcampus.interactions import PREFIX, menu_message
+from kwcampus.interactions import (
+    PREFIX,
+    REPORT_COMMAND,
+    SETUP_COMMAND,
+    SETUP_START,
+    install_message,
+    menu_message,
+)
 from kwcampus.topics import TOPICS
 
 REGION = "ap-northeast-2"
+STACK = "KwCampus"  # infra/app.py; its BridgeUrl output is the install page's base
 
 KICK_MEMBERS = 1 << 1
 BAN_MEMBERS = 1 << 2
@@ -92,9 +107,16 @@ ONLY_MENTIONS = 1  # guild default_message_notifications: 0 = all messages, 1 = 
 
 NOTICE_CHANNEL_KEYS = ("notice", "academic", "scholarship", "career", "international")
 MENU_CHANNEL = "알림-설정"
-MENU_TOPIC = "버튼을 눌러 받고 싶은 공지 알림을 고르세요. 이 채널에는 봇만 글을 씁니다."
+MENU_TOPIC = "받고 싶은 공지 알림을 골라요."
+INSTALL_CHANNEL = "설치-안내"
+INSTALL_TOPIC = "설치하기를 누르면 내 초대 코드와 설치 링크가 와요."
 DEPARTMENT_CHANNEL = "학과-공지"
-DEPARTMENT_TOPIC = "단과대·학과 게시판과 학과 블로그 공지. 봇만 글을 씁니다."
+DEPARTMENT_TOPIC = "단과대·학과 게시판 공지예요."
+REPORT_CHANNEL = "제보-검토"
+REPORT_TOPIC = "들어온 제보예요. 운영자만 봐요."
+REPORT_DESCRIPTION = "틀린 정보 알리기"
+SETUP_DESCRIPTION = "설치 링크와 내 초대 코드 받기"
+COMMANDS = ((REPORT_COMMAND, REPORT_DESCRIPTION), (SETUP_COMMAND, SETUP_DESCRIPTION))
 TEXT_CHANNEL = 0
 NEW = "<새로 만듦>"
 
@@ -166,18 +188,25 @@ def _overwrites_for(guild_id: str, bot_id: str, mention: bool) -> list[tuple[str
 
 
 def _button_ids(message: dict) -> list[tuple]:
-    return [(c.get("type"), c.get("style"), c.get("label"), c.get("custom_id"))
+    return [(c.get("type"), c.get("style"), c.get("label"), c.get("custom_id"), c.get("url"))
             for row in message.get("components") or [] for c in row.get("components") or []]
 
 
 def _is_menu(message: dict, bot_id: str) -> bool:
     return (message.get("author") or {}).get("id") == bot_id and any(
-        str(cid or "").startswith(PREFIX) for *_, cid in _button_ids(message))
+        str(b[3] or "").startswith(PREFIX) for b in _button_ids(message))
+
+
+def _is_install(message: dict, bot_id: str) -> bool:
+    return (message.get("author") or {}).get("id") == bot_id and any(
+        b[3] == SETUP_START for b in _button_ids(message))
 
 
 class Setup:
-    def __init__(self, api: DiscordAPI, ssm, *, apply: bool, department: bool, out=print):
+    def __init__(self, api: DiscordAPI, ssm, *, apply: bool, department: bool, out=print,
+                 bridge: str | None = None):
         self.api, self.ssm, self.apply, self.department, self.out = api, ssm, apply, department, out
+        self.bridge = bridge.rstrip("/") if bridge else None  # the install page's base URL
         self.changes = 0
         self.needed = MANAGE_ROLES  # server-level bot permissions this run needs
         self.ssm_failed = False
@@ -222,26 +251,35 @@ class Setup:
             self.out("\n중단: 위 역할 문제를 고치기 전에는 아무것도 바꾸지 않습니다.")
             return 1
         by_id = {str(c["id"]): c for c in channels}
-        targets, menu_channel, dept_channel = self._channels(guild_id, bot_id, notice, channels_cfg, saved, by_id,
-                                                             channels)
+        targets, menu_channel, install_channel, dept_channel = self._channels(
+            guild_id, bot_id, notice, channels_cfg, saved, by_id, channels)
         self._permissions(guild_id, bot_id, targets, by_id)
+        report_channel = self._report_channel(guild_id, bot_id, notice, saved, by_id, channels)
         # The role map goes in before the buttons change, so no button points at a role the Lambda can't see.
         self.out("\n[SSM]")
-        known_message = (saved.get("menu") or {}).get("message") if (saved.get("menu") or {}).get(
-            "channel") == menu_channel else None
+
+        def known(key: str, channel: str | None) -> str | None:
+            ref = saved.get(key) or {}
+            return ref.get("message") if channel and ref.get("channel") == channel else None
+
         roles_value = {**saved, "guild": guild_id, "roles": role_ids,
-                       "menu": {"channel": menu_channel, "message": known_message}}
+                       "menu": {"channel": menu_channel, "message": known("menu", menu_channel)},
+                       "report": {"channel": report_channel}}
+        if install_channel:
+            roles_value["install"] = {"channel": install_channel, "message": known("install", install_channel)}
         self._put_if_changed(DISCORD_ROLES_PARAM, saved, roles_value, quiet_if_same=False)
-        message_id = self._menu(menu_channel, bot_id, saved)
-        if message_id != known_message:
-            final = {**roles_value, "menu": {"channel": menu_channel, "message": message_id}}
-            self._put_if_changed(DISCORD_ROLES_PARAM, roles_value, final, label="(버튼 메시지 ID)")
+        final = {**roles_value, "menu": {"channel": menu_channel, "message": self._menu(menu_channel, bot_id, saved)}}
+        if install_channel:
+            final["install"] = {"channel": install_channel,
+                                "message": self._install(install_channel, bot_id, saved)}
+        self._put_if_changed(DISCORD_ROLES_PARAM, roles_value, final, label="(메시지 ID)")
         if self.department:
             if channels_cfg.get("department") == dept_channel:
                 self.step("=", f"{DISCORD_CHANNELS_PARAM} department 그대로")
             else:
                 self._put_if_changed(DISCORD_CHANNELS_PARAM, channels_cfg, {**channels_cfg, "department": dept_channel},
                                      label="(학과 공지가 #학과-공지로 감)")
+        self._commands(guild_id)
         self._report_permissions(everyone, own, guild)
 
         if self.ssm_failed:
@@ -354,8 +392,80 @@ class Setup:
         by_id[str(made["id"])] = made
         return str(made["id"]), True
 
+    def _report_channel(self, guild_id: str, bot_id: str, notice: dict, saved: dict, by_id: dict,
+                        channels: list[dict]) -> str:
+        """#제보-검토: hidden from @everyone, the bot may post there. Only the operators (and the server
+        owner and admins, whom Discord never hides channels from) read the reports."""
+        self.out(f"\n[#{REPORT_CHANNEL}]")
+        parent_id = notice.get("parent_id")
+        known = str((saved.get("report") or {}).get("channel") or "")
+        channel = by_id.get(known) or next(
+            (c for c in channels if c.get("name") == REPORT_CHANNEL and c.get("type") == TEXT_CHANNEL
+             and c.get("parent_id") == parent_id), None)
+        bot_allow = VIEW_CHANNEL | SEND_MESSAGES | EMBED_LINKS | READ_MESSAGE_HISTORY
+        if channel is None:
+            self.needed |= MANAGE_CHANNELS | bot_allow
+            self.step("+", f"#{REPORT_CHANNEL} 만들기 (@everyone에게 숨김, 봇만 글을 씀)")
+            if not self.apply:
+                return NEW
+            made = self.api.call("POST", f"/guilds/{guild_id}/channels", {
+                "name": REPORT_CHANNEL, "type": TEXT_CHANNEL, "topic": REPORT_TOPIC, "parent_id": parent_id,
+                "permission_overwrites": [
+                    {"id": bot_id, "type": 1, "allow": str(bot_allow), "deny": "0"},
+                    {"id": guild_id, "type": 0, "allow": "0", "deny": str(VIEW_CHANNEL)}]})
+            by_id[str(made["id"])] = made
+            return str(made["id"])
+        cid = str(channel["id"])
+        self.step("=", f"#{channel['name']} 있음 ({cid})")
+        if channel.get("topic") != REPORT_TOPIC:
+            self.needed |= MANAGE_CHANNELS
+            self.step("~", f"#{channel['name']} 채널 주제 고치기: {REPORT_TOPIC}")
+            if self.apply:
+                self.api.call("PATCH", f"/channels/{cid}", {"topic": REPORT_TOPIC})
+        existing = {str(o["id"]): o for o in channel.get("permission_overwrites") or []}
+        for oid, kind, allow, deny, who in ((bot_id, 1, bot_allow, 0, "봇"), (guild_id, 0, 0, VIEW_CHANNEL, "@everyone")):
+            new_allow, new_deny = _merge(existing.get(oid), allow, deny)
+            old = existing.get(oid)
+            if old and (int(old["allow"]), int(old["deny"])) == (new_allow, new_deny):
+                self.step("=", f"#{channel['name']} {who}: 이미 맞음")
+                continue
+            self.needed |= new_allow | new_deny
+            self.step("~", f"#{channel['name']} {who}: " + ("보기 숨김" if who == "@everyone" else "보기·보내기 허용"))
+            if self.apply:
+                self.api.call("PUT", f"/channels/{cid}/permissions/{oid}",
+                              {"type": kind, "allow": str(new_allow), "deny": str(new_deny)})
+        return cid
+
+    def _commands(self, guild_id: str) -> None:
+        """The /제보 and /설치 guild commands. Registering needs the app installed with the
+        applications.commands scope; without it this says how to fix that, and the buttons keep working."""
+        slash = "·".join(f"/{name}" for name, _ in COMMANDS)
+        self.out(f"\n[{slash} 명령]")
+        try:
+            app_id = str(self.api.call("GET", "/oauth2/applications/@me")["id"])
+            have = self.api.call("GET", f"/applications/{app_id}/guilds/{guild_id}/commands") or []
+        except (RuntimeError, NotFound) as e:
+            self.step("!", f"명령 목록을 읽지 못했습니다({e}). 봇을 applications.commands 범위로 다시 초대하면 "
+                           f"{slash}가 생깁니다. 제보하기·설치하기 버튼은 그대로 됩니다.")
+            return
+        for name, description in COMMANDS:
+            current = next((c for c in have if c.get("name") == name), None)
+            if current and current.get("description") == description:
+                self.step("=", f"/{name} 있음")
+                continue
+            self.step("+" if current is None else "~", f"/{name} 명령 " + ("만들기" if current is None else "설명 고치기"))
+            if not self.apply:
+                continue
+            try:
+                self.api.call("POST", f"/applications/{app_id}/guilds/{guild_id}/commands",
+                              {"name": name, "description": description, "type": 1})
+            except RuntimeError as e:
+                self.step("!", f"/{name}를 만들지 못했습니다({e}). 봇을 applications.commands 범위로 "
+                               "다시 초대해 주세요. 제보하기·설치하기 버튼은 그대로 됩니다.")
+
     def _channels(self, guild_id, bot_id, notice, channels_cfg, saved, by_id, channels) -> tuple:
-        """([(label, channel id, mention allowed, created now)], menu channel id, department channel id)."""
+        """([(label, channel id, mention allowed, created now)], menu channel id, install channel id or None
+        without a bridge URL, department channel id)."""
         self.out("\n[채널]")
         targets, dept_id = [], None
         for key in NOTICE_CHANNEL_KEYS:
@@ -368,6 +478,15 @@ class Setup:
         menu_id, created = self._find_or_create(guild_id, bot_id, notice, MENU_CHANNEL, MENU_TOPIC,
                                                 (saved.get("menu") or {}).get("channel"), by_id, channels, False)
         targets.append((MENU_CHANNEL, menu_id, False, created))
+        install_id = None
+        if self.bridge:
+            install_id, created = self._find_or_create(guild_id, bot_id, notice, INSTALL_CHANNEL, INSTALL_TOPIC,
+                                                       (saved.get("install") or {}).get("channel"), by_id, channels,
+                                                       False)
+            targets.append((INSTALL_CHANNEL, install_id, False, created))
+        else:
+            self.step("!", f"설치 페이지 주소를 몰라 #{INSTALL_CHANNEL}을 건너뜁니다. "
+                           "--bridge-url https://<bridge-api>로 다시 실행하세요.")
         configured = str(channels_cfg.get("department") or "")
         if self.department:
             dept_id, created = self._find_or_create(guild_id, bot_id, notice, DEPARTMENT_CHANNEL, DEPARTMENT_TOPIC,
@@ -383,7 +502,7 @@ class Setup:
                            "학과 공지가 가지 않습니다. --department-channel로 다시 만들 수 있습니다.")
         else:
             self.step("=", "학과 공지는 계속 #학교-공지로 갑니다 (--department-channel로 #학과-공지를 만들 수 있음)")
-        return targets, menu_id, dept_id
+        return targets, menu_id, install_id, dept_id
 
     def _permissions(self, guild_id: str, bot_id: str, targets: list, by_id: dict) -> None:
         self.out("\n[채널 권한] @everyone: 기록 보기 허용, 메시지·스레드 거부(보기는 건드리지 않음) / "
@@ -412,26 +531,37 @@ class Setup:
 
     def _menu(self, channel_id: str, bot_id: str, saved: dict) -> str:
         self.out(f"\n[#{MENU_CHANNEL} 버튼 메시지]")
-        want = menu_message()
+        labels = " / ".join(t.label for t in TOPICS)
+        return self._bot_message(channel_id, saved.get("menu") or {}, menu_message(),
+                                 lambda m: _is_menu(m, bot_id), "버튼 메시지", f": {labels} / 내 알림 보기")
+
+    def _install(self, channel_id: str, bot_id: str, saved: dict) -> str:
+        self.out(f"\n[#{INSTALL_CHANNEL} 설치 안내 메시지]")
+        return self._bot_message(channel_id, saved.get("install") or {}, install_message(self.bridge),
+                                 lambda m: _is_install(m, bot_id), "설치 안내 메시지",
+                                 f": 설치하기 버튼 / {self.bridge}/start 링크")
+
+    def _bot_message(self, channel_id: str, ref: dict, want: dict, ours, what: str, detail: str) -> str:
+        """The channel's one bot message: found by its saved id (ref), else among the latest 50 by ours(m);
+        posted when missing, edited in place when its text or buttons differ."""
         current = None
         if channel_id != NEW:
-            saved_id = (saved.get("menu") or {}).get("message")
-            if saved_id and (saved.get("menu") or {}).get("channel") == channel_id:
+            saved_id = ref.get("message")
+            if saved_id and ref.get("channel") == channel_id:
                 try:
                     current = self.api.call("GET", f"/channels/{channel_id}/messages/{saved_id}")
                 except NotFound:
                     current = None
             if current is None:
                 current = next((m for m in self.api.call("GET", f"/channels/{channel_id}/messages?limit=50")
-                                if _is_menu(m, bot_id)), None)
+                                if ours(m)), None)
         if current is None:
-            labels = " / ".join(t.label for t in TOPICS)
-            self.step("+", f"버튼 메시지 올리기: {labels} / 내 알림 보기")
+            self.step("+", f"{what} 올리기{detail}")
             return str(self.api.call("POST", f"/channels/{channel_id}/messages", want)["id"]) if self.apply else NEW
         if current.get("content") == want["content"] and _button_ids(current) == _button_ids(want):
-            self.step("=", f"버튼 메시지 그대로 ({current['id']})")
+            self.step("=", f"{what} 그대로 ({current['id']})")
         else:
-            self.step("~", f"버튼 메시지 고치기 ({current['id']})")
+            self.step("~", f"{what} 고치기 ({current['id']})")
             if self.apply:
                 self.api.call("PATCH", f"/channels/{channel_id}/messages/{current['id']}", want)
         return str(current["id"])
@@ -460,16 +590,35 @@ class Setup:
                            "서버 설정 → 개요 → 기본 알림 설정을 '@멘션만'으로 바꿔 주세요.")
 
 
+def _stack_bridge_url(region: str) -> str | None:
+    """The KwCampus stack's BridgeUrl output (cdk deploy prints it too), or None."""
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    try:
+        stacks = boto3.client("cloudformation", region_name=region).describe_stacks(StackName=STACK)["Stacks"]
+    except (BotoCoreError, ClientError):
+        return None
+    return next((o.get("OutputValue") for s in stacks for o in s.get("Outputs") or []
+                 if o.get("OutputKey") == "BridgeUrl"), None)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--apply", action="store_true", help="실제로 바꿉니다 (없으면 계획만 출력)")
     parser.add_argument("--department-channel", action="store_true", help="#학과-공지를 만들고 학과 공지를 그리로 보냅니다")
+    parser.add_argument("--bridge-url", default=os.environ.get("KW_BRIDGE_BASE_URL"),
+                        help="설치 페이지가 있는 bridge 주소 (없으면 KwCampus 스택의 BridgeUrl)")
     parser.add_argument("--region", default=REGION)
     args = parser.parse_args(argv)
 
     import boto3
     from botocore.exceptions import BotoCoreError, ClientError
 
+    bridge = args.bridge_url or _stack_bridge_url(args.region)
+    if bridge and not bridge.startswith("https://"):
+        print(f"! --bridge-url은 https://로 시작해야 합니다: {bridge}")
+        return 2
     ssm = boto3.client("ssm", region_name=args.region)
     try:
         token = clean_token(_get_param(ssm, DISCORD_TOKEN_PARAM, decrypt=True))
@@ -480,7 +629,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"! {DISCORD_TOKEN_PARAM}: {problem}")
         return 2
     try:
-        return Setup(DiscordAPI(token), ssm, apply=args.apply, department=args.department_channel).run()
+        return Setup(DiscordAPI(token), ssm, apply=args.apply, department=args.department_channel,
+                     bridge=bridge).run()
     except (RuntimeError, NotFound) as e:
         print(f"! 중단: {e}")
         return 1

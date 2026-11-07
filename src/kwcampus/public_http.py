@@ -3,23 +3,22 @@
 Routes (everything else is 404):
   GET  /healthz                      readiness check for the adapter
   POST /c/<token>/mcp                MCP Streamable HTTP, stateless, JSON responses
-  GET  /c/<token>/api/notices        JSON for the local kw-mcp (latest or ?q= search; ?source= boards)
+  GET  /c/<token>/api/notices        JSON for the local kw-mcp (latest or ?q= search; ?source= boards;
+                                     ?open_only=true or ?deadline_after=YYYY-MM-DD: deadline not passed)
   GET  /c/<token>/api/menu           cafeteria menu (?date=YYYY-MM-DD, default today KST)
   GET  /c/<token>/api/calendar       academic calendar (?from=&to=, default next 30 days)
 
-<token> is a per-person access token; SSM /kw/mcp/tokens holds only their SHA-256 hashes.
+<token> is a per-person invite token (invites.py): on the hand-made SSM list /kw/mcp/tokens (SHA-256
+hashes only) or issued in Discord (kw-bridge INVITE#<hash>, not revoked).
 GET/DELETE on the MCP path return 405 so no long-lived SSE stream can hold a Lambda.
 """
 
 from __future__ import annotations
 
 import hashlib
-import hmac
-import json
 import logging
 import os
 import re
-import time
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -31,17 +30,17 @@ from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 
-from kwcampus import campus, params, public_data
+from kwcampus import campus, invites, public_data
 from kwcampus.config import KST, PUBLIC_TABLE
 
-TOKENS_PARAM = "/kw/mcp/tokens"  # String: JSON list of sha256 hex digests
 _PATH = re.compile(r"^/c/([A-Za-z0-9_-]{20,80})(/mcp|/api/notices|/api/menu|/api/calendar)/?$")
 
 INSTRUCTIONS = """\
-광운대학교 공개 공지(www.kw.ac.kr 메인 공지·취업게시판·종합 FAQ, 학과 게시판)를 조회합니다. 비공식 도구이며 제목·날짜·분류·부서·링크만 있습니다.
+광운대학교 공개 공지(www.kw.ac.kr 메인 공지·취업게시판·종합 FAQ, 학과 게시판)를 조회합니다. 비공식 도구이며 제목·날짜·분류·부서·링크가 기본입니다.
 - 분류는 일반, 학사, 학생, 봉사, 등록/장학, 입학, 시설, 병무, 외부, 국제교류, 국제학생(메인 공지), 취업(취업게시판), FAQ, 학과 이름(인공지능융합대학, 전자정보공과대학, 전자공학과 등)입니다. "장학금", "채용", "국제", "학과"(모든 학과), 이름 일부("건축")도 받습니다. 없는 분류는 unknown_category 오류와 쓸 수 있는 분류 목록을 돌려줍니다.
 - 분류 없이 받은 최신 목록에는 FAQ가 빠집니다. 여러 게시판이 같은 제목으로 올린 공지는 하나로 묶고 나머지 post_id를 also에, 그 게시판을 also_boards에 넣습니다.
-- 본문은 없으니 자세한 내용은 url 링크를 안내하세요. 날짜는 한국 시간 기준입니다.
+- 학사·장학·취업·국제·학과 공지 일부에는 extracted(마감·대상·자격·신청 방법·금액·문의 부서)와 deadline(아직 남은 가장 이른 신청마감, 없으면 가장 이른 마감)이 붙습니다. AI가 본문에서 뽑은 것이라 틀릴 수 있으니 중요한 날짜는 url 원문으로 확인하라고 안내하세요. 없는 공지는 원문 링크를 안내하세요.
+- open_only=True면 마감이 오늘 이후인 공지만, deadline_after(YYYY-MM-DD)면 그날 이후 마감인 공지만 돌려줍니다(예: 아직 신청할 수 있는 장학금). 날짜는 한국 시간 기준입니다.
 - 학식(함지마루 주간 식단)과 학사일정(학교 학사일정 페이지)도 조회할 수 있습니다.
 """
 READ_ONLY = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False)
@@ -82,26 +81,33 @@ def list_notice_categories() -> list[dict[str, Any]]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-def latest_notices(category: str | None = None, limit: int = 10, include_pinned: bool = True) -> list[dict[str, Any]]:
-    """최신 공지(게시일 역순). category로 분류를 거르고(예: "학사", "장학"), include_pinned=False면 상단 고정 글을 뺍니다."""
+def latest_notices(category: str | None = None, limit: int = 10, include_pinned: bool = True,
+                   open_only: bool = False, deadline_after: str | None = None) -> list[dict[str, Any]]:
+    """최신 공지(게시일 역순). category로 분류를 거르고(예: "학사", "장학"), include_pinned=False면 상단 고정 글을 뺍니다.
+    open_only=True면 마감(deadline)이 오늘 이후인 공지만, deadline_after(YYYY-MM-DD)면 그날 이후 마감인 공지만 돌려줍니다."""
     try:
-        return public_data.latest(_table(), category, limit, include_pinned)
+        return public_data.latest(_table(), category, limit, include_pinned, open_only=open_only,
+                                  deadline_after=_date(deadline_after, "deadline_after"))
     except public_data.UnknownCategory as e:  # the model should see which labels exist
         raise ToolError(str(e)) from None
 
 
 @mcp.tool(annotations=READ_ONLY)
-def search_notices(query: str, category: str | None = None, since: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
-    """제목·부서에서 검색합니다. 띄어쓴 단어가 모두 들어간 공지만 찾습니다. since는 YYYY-MM-DD(그날 이후 게시)."""
+def search_notices(query: str, category: str | None = None, since: str | None = None, limit: int = 20,
+                   open_only: bool = False, deadline_after: str | None = None) -> list[dict[str, Any]]:
+    """제목·부서에서 검색합니다. 띄어쓴 단어가 모두 들어간 공지만 찾습니다. 결과가 비면 다른 말로 다시 찾으세요(예: 세부전공 →
+    전공 변경·전공배정, 드랍 → 수강포기). since는 YYYY-MM-DD(그날 이후 게시).
+    open_only=True면 마감이 오늘 이후인 공지만, deadline_after(YYYY-MM-DD)면 그날 이후 마감인 공지만 찾습니다."""
     try:
-        return public_data.search(_table(), query, category, _date(since, "since"), limit)
+        return public_data.search(_table(), query, category, _date(since, "since"), limit, open_only=open_only,
+                                  deadline_after=_date(deadline_after, "deadline_after"))
     except public_data.UnknownCategory as e:
         raise ToolError(str(e)) from None
 
 
 @mcp.tool(annotations=READ_ONLY)
 def get_notice(post_id: str) -> dict[str, Any]:
-    """post_id로 공지 하나를 봅니다(제목·분류·부서·날짜·링크)."""
+    """post_id로 공지 하나를 봅니다(제목·분류·부서·날짜·링크, 있으면 deadline과 extracted)."""
     return public_data.get(_table(), post_id) or {"error": "not_found", "post_id": post_id}
 
 
@@ -152,17 +158,17 @@ def academic_calendar(start: str | None = None, end: str | None = None, query: s
     return _events_between(s, e, query)
 
 
-# (loaded_at, hashes); None until the first load. monotonic() can be near 0 in a fresh
-# Lambda microVM, so "older than 300 s" must not be the only trigger for the first load.
-_tokens: tuple[float, frozenset[str]] | None = None
+# Hashes taken without a lookup: KW_LOCAL_TOKEN's, for local runs only (see the bottom of this file).
+_tokens: frozenset[str] | None = None
 
 
 def _token_ok(token: str) -> bool:
-    global _tokens
-    if _tokens is None or time.monotonic() - _tokens[0] > 300:
-        _tokens = (time.monotonic(), frozenset(json.loads(params.get(TOKENS_PARAM, ttl_s=0) or "[]")))
-    digest = hashlib.sha256(token.encode()).hexdigest()
-    return any(hmac.compare_digest(digest, known) for known in _tokens[1])
+    """A live invite token. invites keeps each answer a minute, hits and misses alike, so a busy
+    extension costs one SSM read and at most one DynamoDB read a minute, and a withdrawn invite stops
+    working here within that minute."""
+    if _tokens and hashlib.sha256(token.encode()).hexdigest() in _tokens:
+        return True
+    return invites.check(token) is not None
 
 
 _BAD_DATE = {"error": "bad_date", "expected": "YYYY-MM-DD"}
@@ -192,12 +198,14 @@ def _notices_api(request: Request) -> JSONResponse:
         # kw-mcp's my_notices asks for every department board and keeps the student's own on the PC,
         # so those boards get the larger cap (the department never comes here).
         cap = public_data.DEPARTMENT_LIMIT if public_data.only_departments(q.get("category")) else public_data.MAX_LIMIT
+        deadline = {"open_only": q.get("open_only", "false") == "true",
+                    "deadline_after": _date(q.get("deadline_after"), "deadline_after")}
         if q.get("q"):
             rows = public_data.search(table, q["q"], q.get("category"), _date(q.get("since"), "since"), limit,
-                                      sources=sources, max_limit=cap)
+                                      sources=sources, max_limit=cap, **deadline)
         else:  # `since` must hold here too: kw-mcp's "new notices" ask without a query
             rows = public_data.latest(table, q.get("category"), limit, q.get("pinned", "true") != "false",
-                                      _date(q.get("since"), "since"), sources=sources, max_limit=cap)
+                                      _date(q.get("since"), "since"), sources=sources, max_limit=cap, **deadline)
     except public_data.UnknownCategory as e:
         return JSONResponse(e.as_dict(), status_code=400)
     except BadDate:
@@ -252,5 +260,5 @@ def build_app():
 app = build_app()
 
 
-if os.environ.get("KW_LOCAL_TOKEN"):  # local runs only: accept one token without SSM
-    _tokens = (float("inf"), frozenset({hashlib.sha256(os.environ["KW_LOCAL_TOKEN"].encode()).hexdigest()}))
+if os.environ.get("KW_LOCAL_TOKEN"):  # local runs only: accept one token without SSM or DynamoDB
+    _tokens = frozenset({hashlib.sha256(os.environ["KW_LOCAL_TOKEN"].encode()).hexdigest()})

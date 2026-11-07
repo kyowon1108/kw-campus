@@ -136,7 +136,7 @@ def test_edit_after_half_an_hour_replies_once_per_kst_day(aws):
     assert body["message_reference"] == {"message_id": mid, "channel_id": "111", "fail_if_not_exists": False}
     assert body["allowed_mentions"] == {"parse": [], "replied_user": False}
     # no 수정일 change (aicon/department style): the day the change was seen
-    assert body["content"] == f"✏️ 수정됨 · 2026-11-06 · 제목 변경\n<{NOTICE['url']}>"
+    assert body["content"] == f"✏️ 공지가 수정됐어요 · 2026-11-06 · 제목이 바뀌었어요\n<{NOTICE['url']}>"
 
     # a second edit the same KST day only fixes the message
     aws["public"].update_item(Key=JOB["key"], UpdateExpression="SET updated_date = :u",
@@ -150,7 +150,7 @@ def test_edit_after_half_an_hour_replies_once_per_kst_day(aws):
     aws["public"].update_item(Key=JOB["key"], UpdateExpression="SET updated_date = :u",
                               ExpressionAttributeValues={":u": "2026-11-07"})
     assert run(aws, later, fake, datetime(2026, 11, 7, 0, 30, tzinfo=KST)) == "edited_replied"
-    assert fake.calls[-1][2]["content"] == f"✏️ 수정됨 · 2026-11-07\n<{NOTICE['url']}>"
+    assert fake.calls[-1][2]["content"] == f"✏️ 공지가 수정됐어요 · 2026-11-07\n<{NOTICE['url']}>"
     record = aws["delivery"].get_item(Key={"PK": f"{NOTICE['PK']}|{NOTICE['SK']}", "SK": "CH#academic"})["Item"]
     assert record["reply_day"] == "2026-11-07" and record["reply_state"] == "sent"
 
@@ -407,10 +407,10 @@ def test_dispatcher_resends_only_the_rejected_entries(monkeypatch):
             return {}
 
     sqs = Sqs(fail_first=1)
-    dispatcher._send(sqs, [{"n": 1}, {"n": 2}, {"n": 3}])
+    dispatcher.send_jobs(sqs, [{"n": 1}, {"n": 2}, {"n": 3}])
     assert sqs.calls == [["0", "1", "2"], ["0"]]
     with pytest.raises(RuntimeError):
-        dispatcher._send(Sqs(fail_first=9), [{"n": 1}])
+        dispatcher.send_jobs(Sqs(fail_first=9), [{"n": 1}])
 
 
 def test_quiet_edits_fix_the_message_without_a_note(aws):
@@ -451,7 +451,7 @@ def test_titles_that_may_name_someone_go_out_without_title_or_mention(aws):
     job = {"action": "post", "key": {"PK": item["PK"], "SK": item["SK"]}, "channel": "department"}
     discord.handle_job(job, aws["public"], aws["delivery"], "t", {"notice": "111"}, {"ei": "780"}, send=fake, now=DAY)
     _, _, body = fake.calls[-1]
-    assert body["content"].startswith("**[전자공학과]** 새 글 (제목은 링크에서 확인)")
+    assert body["content"].startswith("**[전자공학과]** 새 글이 올라왔어요. 제목은 링크를 눌러 확인해 주세요.")
     assert "홍길동" not in body["content"] and body["allowed_mentions"] == {"parse": []}
     assert discord.render({**NOTICE, "title": "장학생 김*수 외 3명"}).startswith("**[학사]** 새 글")
 

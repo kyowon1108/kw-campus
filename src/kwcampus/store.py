@@ -9,13 +9,18 @@ MODIFY whose norm_v went up is our own re-normalisation; the school did not edit
 title_key is the title without tags, brackets and punctuation, to fold cross-posted copies.
 A notice taken down by hand (scripts/collector_admin.py takedown) keeps a blank item with
 removed=true until its ttl, so the next collector run cannot bring it back.
+
+A new notice (not a seed row) or one whose title changed also gets a row in the page queue
+(PK = "BODYQ", SK = "<notice PK>|<notice SK>"): extract.py reads that notice's own page once, in a
+later collector run, and stores what it found on the notice (`extracted`, `body_hash`). The queue's
+SK does not start with "N#", so the stream filter keeps it away from the dispatcher.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from botocore.exceptions import ClientError
 
@@ -24,6 +29,9 @@ from kwcampus.kwnotice.domain import NoticeSummary
 from kwcampus.kwnotice.redaction import REDACTION_LEVEL
 
 SCHEMA_VERSION = 1
+BODY_QUEUE = "BODYQ"
+# A page not read by then is old news: the queue row goes with its ttl.
+BODY_QUEUE_TTL = timedelta(days=14)
 _TAGS = re.compile(r"\[[^\]]*\]|\([^)]*\)|【[^】]*】|<[^>]*>")
 _NOT_WORD = re.compile(r"[\W_]+")
 
@@ -66,20 +74,33 @@ def notice_item(source: str, n: NoticeSummary, now: datetime, seed: bool) -> dic
     }
 
 
+def queue_body(table, item: dict[str, object]) -> None:
+    """Ask for this notice's page to be read once (extract.collect). A second ask before then is the same row."""
+    at = int(item["first_seen"])  # notice_item sets it to the run's time
+    table.put_item(Item={
+        "PK": BODY_QUEUE, "SK": f"{item['PK']}|{item['SK']}",
+        "notice_pk": item["PK"], "notice_sk": item["SK"], "queued_at": at,
+        "ttl": at + int(BODY_QUEUE_TTL.total_seconds()),
+    })
+
+
 def upsert(table, item: dict[str, object]) -> str:
     """Insert a new notice or update a changed one. Returns inserted/updated/unchanged.
 
     An update also moves posted_date (a department re-posting an old post for a new term keeps its
     number but gets a new 등록일) and the ttl: a notice the school keeps changing stays 120 days
-    from its last change."""
+    from its last change. A new notice that is no seed row, and any notice whose title changed, get
+    their page queued (queue_body)."""
     try:
         table.put_item(Item=item, ConditionExpression="attribute_not_exists(PK)")
+        if not item.get("seed"):
+            queue_body(table, item)
         return "inserted"
     except ClientError as e:
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
     try:
-        table.update_item(
+        old = table.update_item(
             Key={"PK": item["PK"], "SK": item["SK"]},
             UpdateExpression=(
                 "SET title = :title, title_key = :tkey, category_id = :cat, department = :dept, "
@@ -100,12 +121,19 @@ def upsert(table, item: dict[str, object]) -> str:
                 ":norm": item["norm_v"],
                 ":ttl": item["ttl"],
             },
-        )
-        return "updated"
+            ReturnValues="ALL_OLD",  # the whole item before: an unchanged title is still there to compare
+        ).get("Attributes") or {}
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
             return "unchanged"
         raise
+    # A title that changed only because our redaction rules did (norm_v up, same 수정일) is no new page.
+    # An item stored before norm_v existed has none: its retitle counts as the school's.
+    ours = (old.get("norm_v") is not None and old["norm_v"] != item["norm_v"]
+            and old.get("updated_date") == item["updated_date"])
+    if old.get("title") != item["title"] and not ours:
+        queue_body(table, item)
+    return "updated"
 
 
 def is_seeded(table, source: str) -> bool:

@@ -1,6 +1,7 @@
 import hashlib
 import json
 
+import boto3
 import pytest
 from starlette.testclient import TestClient
 
@@ -10,10 +11,21 @@ TOKEN = "friend-token-0123456789abcdef"
 H = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 
 
+def bridge_table():
+    """kw-bridge, where Discord-issued invites live (a token not on the SSM list is looked up there)."""
+    return boto3.resource("dynamodb").create_table(
+        TableName="kw-bridge",
+        KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+        AttributeDefinitions=[{"AttributeName": "PK", "AttributeType": "S"},
+                              {"AttributeName": "SK", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST")
+
+
 @pytest.fixture
 def client(aws, monkeypatch):
     aws["ssm"].put_parameter(Name="/kw/mcp/tokens", Type="String",
                              Value=json.dumps([hashlib.sha256(TOKEN.encode()).hexdigest()]))
+    bridge_table()
     monkeypatch.setattr(public_http, "_tokens", None)
     public_data.clear_cache()
     table = aws["public"]
@@ -135,11 +147,18 @@ def test_tool_failures_are_not_logged_at_info():
 
 
 def test_tokens_load_in_a_fresh_container_where_monotonic_is_near_zero(aws, monkeypatch):
+    import time
+
     aws["ssm"].put_parameter(Name="/kw/mcp/tokens", Type="String",
                              Value=json.dumps([hashlib.sha256(TOKEN.encode()).hexdigest()]))
     monkeypatch.setattr(public_http, "_tokens", None)
-    monkeypatch.setattr(public_http.time, "monotonic", lambda: 1.0)
+    monkeypatch.setattr(time, "monotonic", lambda: 1.0)
     assert public_http._token_ok(TOKEN)
+
+
+def test_a_local_token_needs_no_lookup(monkeypatch):
+    monkeypatch.setattr(public_http, "_tokens", frozenset({hashlib.sha256(TOKEN.encode()).hexdigest()}))
+    assert public_http._token_ok(TOKEN)  # no AWS here at all
 
 
 def test_unknown_category_is_an_error_with_the_valid_labels(client):

@@ -26,6 +26,7 @@ from kw_mcp.service import (  # shared with the PC agent: one definition
     parse_due,  # "23:59" is open through 23:59:59, as in kw-mcp
     period_time,
     schedule_note,
+    schedule_slots,
 )
 from kw_mcp.text import clean, html_to_text
 from mcp.server.mcpserver.exceptions import ToolError
@@ -135,7 +136,7 @@ def courses(snap: dict) -> list[dict]:
     for c in snap.get("courses", []):
         schedule = _t(c.get("lctrumSchdulInfo"))
         row = {"course": _t(c.get("subjNm")), "professor": _t(c.get("profNm")), "schedule": schedule,
-               "slots": parse_schedule(schedule), "semester": c.get("yearhakgi")}
+               "slots": schedule_slots(schedule), "semester": c.get("yearhakgi")}
         if note := schedule_note(schedule):
             row["note"] = note
         out.append(row)

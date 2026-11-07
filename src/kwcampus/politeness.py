@@ -33,6 +33,9 @@ from kwcampus.config import KST
 from kwcampus.obs import log, metrics
 
 MIN_INTERVAL = timedelta(seconds=60)
+# A notice's own images and attachment files, right after its page (a browser opening the notice loads
+# them all at once): this far apart, then the server's minute again (rest). Each still counts.
+ASSET_GAP_S = 3
 COOLDOWN_START = timedelta(minutes=30)
 COOLDOWN_MAX = timedelta(hours=24)
 SOFT_COOLDOWN_MAX = timedelta(hours=6)
@@ -75,8 +78,11 @@ def state(table, origin: str) -> dict:
     return table.get_item(Key=_key(origin), ConsistentRead=True).get("Item") or {}
 
 
-def acquire(table, origin: str, now: datetime, daily_cap: int, by: str | None = None) -> Permit:
-    """`now` is the time of the request about to be made. `by` records who took the permit."""
+def acquire(table, origin: str, now: datetime, daily_cap: int, by: str | None = None,
+            interval: timedelta | None = None) -> Permit:
+    """`now` is the time of the request about to be made. `by` records who took the permit. `interval`
+    (default MIN_INTERVAL) is how long the next request to this server waits; only an operator's
+    backfill run and a page run's notice images and files (ASSET_GAP_S, then rest) pass a shorter one."""
     item = state(table, origin)
     if item.get("disabled"):
         log("origin_disabled", origin=origin)
@@ -92,7 +98,7 @@ def acquire(table, origin: str, now: datetime, daily_cap: int, by: str | None = 
         return Permit(False, "daily_cap")
 
     version = int(item.get("ver", 0))
-    values = {":next": _ts(now + MIN_INTERVAL), ":day": today, ":count": count + 1, ":ver": version,
+    values = {":next": _ts(now + (interval or MIN_INTERVAL)), ":day": today, ":count": count + 1, ":ver": version,
               ":newver": version + 1, ":now": _ts(now), ":false": False}
     update = "SET next_at = :next, #day = :day, day_count = :count, ver = :newver"
     if by:
@@ -116,6 +122,21 @@ def acquire(table, origin: str, now: datetime, daily_cap: int, by: str | None = 
             return Permit(False, "raced")
         raise
     return Permit(True, "ok")
+
+
+def rest(table, origin: str, at: datetime) -> None:
+    """The server's full MIN_INTERVAL from `at` (the end of a burst taken with a shorter `interval`):
+    the next list request waits as usual. Never brings the next request closer."""
+    try:
+        table.update_item(
+            Key=_key(origin),
+            UpdateExpression="SET next_at = :next ADD ver :one",  # a run that read the old state must re-read
+            ConditionExpression="attribute_not_exists(next_at) OR next_at < :next",
+            ExpressionAttributeValues={":next": _ts(at + MIN_INTERVAL), ":one": 1},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
 
 
 def move(table, old: str, new: str) -> None:

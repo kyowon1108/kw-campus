@@ -21,9 +21,10 @@ def _table(dynamodb, name: str):
 
 @pytest.fixture
 def aws():
-    from kwcampus import params
+    from kwcampus import invites, params
 
     params.clear_cache()
+    invites.clear_cache()  # an invite's answer is kept a minute: never across tests
     with mock_aws():
         dynamodb = boto3.resource("dynamodb")
         yield {
@@ -33,3 +34,4 @@ def aws():
             "sqs": boto3.client("sqs"),
         }
     params.clear_cache()
+    invites.clear_cache()

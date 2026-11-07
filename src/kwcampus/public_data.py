@@ -8,6 +8,11 @@ the current redaction version never shows a name. Expired items (ttl passed, the
 can lag by days) and items taken down by hand are never served. The same notice cross-posted by
 several boards (the very same title, brackets included) comes back once, with the other copies'
 post ids in "also" and their boards in "also_boards", so a department filter still finds its copy.
+
+A notice whose page was read (extract.py) also carries "extracted" (deadlines, 대상, 자격, 신청 방법,
+금액, 문의 부서, as a model read them) and "deadline": the earliest 신청마감 still ahead, else the
+earliest deadline still ahead, else the earliest one. Rows without them keep their old shape.
+open_only / deadline_after keep only notices whose deadline is today or later (KST) / on or after a day.
 """
 
 from __future__ import annotations
@@ -15,12 +20,12 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Iterable
-from datetime import date
+from datetime import UTC, date, datetime
 
 from boto3.dynamodb.conditions import Key
 
-from kwcampus import deptboards, wixfeeds, wwwboards
-from kwcampus.config import NOTICE_SOURCE
+from kwcampus import deptboards, extract, wixfeeds, wwwboards
+from kwcampus.config import KST, NOTICE_SOURCE
 from kwcampus.kwnotice.redaction import redact_text
 from kwcampus.routing import CATEGORY_LABEL, QUIET_CATEGORIES
 
@@ -189,10 +194,14 @@ def _public_id(item: dict) -> str:
     return raw if source == NOTICE_SOURCE else f"{source}-{raw}"
 
 
+def _today() -> date:
+    return datetime.now(UTC).astimezone(KST).date()
+
+
 def public_view(item: dict) -> dict:
     """Only fields meant for readers; internal flags (seed, hashes, ttl) stay in the table."""
     cid = str(item.get("category_id", ""))
-    return {
+    row = {
         "post_id": _public_id(item),
         "title": redact_text(str(item.get("title", ""))),
         "category": CATEGORY_LABEL.get(cid, cid),
@@ -203,14 +212,21 @@ def public_view(item: dict) -> dict:
         "pinned": bool(item.get("pinned")),
         "url": str(item.get("url", "")),
     }
+    if isinstance(item.get("extracted"), dict):
+        facts = extract.public_facts(item)
+        row["deadline"] = extract.deadline_of(facts, _today())
+        row["extracted"] = facts
+    return row
 
 
 def _filter(rows: Iterable[dict], category: str | Iterable[str] | None, since: date | None, quiet: bool = True,
-            sources: Iterable[str] | None = None) -> list[dict]:
+            sources: Iterable[str] | None = None, deadline_from: date | None = None) -> list[dict]:
     """quiet=False leaves out the FAQ (reference pages, never announced) unless asked for by category.
-    sources keeps only rows of those sources ("kw-notice" is the main board)."""
+    sources keeps only rows of those sources ("kw-notice" is the main board). deadline_from keeps only
+    rows whose deadline falls on that day or later."""
     ids = _category_ids(category)
     wanted = frozenset(sources) if sources is not None else None
+    after = deadline_from.isoformat() if deadline_from else None
     out = []
     for r in rows:
         if wanted is not None and r.get("_source", NOTICE_SOURCE) not in wanted:
@@ -220,6 +236,8 @@ def _filter(rows: Iterable[dict], category: str | Iterable[str] | None, since: d
         if ids is None and not quiet and r.get("category_id") in QUIET_CATEGORIES:
             continue
         if since and r["posted_date"] < since.isoformat():
+            continue
+        if after and not (r.get("deadline") and str(r["deadline"]["at"])[:10] >= after):
             continue
         out.append(r)
     return out
@@ -272,21 +290,30 @@ def _limited(rows: list[dict], limit: int, max_limit: int = MAX_LIMIT) -> list[d
     return folded[:limit]
 
 
+def _deadline_from(deadline_after: date | None, open_only: bool) -> date | None:
+    days = [d for d in (deadline_after, _today() if open_only else None) if d]
+    return max(days, default=None)
+
+
 def latest(table, category: str | Iterable[str] | None = None, limit: int = 10, include_pinned: bool = True,
-           since: date | None = None, sources: Iterable[str] | None = None, max_limit: int = MAX_LIMIT) -> list[dict]:
-    """Newest notices. Every filter (category, since, sources, pinned) applies before the limit, which is
-    at most max_limit (MAX_LIMIT; DEPARTMENT_LIMIT for the department boards' own queries)."""
-    rows = _filter(notices(table), category, since, quiet=False, sources=sources)
+           since: date | None = None, sources: Iterable[str] | None = None, max_limit: int = MAX_LIMIT, *,
+           deadline_after: date | None = None, open_only: bool = False) -> list[dict]:
+    """Newest notices. Every filter (category, since, sources, pinned, deadline) applies before the limit,
+    which is at most max_limit (MAX_LIMIT; DEPARTMENT_LIMIT for the department boards' own queries)."""
+    rows = _filter(notices(table), category, since, quiet=False, sources=sources,
+                   deadline_from=_deadline_from(deadline_after, open_only))
     if not include_pinned:
         rows = [r for r in rows if not r["pinned"]]
     return _limited(rows, limit, max_limit)
 
 
 def search(table, query: str, category: str | Iterable[str] | None = None, since: date | None = None,
-           limit: int = 20, sources: Iterable[str] | None = None, max_limit: int = MAX_LIMIT) -> list[dict]:
+           limit: int = 20, sources: Iterable[str] | None = None, max_limit: int = MAX_LIMIT, *,
+           deadline_after: date | None = None, open_only: bool = False) -> list[dict]:
     """Notices whose title or department has every word of query; filters apply before the limit."""
     terms = [t.casefold() for t in query.split() if t.strip()]
-    rows = _filter(notices(table), category, since, quiet=bool(terms), sources=sources)
+    rows = _filter(notices(table), category, since, quiet=bool(terms), sources=sources,
+                   deadline_from=_deadline_from(deadline_after, open_only))
     hits = [r for r in rows if all(t in (r["title"] + " " + r["department"]).casefold() for t in terms)]
     return _limited(hits, limit, max_limit)
 

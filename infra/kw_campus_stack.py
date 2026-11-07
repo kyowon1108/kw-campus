@@ -24,10 +24,15 @@ COLLECT_SCHEDULE = "cron(0/20 9-18 ? * MON-FRI *)"
 # One more look on weekday evenings: closures and class cancellations are often posted the evening
 # before (에브리타임, 2026-11). No weekend run: none of the first 309 notices was posted on a weekend.
 EXTRA_COLLECT_SCHEDULES = {"CollectEveningSchedule": ("kw-collector-evening", "cron(0 21 ? * MON-FRI *)")}
+# Ten minutes after each daytime list run: read queued notice pages (one per server, from the day's
+# spare requests) and pull facts out of them with OpenAI (extract.py).
+PAGES_SCHEDULE = "cron(10/20 9-18 ? * MON-FRI *)"
 # Weekdays 07:30 KST: cafeteria menu / academic calendar refresh (0-2 www requests a run).
 CAMPUS_SCHEDULE = "cron(30 7 ? * MON-FRI *)"
+# Weekdays 08:30 KST: D-3 / D-1 reminders under announced notices (reminders.py).
+REMIND_SCHEDULE = "cron(30 8 ? * MON-FRI *)"
 # Per-route limits on the bridge (requests/s, burst). Each route here has its own bucket; everything
-# else (installer pages, junk paths) shares the stage default of 10/20. Signup-like routes get much
+# else (the pages and downloads, junk paths) shares the stage default of 10/20. Signup-like routes get much
 # less. /mcp has its own bucket, so junk on other paths can't crowd out the connectors. Agents'
 # result posts have their own bucket and their own function (BRIDGE_RESULT_ROUTE), so neither other
 # routes nor /mcp calls waiting on agents can starve them; a flood aimed at /device/result itself
@@ -39,6 +44,7 @@ BRIDGE_ROUTE_LIMITS = {
     ("GET", "/oauth/authorize"): (2, 5),
     ("HEAD", "/oauth/authorize"): (2, 5),
     ("POST", "/oauth/approve"): (2, 5),
+    ("POST", "/connect/claim"): (2, 5),  # answers whether a connection code is pending: no faster than approve
     ("POST", "/oauth/token"): (5, 10),
     ("POST", "/device/register"): (1, 3),
     ("POST", "/device/pair"): (2, 5),
@@ -143,17 +149,24 @@ class KwCampusStack(cdk.Stack):
         # retries=0: a failed or slow run must not hit the school's servers again a minute later.
         # One at a time: a manual run can never overlap a scheduled one (the 60 s gap holds), and a
         # run held back by that is dropped after 5 minutes instead of retried for hours.
-        collector = fn("Collector", "kwcampus.collector.handler", 150, retries=0, concurrency=1,
-                       max_event_age=cdk.Duration.minutes(5))
+        # The page runs extract with OpenAI (KW_EXTRACT_MODEL unset: extract's default gpt-5.4-mini) and read
+        # a notice's images and files too (notice_assets: up to 60 s, inside the 150 s): 512 MB for parsing a
+        # 15 MB PDF or HWP and sending 4 MB of images, as on the bridge, which reads the same files.
+        collector = fn("Collector", "kwcampus.collector.handler", 150, {"KW_EXTRACT_PROVIDER": "openai"}, memory=512,
+                       retries=0, concurrency=1, max_event_age=cdk.Duration.minutes(5))
         dispatcher = fn("Dispatcher", "kwcampus.dispatcher.handler", 30, {"KW_DISCORD_QUEUE_URL": queue.queue_url})
         sender = fn("DiscordSender", "kwcampus.discord.handler", 60)
         campus = fn("Campus", "kwcampus.campus.handler", 150, retries=0)
+        reminders = fn("Reminders", "kwcampus.reminders.handler", 60, {"KW_DISCORD_QUEUE_URL": queue.queue_url},
+                       retries=0)
         lwa = lambda_.LayerVersion.from_layer_version_arn(self, "LwaLayer", LWA_LAYER)
         web_env = {"AWS_LAMBDA_EXEC_WRAPPER": "/opt/bootstrap", "AWS_LWA_PORT": "8080",
                    "AWS_LWA_READINESS_CHECK_PATH": "/healthz"}
-        public_mcp = fn("PublicMcp", "run.sh", 15, memory=512, layers=[lwa], extra_env=web_env)
+        public_mcp = fn("PublicMcp", "run.sh", 15, memory=512, layers=[lwa],
+                        extra_env={**web_env, "KW_BRIDGE_TABLE": bridge_table.table_name})
 
-        # collector: kw-public only, its own switches, no Discord secrets
+        # collector: kw-public only, its own switches, no Discord secrets. /kw/collector/* also holds the
+        # OpenAI key (SecureString, aws/ssm key, decrypted through SSM) and the extraction cap.
         public.grant_read_write_data(collector)
         collector.add_to_role_policy(iam.PolicyStatement(
             actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/collector/*"]))
@@ -188,8 +201,16 @@ class KwCampusStack(cdk.Stack):
         sender.add_to_role_policy(iam.PolicyStatement(
             actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/discord/*"]))
 
-        # Discord buttons (#알림-설정): its own function and API, no table access, reads only the
-        # three parameters it needs. Discord must get an answer within 3 s.
+        # reminders: reads notices, puts "remind" jobs on the Discord queue (the sender posts them), reads
+        # the notify switch; no Discord secrets, no delivery records
+        public.grant_read_data(reminders)
+        queue.grant_send_messages(reminders)
+        reminders.add_to_role_policy(iam.PolicyStatement(
+            actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/collector/notify"]))
+
+        # Discord buttons (#알림-설정): its own function and API, reads only the three parameters it
+        # needs, and touches only the invite rows of kw-bridge (granted below, next to the bridge whose
+        # address its invites carry). Discord must get an answer within 3 s.
         # 1024 MB for the CPU share: a cold start must still answer well inside those 3 s.
         interactions = fn("DiscordInteractions", "kwcampus.interactions.handler", 5, memory=1024)
         interactions.add_to_role_policy(iam.PolicyStatement(
@@ -209,16 +230,20 @@ class KwCampusStack(cdk.Stack):
         campus.add_to_role_policy(iam.PolicyStatement(
             actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/collector/*"]))
 
-        # public MCP: read-only on kw-public, its own token list
+        # public MCP: read-only on kw-public, its own token list, and one look at an invite row each
+        # (a Discord-issued invite is a token too: invites.check)
         public.grant_read_data(public_mcp)
         public_mcp.add_to_role_policy(iam.PolicyStatement(
             actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/mcp/*"]))
+        public_mcp.add_to_role_policy(iam.PolicyStatement(
+            actions=["dynamodb:GetItem"], resources=[bridge_table.table_arn],
+            conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["INVITE#*"]}}))
         api = apigw.HttpApi(self, "PublicApi", api_name="kw-public-mcp", create_default_stage=False,
                             default_integration=apigw_int.HttpLambdaIntegration("PublicMcpIntegration", public_mcp))
         api.add_stage("DefaultStage", stage_name="$default", auto_deploy=True,
                       throttle=apigw.ThrottleSettings(rate_limit=2, burst_limit=5))
 
-        # bridge: WebSocket for PC agents, HTTP for OAuth + personal MCP + installer
+        # bridge: WebSocket for PC agents, HTTP for OAuth + personal MCP + pages and downloads
         bridge_env = {"KW_BRIDGE_TABLE": bridge_table.table_name}
         bridge_ws = fn("BridgeWs", "kwcampus.bridge.ws.handler", 10, extra_env=bridge_env)
         bridge_table.grant_read_write_data(bridge_ws)
@@ -241,8 +266,16 @@ class KwCampusStack(cdk.Stack):
         bridge_table.grant_read_write_data(bridge)
         public.grant_read_data(bridge)
         ws_stage.grant_management_api_access(bridge)
+        # Only what it reads: the JWT secret and the hand-made invite list (invites.TOKENS_PARAM).
         bridge.add_to_role_policy(iam.PolicyStatement(
-            actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/bridge/*", f"{ssm_arn}/kw/mcp/*"]))
+            actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/bridge/jwt-secret", f"{ssm_arn}/kw/mcp/tokens"]))
+        # Discord buttons hand out invites for this bridge: INVITE# rows, the member's DMEMBER# row and the
+        # day's DINVITES# count only (invites.issue: one transaction of Updates, authorised per Update).
+        interactions.add_environment("KW_BRIDGE_TABLE", bridge_table.table_name)
+        interactions.add_environment("KW_BRIDGE_BASE_URL", bridge_api.api_endpoint)
+        interactions.add_to_role_policy(iam.PolicyStatement(
+            actions=["dynamodb:GetItem", "dynamodb:UpdateItem"], resources=[bridge_table.table_arn],
+            conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["INVITE#*", "DMEMBER#*", "DINVITES#*"]}}))
         # POST /device/result alone: the same code and app as the bridge, its own concurrency, and only
         # what that route touches. store.put_result fills the RESULT# slot the waiting bridge call opened
         # (UpdateItem, then GetItem to accept a retried identical body); the bridge polls that slot in
@@ -279,20 +312,25 @@ class KwCampusStack(cdk.Stack):
         schedule_role = iam.Role(self, "ScheduleRole", assumed_by=iam.ServicePrincipal("scheduler.amazonaws.com"))
         collector.grant_invoke(schedule_role)
         campus.grant_invoke(schedule_role)
-        scheduler.CfnSchedule(
-            self, "CampusSchedule",
-            name="kw-campus-tick",
-            schedule_expression=CAMPUS_SCHEDULE,
-            schedule_expression_timezone="Asia/Seoul",
-            flexible_time_window=scheduler.CfnSchedule.FlexibleTimeWindowProperty(mode="OFF"),
-            target=scheduler.CfnSchedule.TargetProperty(
-                arn=campus.function_arn,
-                role_arn=schedule_role.role_arn,
-                retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
-            ),
-        )
-        for construct_id, (name, expression) in {"CollectSchedule": ("kw-collector-tick", COLLECT_SCHEDULE),
-                                                 **EXTRA_COLLECT_SCHEDULES}.items():
+        reminders.grant_invoke(schedule_role)
+        for construct_id, name, expression, target in (("CampusSchedule", "kw-campus-tick", CAMPUS_SCHEDULE, campus),
+                                                       ("RemindSchedule", "kw-remind-tick", REMIND_SCHEDULE, reminders)):
+            scheduler.CfnSchedule(
+                self, construct_id,
+                name=name,
+                schedule_expression=expression,
+                schedule_expression_timezone="Asia/Seoul",
+                flexible_time_window=scheduler.CfnSchedule.FlexibleTimeWindowProperty(mode="OFF"),
+                target=scheduler.CfnSchedule.TargetProperty(
+                    arn=target.function_arn,
+                    role_arn=schedule_role.role_arn,
+                    retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
+                ),
+            )
+        collector_runs = {"CollectSchedule": ("kw-collector-tick", COLLECT_SCHEDULE, None),
+                          **{k: (name, expr, None) for k, (name, expr) in EXTRA_COLLECT_SCHEDULES.items()},
+                          "CollectPagesSchedule": ("kw-collector-pages", PAGES_SCHEDULE, '{"phase": "pages"}')}
+        for construct_id, (name, expression, payload) in collector_runs.items():
             scheduler.CfnSchedule(
                 self, construct_id,
                 name=name,
@@ -302,6 +340,7 @@ class KwCampusStack(cdk.Stack):
                 target=scheduler.CfnSchedule.TargetProperty(
                     arn=collector.function_arn,
                     role_arn=schedule_role.role_arn,
+                    input=payload,
                     retry_policy=scheduler.CfnSchedule.RetryPolicyProperty(maximum_retry_attempts=0),
                 ),
             )
@@ -325,7 +364,8 @@ class KwCampusStack(cdk.Stack):
             a.add_alarm_action(action)
 
         five_min = cdk.Duration.minutes(5)
-        for f in (collector, dispatcher, sender, interactions, campus, public_mcp, bridge, bridge_result, bridge_ws):
+        for f in (collector, dispatcher, sender, interactions, campus, public_mcp, bridge, bridge_result, bridge_ws,
+                  reminders):
             alarm(f"{f.node.id.lower()}-errors", f.metric_errors(period=five_min))
         for f in (collector, bridge, bridge_result, interactions):
             alarm(f"{f.node.id.lower()}-throttles", f.metric_throttles(period=five_min))
@@ -405,6 +445,12 @@ class KwCampusStack(cdk.Stack):
         # a board that answers but parses to nothing: its layout changed, or a block page we don't recognise
         alarm("collector-parse-empty", cw.Metric(namespace="KwCampus", metric_name="ParseEmpty",
                                                  statistic="Sum", period=cdk.Duration.hours(3)), threshold=3)
+        # notice pages the model couldn't read (OpenAI errors, broken answers, a board's page layout changed)
+        alarm("collector-extract-failed", cw.Metric(namespace="KwCampus", metric_name="ExtractFail",
+                                                    statistic="Sum", period=cdk.Duration.hours(6)), threshold=3)
+        # the OpenAI key is missing, refused or revoked: extraction is stopped until a human fixes it
+        alarm("collector-extract-auth", cw.Metric(namespace="KwCampus", metric_name="ExtractAuthFail",
+                                                  statistic="Sum", period=cdk.Duration.hours(1)))
         alarm("discord-dlq", dlq.metric_approximate_number_of_messages_visible(period=five_min))
         # buttons that couldn't change a role (bot role dragged below the subscription roles, token gone)
         alarm("discord-buttons-failed", cw.Metric(namespace="KwCampus", metric_name="InteractionFailed",

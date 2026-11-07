@@ -117,7 +117,7 @@ def test_bridge_reports_snapshot_gaps_and_asks_the_pc_again(env, monkeypatch):
     assert out["until"] == "2099-11-13 23:59" and [i["title"] for i in out["items"]] == ["HW3"]
     assert out["incomplete"]["missing"] == ["quiz", "online_test", "survey", "discussion"]
     assert out["incomplete"]["missing_courses"] == [{"kind": "assignment", "course": "운영체제"}]
-    assert "빠진 마감" in out["incomplete"]["message"] and "kw-mcp update" in out["incomplete"]["message"]
+    assert "빠진 마감" in out["incomplete"]["message"] and "KW CAMPUS 확장을 다시 설치" in out["incomplete"]["message"]
     quizzes = tool(c, token, "my_quizzes")
     assert quizzes["isError"] and "퀴즈 목록을 읽지 못했습니다" in quizzes["content"][0]["text"]
     assert len(_sent(env, "snapshot")) == 2  # a partial snapshot isn't cached: the PC retries what failed
@@ -250,7 +250,7 @@ def test_my_notices_keeps_the_students_own_department_and_college(env, monkeypat
 
     answers["department"] = {"error": "unsupported"}  # an agent before 1.0.0: the rest still answers
     out = tool(c, token, "my_notices")["structuredContent"]
-    assert "department" not in out and "kw-mcp update" in out["department_note"]
+    assert "department" not in out and "KW CAMPUS 확장을 다시 설치" in out["department_note"]
     assert isinstance(out["course_posts"], list) and "school_academic" in out
 
     answers["department"] = {"result": {"op": "department"}}  # not a name: ignored, not split into one
@@ -295,9 +295,9 @@ def test_an_agent_that_ignores_id_is_told_to_update(env, monkeypatch):
     monkeypatch.setattr(bridge, "_agent_request", agent_0_9_0)
     picked = tool(c, token, "my_assignment_detail", course="데이터", title="HW3", id="1234")
     text = picked["content"][0]["text"]
-    assert picked["isError"] and "여러 개" in text and "kw-mcp update" in text
+    assert picked["isError"] and "여러 개" in text and "KW CAMPUS 확장을 다시 설치" in text
     plain = tool(c, token, "my_assignment_detail", course="데이터", title="HW3")["content"][0]["text"]
-    assert "여러 개" in plain and "kw-mcp update" not in plain
+    assert "여러 개" in plain and "다시 설치" not in plain
 
 
 # --- 6. agent error messages -----------------------------------------------------------------------
@@ -337,9 +337,10 @@ def test_agent_messages_for_klas_down_and_the_request_cap_reach_the_tool_error()
     slow = _tool_error({"error": "klas_slow"})
     assert slow == bridge._ERRORS["klas_slow"] and "느립니다" in slow and "다시" in slow
     login = _tool_error({"error": "klas_login_required", "message": "비밀번호가 맞지 않습니다."})
-    assert "kw-mcp setup" in login and login.endswith("비밀번호가 맞지 않습니다.")
+    assert "KW CAMPUS 확장 설정에서 다시 넣어" in login and login.endswith("비밀번호가 맞지 않습니다.")
+    assert "kw-mcp" not in login  # no terminal commands for students
     old = _tool_error({"error": "unsupported"})
-    assert "kw-mcp update" in old and "설치할 때" not in old
+    assert "KW CAMPUS 확장을 다시 설치" in old and "kw-mcp" not in old
     assert _tool_error({"error": "not_found", "message": "그런 글이 없습니다."}) == "그런 글이 없습니다."
 
 

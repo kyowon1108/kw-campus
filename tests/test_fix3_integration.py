@@ -2,17 +2,12 @@
 
 Made-up courses, titles and ids only; no KLAS, school servers or AWS (moto)."""
 
-import re
-from datetime import UTC, datetime
-from pathlib import Path
-
 import test_bridge
 from kw_mcp import agent as kw_agent
-from kw_mcp import release
 from test_bridge import FakeDevice, mcp_call, oauth, register, tool
 
 from kwcampus.bridge import app as bridge
-from kwcampus.bridge import install, store
+from kwcampus.bridge import store
 
 env = test_bridge.env
 
@@ -65,32 +60,3 @@ def test_an_id_left_out_is_not_sent(env):
     tool(c, token, "my_assignment_detail", course="데이터", title="HW3")
     assert "id" not in _calls(env)[0]["args"]
     assert bridge._id_arg(None) is None and bridge._id_arg(0) == "0" and bridge._id_arg("5-678") == "5-678"
-
-
-# --- the first install and an agent update install a release the same way -------------------------
-
-def _flags(argv: list[str]) -> set[str]:
-    return {a for a in argv if a.startswith("--")}
-
-
-def _line(script: str, start: str) -> list[str]:
-    """The words of the script line that starts with `start` (after the shell's `if !`)."""
-    found = [line for line in script.splitlines() if line.lstrip("if! ").startswith(start)]
-    assert len(found) == 1, (start, found)
-    return found[0].replace("\\", " ").split()
-
-
-def test_installers_check_hashes_and_refuse_builds_like_an_agent_update(tmp_path):
-    pins = tmp_path / release.constraints_name("1.0.0")
-    exported = "httpx==0.28.1 \\\n    --hash=sha256:" + "0" * 64 + "\n"
-    pins.write_text(release.constraints_text(exported, "1.0.0", datetime(2026, 11, 1, tzinfo=UTC)))
-    wheel = tmp_path / "kw_mcp-1.0.0-py3-none-any.whl"
-    install_step, hash_step = kw_agent.install_steps("uv", wheel, pins, Path("python"))
-    assert "--exclude-newer" in install_step and "--no-build" in hash_step
-    for script in (install.INSTALL_SH, install.INSTALL_PS1):
-        assert _flags(_line(script, "uv pip install")) == _flags(hash_step)
-        tool_line = " ".join(_line(script, "uv tool install"))
-        tool_flags = _flags(tool_line.split()) | (_flags(_line(script, "--exclude-newer"))
-                                                   if "--exclude-newer" not in tool_line else set())
-        assert tool_flags == _flags(install_step)
-        assert re.search(r"--exclude-newer ['\"]__EXCLUDE_NEWER__['\"]", script)

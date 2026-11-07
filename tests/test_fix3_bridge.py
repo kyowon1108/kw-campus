@@ -401,32 +401,33 @@ def test_timeouts_unreadable_answers_and_crashes_are_counted(env, monkeypatch, c
                                                       "AgentOutcomeUnexpected"]
 
 
-# --- S33: update hints by protocol version -----------------------------------------------------------
+# --- S33: update hints (every version: reinstall the extension) ------------------------------------
 
-def test_update_hint_follows_the_agent_version(env, monkeypatch):
+def test_update_hint_points_at_the_extension_for_every_agent_version(env, monkeypatch):
     c, device, token = _connected(env, version=3)
     env["answers"]["grades"] = {"error": "unsupported"}
     text = tool(c, token, "my_grades")["content"][0]["text"]
-    assert "`kw-mcp update`를 실행해" in text and "/setup" not in text
+    assert "옛 버전이라 이 기능을 못 써요" in text and "KW CAMPUS 확장을 다시 설치" in text
+    assert "kw-mcp" not in text and "/setup" not in text  # no terminal commands for students
     env["answers"]["assignment_detail"] = {"error": "not_found", "message": "그런 과제가 없습니다."}
     picked = tool(c, token, "my_assignment_detail", course="데이터", title="HW3", id="7")["content"][0]["text"]
     assert picked.endswith(": 그런 과제가 없습니다.")  # a 1.0 agent knows ids: no update hint on top
 
     store.remove_connection(env["table"], "conn-1")
     store.add_connection(env["table"], device.uid, "conn-2", 2)  # the PC went back to 0.9.0
-    text = tool(c, token, "my_grades")["content"][0]["text"]
-    assert f"{bridge.BASE_URL}/setup" in text and "1.0부터는 `kw-mcp update`" in text
+    assert tool(c, token, "my_grades")["content"][0]["text"] == text
     picked = tool(c, token, "my_assignment_detail", course="데이터", title="HW3", id="7")["content"][0]["text"]
-    assert "그런 과제가 없습니다. 1.0보다 옛 PC 에이전트는 id·file_index를 모르고" in picked and "/setup" in picked
+    assert "그런 과제가 없습니다. 1.0보다 옛 PC 에이전트는 id·file_index를 모르고" in picked
+    assert "KW CAMPUS 확장을 다시 설치" in picked and "kw-mcp" not in picked
 
     store.remove_connection(env["table"], "conn-2")
-    store.add_connection(env["table"], device.uid, "conn-3", 1)  # before calls: told to install again
+    store.add_connection(env["table"], device.uid, "conn-3", 1)  # before calls
     text = tool(c, token, "my_grades")["content"][0]["text"]
-    assert "/setup" in text and "1.0보다 옛 버전" in text
+    assert "옛 버전" in text and "KW CAMPUS 확장을 다시 설치" in text and "kw-mcp" not in text
 
 
-def test_raise_for_without_a_version_gives_the_install_hint():
-    with pytest.raises(ToolError, match="설치 명령을 PC에서 다시 실행"):
+def test_raise_for_unsupported_gives_the_extension_hint():
+    with pytest.raises(ToolError, match="KW CAMPUS 확장을 다시 설치"):
         bridge._raise_for({"error": "unsupported"})
     with pytest.raises(ToolError, match="KLAS에서 데이터를 읽지"):
         bridge._raise_for({"error": ["not", "a", "code"]})
@@ -440,7 +441,9 @@ def test_one_invite_registers_a_few_pcs_and_an_unlinked_one_frees_its_place(env)
     extra = FakeDevice()
     refused = c.post("/device/register", json={"invite": INVITE, "public_key": extra.jwk})
     assert refused.status_code == 409 and refused.json()["error"] == "too_many_devices"
-    assert "kw-mcp unlink" in refused.json()["message"]
+    message = refused.json()["message"]
+    assert message == ("이 초대 코드로 연결한 PC가 이미 5대예요. 안 쓰는 PC에서 KW CAMPUS 확장을 지우거나, "
+                       "디스코드 #설치-안내에서 새 초대 코드를 받아 주세요.")
     assert c.post("/device/unlink", json=signed(devices[0], "unlink")).status_code == 200
     assert c.post("/device/register", json={"invite": INVITE, "public_key": extra.jwk}).status_code == 201
 

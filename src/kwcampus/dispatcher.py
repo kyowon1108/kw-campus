@@ -17,6 +17,9 @@
 - any other MODIFY that moved the notice's ttl (pinned or department changed) → "keep": the sender
   moves the delivery record's ttl along, without calling Discord.
 A notice taken down by hand (removed=true, scripts/collector_admin.py takedown) gets no job at all.
+The facts extract.py writes onto a notice (extracted, body_hash, ...) change nothing the message shows
+and move no ttl, so that MODIFY makes no job either. D-day reminders come from reminders.py, which
+sends its "remind" jobs to the same queue with send_jobs.
 While the /kw/collector/notify switch is off nothing reaches Discord: only "keep" jobs go out (for
 every MODIFY that moved the ttl), so the delivery records still follow their notices.
 """
@@ -171,7 +174,7 @@ def jobs_for(records: list[dict], today: date, notify: bool = True) -> list[dict
     return jobs
 
 
-def _send(sqs, jobs: list[dict]) -> None:
+def send_jobs(sqs, jobs: list[dict]) -> None:
     """Up to 10 jobs; entries SQS rejects are sent again a couple of times before giving up."""
     entries = [{"Id": str(i), "MessageBody": json.dumps(job)} for i, job in enumerate(jobs)]
     for _ in range(SEND_TRIES):
@@ -191,7 +194,7 @@ def handler(event, context):
     if jobs:
         sqs = boto3.client("sqs")
         for start in range(0, len(jobs), 10):
-            _send(sqs, jobs[start : start + 10])
+            send_jobs(sqs, jobs[start : start + 10])
     if not notify:  # only "keep" jobs went out: nothing reaches Discord
         log("dispatch_skip", reason="notify_off", records=len(records), keep=len(jobs))
         return {"batchItemFailures": []}

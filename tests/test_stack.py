@@ -8,9 +8,9 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "infra"))
 from kw_campus_stack import KwCampusStack
 
 
-def template(tmp_path, alarm_email: str | None = None) -> Template:
+def template(tmp_path, alarm_email: str | None = None, context: dict | None = None) -> Template:
     (tmp_path / "placeholder.py").write_text("")
-    app = cdk.App()
+    app = cdk.App(context=context)
     stack = KwCampusStack(app, "Test", asset_path=str(tmp_path), alarm_email=alarm_email,
                           env=cdk.Environment(region="ap-northeast-2"))
     return Template.from_stack(stack)
@@ -35,7 +35,7 @@ def route_targets(t: Template) -> dict[str, str]:
 
 def test_functions_and_tables(tmp_path):
     t = template(tmp_path)
-    t.resource_count_is("AWS::Lambda::Function", 9)
+    t.resource_count_is("AWS::Lambda::Function", 10)  # kw-reminders added
     t.resource_count_is("AWS::DynamoDB::Table", 3)
     t.has_resource_properties("AWS::DynamoDB::Table", {
         "TableName": "kw-public",
@@ -94,6 +94,19 @@ def test_public_mcp_runs_behind_web_adapter_with_throttling(tmp_path):
     assert "PutItem" not in mcp_policy and "/kw/mcp/*" in mcp_policy and "/kw/discord" not in mcp_policy
 
 
+def test_public_mcp_reads_only_invite_rows_of_the_bridge_table(tmp_path):
+    """A Discord-issued invite is a public token too (invites.check): one GetItem on INVITE#<hash>."""
+    t = template(tmp_path)
+    t.has_resource_properties("AWS::Lambda::Function", {
+        "FunctionName": "kw-publicmcp",
+        "Environment": {"Variables": Match.object_like({"KW_BRIDGE_TABLE": {"Ref": "BridgeTable91945A73"}})}})
+    statements = policy_of(t, "PublicMcpServiceRole")["Properties"]["PolicyDocument"]["Statement"]
+    bridge = [s for s in statements if "BridgeTable91945A73" in str(s["Resource"])]
+    assert bridge == [{"Action": "dynamodb:GetItem", "Effect": "Allow",
+                       "Resource": {"Fn::GetAtt": ["BridgeTable91945A73", "Arn"]},
+                       "Condition": {"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["INVITE#*"]}}}]
+
+
 def test_bridge_wiring_and_least_privilege(tmp_path):
     t = template(tmp_path)
     t.has_resource_properties("AWS::Lambda::Function", {
@@ -108,7 +121,14 @@ def test_bridge_wiring_and_least_privilege(tmp_path):
     policies = t.find_resources("AWS::IAM::Policy")
     bridge = str(next(p for n, p in policies.items() if n.startswith("BridgeServiceRole")))
     ws = str(next(p for n, p in policies.items() if n.startswith("BridgeWsServiceRole")))
-    assert "execute-api:ManageConnections" in bridge and "/kw/bridge/*" in bridge and "/kw/discord" not in bridge
+    assert "execute-api:ManageConnections" in bridge and "/kw/discord" not in bridge
+    # SSM: only what it reads (the JWT secret, the hand-made invite list); no /kw/bridge/* (the old seal key)
+    ssm = [s for s in policy_of(t, "BridgeServiceRole")["Properties"]["PolicyDocument"]["Statement"]
+           if s["Action"] == "ssm:GetParameter"]
+    assert len(ssm) == 1
+    assert sorted(r["Fn::Join"][1][-1] for r in ssm[0]["Resource"]) == [
+        ":parameter/kw/bridge/jwt-secret", ":parameter/kw/mcp/tokens"]
+    assert "/kw/bridge/*" not in bridge and "/kw/mcp/*" not in bridge
     assert "ssm:" not in ws and "ManageConnections" not in ws
 
 
@@ -124,8 +144,20 @@ def test_discord_interactions_have_their_own_api_and_least_privilege(tmp_path):
     policy = str(next(p for n, p in policies.items() if n.startswith("DiscordInteractionsServiceRole")))
     assert all(f"/kw/discord/{name}" in policy for name in ("bot-token", "public-key", "roles"))
     assert "/kw/discord/*" not in policy and "/kw/discord/channels" not in policy
-    assert "dynamodb" not in policy and "sqs" not in policy
+    assert "sqs" not in policy
     assert "ssm:GetParameters" in policy  # one call for all three
+    # invites: GetItem/UpdateItem on the invite and member rows of kw-bridge, nothing else in any table
+    statements = policy_of(t, "DiscordInteractionsServiceRole")["Properties"]["PolicyDocument"]["Statement"]
+    tables = [s for s in statements if "dynamodb" in str(s["Action"])]
+    assert tables == [{"Action": ["dynamodb:GetItem", "dynamodb:UpdateItem"], "Effect": "Allow",
+                       "Resource": {"Fn::GetAtt": ["BridgeTable91945A73", "Arn"]},
+                       "Condition": {"ForAllValues:StringLike": {
+                           "dynamodb:LeadingKeys": ["INVITE#*", "DMEMBER#*", "DINVITES#*"]}}}]
+    env = {f["Properties"]["FunctionName"]: f["Properties"]["Environment"]["Variables"]
+           for f in t.find_resources("AWS::Lambda::Function").values()}
+    variables, bridge_variables = env["kw-discordinteractions"], env["kw-bridge"]
+    assert variables["KW_BRIDGE_TABLE"] == {"Ref": "BridgeTable91945A73"}
+    assert variables["KW_BRIDGE_BASE_URL"] == bridge_variables["KW_BRIDGE_BASE_URL"]  # invites carry this address
     t.has_resource_properties("AWS::CloudWatch::Alarm", {"AlarmName": "kw-discord-buttons-failed",
                                                          "MetricName": "InteractionFailed"})
 
@@ -294,3 +326,25 @@ def test_logical_ids_stay_put(tmp_path):
                 "BridgeWsApi49B6887C", "PublicApiC8293BC5", "DiscordQueueF83490F5", "DiscordDlq7CEACF49",
                 "Alarms04B5A0BF", "Bridge48182F58", "BridgeWs0035CE13", "Collector9EBA7CF5"}
     assert deployed <= set(template(tmp_path).to_json()["Resources"])
+
+
+def test_no_discord_join_link_reaches_the_bridge(tmp_path):
+    """The server is invite-only: nothing puts a Discord join link on /start."""
+    functions = template(tmp_path, context={"discordInviteUrl": "https://discord.gg/kwcampus"}).find_resources(
+        "AWS::Lambda::Function")
+    assert "KW_DISCORD_INVITE_URL" not in str(functions)
+
+
+def test_connect_claim_has_its_own_limit(tmp_path):
+    stage = next(s["Properties"] for s in template(tmp_path).find_resources("AWS::ApiGatewayV2::Stage").values()
+                 if "RouteSettings" in s["Properties"])
+    assert stage["RouteSettings"]["POST /connect/claim"] == {"ThrottlingRateLimit": 2, "ThrottlingBurstLimit": 5}
+
+
+def test_collector_extracts_with_openai_and_has_room_for_images_and_files(tmp_path):
+    t = template(tmp_path)
+    (fn,) = [f["Properties"] for f in t.find_resources("AWS::Lambda::Function").values()
+             if f["Properties"]["FunctionName"] == "kw-collector"]
+    variables = fn["Environment"]["Variables"]
+    assert variables["KW_EXTRACT_PROVIDER"] == "openai" and "KW_EXTRACT_MODEL" not in variables  # gpt-5.4-mini
+    assert fn["MemorySize"] == 512 and fn["Timeout"] == 150

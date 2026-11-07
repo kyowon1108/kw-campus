@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from kwcampus.discord import NotFound
-from kwcampus.interactions import menu_message
+from kwcampus.interactions import install_message, menu_message
 from kwcampus.routing import TOPICS
 
 _spec = importlib.util.spec_from_file_location("discord_setup", Path(__file__).parents[1] / "scripts" / "discord_setup.py")
@@ -19,6 +19,7 @@ ADD_REACTIONS = 1 << 6
 EVERYONE_PERMS = (ds.VIEW_CHANNEL | ds.SEND_MESSAGES | ds.READ_MESSAGE_HISTORY | ds.MENTION_EVERYONE
                   | ds.CREATE_PUBLIC_THREADS | ds.CREATE_PRIVATE_THREADS | ds.SEND_MESSAGES_IN_THREADS)
 CHANNELS = {"notice": "201", "academic": "202", "scholarship": "203", "career": "204", "international": "205"}
+BRIDGE = "https://bridge.example.com"
 
 
 class FakeDiscord:
@@ -43,6 +44,8 @@ class FakeDiscord:
         self.channels.append({"id": "209", "name": "운영", "type": 0, "parent_id": "300", "guild_id": GUILD,
                               "permission_overwrites": [{"id": GUILD, "type": 0, "allow": "0", "deny": "1024"}]})
         self.messages: dict[str, list[dict]] = {}
+        self.commands: list[dict] = []
+        self.commands_forbidden = False  # True: the app was installed without applications.commands
         self.writes: list[tuple[str, str]] = []
         self._next = 1000
 
@@ -69,6 +72,15 @@ class FakeDiscord:
             return copy.deepcopy(self.channels)
         if (method, path) == ("GET", f"/guilds/{GUILD}/members/{BOT}"):
             return {"user": {"id": BOT}, "roles": [BOT_ROLE]}
+        if (method, path) == ("GET", "/oauth2/applications/@me"):
+            return {"id": BOT}
+        if path == f"/applications/{BOT}/guilds/{GUILD}/commands":
+            if self.commands_forbidden:
+                raise RuntimeError(f"Discord 403 on {method} {path} (봇 권한이 부족합니다)")
+            if method == "GET":
+                return copy.deepcopy(self.commands)
+            self.commands = [c for c in self.commands if c["name"] != body["name"]] + [{"id": self._id(), **body}]
+            return self.commands[-1]
         if (method, path) == ("POST", f"/guilds/{GUILD}/roles"):
             for r in self.roles[1:] if self.shift else []:
                 r["position"] += 1  # new roles go to the bottom, just above @everyone
@@ -114,9 +126,9 @@ def ssm(aws):
     return aws["ssm"]
 
 
-def run(api, ssm, apply=False, department=False):
+def run(api, ssm, apply=False, department=False, bridge=BRIDGE):
     lines = []
-    code = ds.Setup(api, ssm, apply=apply, department=department, out=lines.append).run()
+    code = ds.Setup(api, ssm, apply=apply, department=department, out=lines.append, bridge=bridge).run()
     return code, "\n".join(lines)
 
 
@@ -129,7 +141,8 @@ def test_dry_run_changes_nothing(ssm):
     code, out = run(api, ssm)
     assert code == 0 and api.writes == []
     assert "dry-run: 아무것도 바꾸지 않았습니다" in out
-    assert out.count("역할 만들기") == len(TOPICS) and "#알림-설정 만들기" in out
+    assert out.count("역할 만들기") == len(TOPICS) and "#알림-설정 만들기" in out and "#설치-안내 만들기" in out
+    assert "/설치 명령 만들기" in out and "설치 안내 메시지 올리기" in out
     with pytest.raises(ssm.exceptions.ParameterNotFound):
         ssm.get_parameter(Name="/kw/discord/roles")
 
@@ -160,9 +173,18 @@ def test_apply_sets_everything_up_and_a_second_run_is_a_no_op(ssm):
 
     [menu] = api.messages[menu_channel["id"]]
     assert menu["content"] == menu_message()["content"]
+    install = next(c for c in api.channels if c["name"] == "설치-안내")
+    [guide] = api.messages[install["id"]]
     saved = json.loads(ssm.get_parameter(Name="/kw/discord/roles")["Parameter"]["Value"])
+    report = next(c for c in api.channels if c["name"] == "제보-검토")
     assert saved == {"guild": GUILD, "roles": {t.key: created[t.role]["id"] for t in TOPICS},
-                     "menu": {"channel": menu_channel["id"], "message": menu["id"]}}
+                     "menu": {"channel": menu_channel["id"], "message": menu["id"]},
+                     "install": {"channel": install["id"], "message": guide["id"]},
+                     "report": {"channel": report["id"]}}
+    # 제보 goes to a channel @everyone can't see; only the bot (and admins) read it
+    assert int(overwrite(api, report["id"], GUILD)["deny"]) & ds.VIEW_CHANNEL
+    assert int(overwrite(api, report["id"], BOT)["allow"]) & ds.SEND_MESSAGES
+    assert [c["name"] for c in api.commands] == ["제보", "설치"]
 
     api.writes.clear()
     code, out = run(api, ssm, apply=True)
@@ -395,3 +417,83 @@ def test_a_stale_channel_topic_is_refreshed(ssm):
     api.writes.clear()
     run(api, ssm, apply=True, department=True)
     assert api.writes == [("PATCH", f"/channels/{dept['id']}")] and dept["topic"] == ds.DEPARTMENT_TOPIC
+
+    report = next(c for c in api.channels if c["name"] == "제보-검토")
+    report["topic"] = "제보하기 버튼과 /제보로 들어온 내용이 올라옵니다. 운영자만 봅니다."  # the old wording
+    api.writes.clear()
+    run(api, ssm, apply=True, department=True)
+    assert api.writes == [("PATCH", f"/channels/{report['id']}")] and report["topic"] == ds.REPORT_TOPIC
+
+
+def test_without_the_commands_scope_the_button_still_works(ssm):
+    api = FakeDiscord()
+    api.commands_forbidden = True
+    code, out = run(api, ssm, apply=True)
+    assert code == 0, out
+    assert "applications.commands" in out and api.commands == []
+    saved = json.loads(ssm.get_parameter(Name="/kw/discord/roles")["Parameter"]["Value"])
+    assert saved["report"]["channel"]  # the 제보하기 button has somewhere to post
+
+
+def test_an_existing_report_channel_is_hidden_again_if_someone_opened_it(ssm):
+    api = FakeDiscord()
+    run(api, ssm, apply=True)
+    report = next(c for c in api.channels if c["name"] == "제보-검토")
+    report["permission_overwrites"] = [o for o in report["permission_overwrites"] if o["id"] != GUILD]
+    code, out = run(api, ssm, apply=True)
+    assert code == 0 and int(overwrite(api, report["id"], GUILD)["deny"]) & ds.VIEW_CHANNEL
+    assert "보기 숨김" in out
+
+
+def test_the_install_channel_is_read_only_and_holds_one_guide_with_the_install_button(ssm):
+    api = FakeDiscord()
+    code, out = run(api, ssm, apply=True)
+    assert code == 0, out
+    install = next(c for c in api.channels if c["name"] == "설치-안내")
+    assert install["parent_id"] == "300" and install["topic"] == ds.INSTALL_TOPIC
+    everyone = overwrite(api, install["id"], GUILD)
+    assert int(everyone["allow"]) & ds.EVERYONE_ALLOW == ds.EVERYONE_ALLOW
+    assert int(everyone["deny"]) & ds.EVERYONE_DENY == ds.EVERYONE_DENY  # members can't write there
+    assert not int(everyone["deny"]) & ds.VIEW_CHANNEL  # but they see it
+    bot = overwrite(api, install["id"], BOT)
+    assert int(bot["allow"]) & ds.BOT_ALLOW == ds.BOT_ALLOW and not int(bot["allow"]) & ds.MENTION_EVERYONE
+
+    [guide] = api.messages[install["id"]]
+    want = install_message(BRIDGE)
+    assert guide["content"] == want["content"] and guide["components"] == want["components"]
+    buttons = guide["components"][0]["components"]
+    assert [b.get("custom_id") for b in buttons] == ["kwsetup:start", None]
+    assert buttons[1]["url"] == f"{BRIDGE}/start"
+    command = next(c for c in api.commands if c["name"] == "설치")
+    assert command["description"] == ds.SETUP_DESCRIPTION and command["type"] == 1
+
+    api.writes.clear()
+    code, out = run(api, ssm, apply=True)
+    assert code == 0 and api.writes == [] and "바꿀 것이 없습니다" in out, api.writes
+    assert "설치 안내 메시지 그대로" in out and "/설치 있음" in out
+
+
+def test_the_install_guide_follows_a_new_bridge_url_in_place(ssm):
+    api = FakeDiscord()
+    run(api, ssm, apply=True)
+    install = next(c for c in api.channels if c["name"] == "설치-안내")["id"]
+    api.writes.clear()
+    run(api, ssm, apply=True, bridge="https://other.example.com/")
+    [guide] = api.messages[install]
+    assert api.writes == [("PATCH", f"/channels/{install}/messages/{guide['id']}")]
+    assert guide["components"][0]["components"][1]["url"] == "https://other.example.com/start"
+
+
+def test_without_a_bridge_url_the_install_channel_waits(ssm):
+    api = FakeDiscord()
+    code, out = run(api, ssm, apply=True, bridge=None)
+    assert code == 0, out
+    assert "--bridge-url" in out and not any(c["name"] == "설치-안내" for c in api.channels)
+    saved = json.loads(ssm.get_parameter(Name="/kw/discord/roles")["Parameter"]["Value"])
+    assert "install" not in saved
+    assert [c["name"] for c in api.commands] == ["제보", "설치"]  # /설치 needs only the Lambda's settings
+
+    code, out = run(api, ssm, apply=True)  # later, with the URL
+    install = next(c for c in api.channels if c["name"] == "설치-안내")
+    saved = json.loads(ssm.get_parameter(Name="/kw/discord/roles")["Parameter"]["Value"])
+    assert saved["install"] == {"channel": install["id"], "message": api.messages[install["id"]][0]["id"]}

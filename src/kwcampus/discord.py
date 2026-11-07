@@ -4,18 +4,25 @@ The bot token comes from SSM (SecureString), channel ids from /kw/discord/channe
 subscription role ids from /kw/discord/roles. A delivery record (kw-delivery) is claimed before
 posting so an SQS retry never posts the same notice twice.
 
-- post: the notice, mentioning its topic role (none 22:00-08:00) and, for urgent titles from
+- post: the notice, with one line of what extract.py read on its page when that is already there and
+  sure enough ("📌 대상: … · ⏰ 11/18(수) 24:00 마감 · 신청: …"; usually it is read minutes after the post,
+  and a posted message is never edited just to add it), mentioning its topic role (none 22:00-08:00)
+  and, for urgent titles from
   school-wide boards, the 긴급 role at any hour. A topic role is mentioned at most once per 30
   minutes (긴급 always). Only those roles may ping; never @everyone, @here or users. A title that
-  may carry a person's name goes out as "새 글" with the link only, and pings nobody.
+  may carry a person's name goes out as "새 글이 올라왔어요" with the link only, and pings nobody.
 - edit: the original message is rewritten, in whatever channel it was posted to. If the school
-  changed the title or the 수정일 and the post is more than 30 minutes old, a short "수정됨" reply
+  changed the title or the 수정일 and the post is more than 30 minutes old, a short "공지가 수정됐어요" reply
   goes under it, at most once per notice per KST day. Our own changes (new redaction rules, a
   recategorised notice) are quiet: the message is fixed, nobody is told.
 - repost: a department board reused an old post for a new one; edit it if we posted it, else post.
 - keep: the notice changed in a way the message doesn't show (pinned, department), or while
   notifications were off; only the delivery record's ttl moves, Discord isn't called (so neither a
   missing bot token nor a 429 holds it up).
+- remind (reminders.py, weekday mornings): a reply under the notice's message, "⏰ 신청 마감 D-3 ·
+  11/18(수) 24:00까지", mentioning nobody. Each D-level is claimed in the delivery record (remind_d3, remind_d1)
+  before posting, so it goes out at most once; nothing goes out when the notice's 신청마감 changed
+  since the job was made, or the message is gone (that level is then marked gone).
 A notice taken down by hand (removed=true) is never posted or edited again, whatever job comes late.
 
 The delivery record lives 30 days longer than its notice: each edit, repost and keep moves its ttl
@@ -63,6 +70,7 @@ from kwcampus.discordapi import (
     token_problem,
 )
 from kwcampus.discordapi import call as _discord
+from kwcampus.extract import deadline_of, next_application, parse_at
 from kwcampus.obs import log, metrics
 from kwcampus.routing import (
     CATEGORY_LABEL,
@@ -82,8 +90,11 @@ STALE_CLAIM = timedelta(seconds=90)
 # One event shows up on several boards (a job fair on five department sites): a topic role is
 # pinged at most this often; later notices still go out, just without the mention.
 MENTION_EVERY = timedelta(minutes=30)
-EDIT_NOTE_PREFIX = "✏️ 수정됨"
-SAFE_TITLE = "새 글 (제목은 링크에서 확인)"
+EDIT_NOTE_PREFIX = "✏️ 공지가 수정됐어요"
+REMIND_PREFIX = "⏰ 신청 마감"
+SUMMARY_MIN_CONFIDENCE = 0.7
+_WEEKDAYS = "월화수목금토일"
+SAFE_TITLE = "새 글이 올라왔어요. 제목은 링크를 눌러 확인해 주세요."
 NO_PINGS = {"parse": []}
 # A delivery record outlives its notice (kw-public ttl) by this much.
 RECORD_GRACE = DELIVERY_TTL - NOTICE_TTL
@@ -128,10 +139,44 @@ def _nonce(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:25]
 
 
-def render(item: dict, mentions: list[str] | None = None) -> str:
+def _when(at: str) -> str:
+    """"11/18(수) 24:00" (a deadline at the day's end is stored as 23:59:59), or "11/18(수)"."""
+    day, timed = parse_at(at)
+    when = f"{day.month}/{day.day}({_WEEKDAYS[day.weekday()]})"
+    if timed:
+        clock = datetime.fromisoformat(at).astimezone(KST)
+        when += " 24:00" if (clock.hour, clock.minute, clock.second) == (23, 59, 59) else f" {clock:%H:%M}"
+    return when
+
+
+def summary_line(item: dict, now: datetime) -> str | None:
+    """"📌 대상: … · ⏰ 11/18(수) 24:00 마감 · 신청: …" from the notice's extracted facts; None without them,
+    when the model was unsure, or for a title that may name someone."""
+    facts = item.get("extracted")
+    if not isinstance(facts, dict) or _risky(item):
+        return None
+    try:
+        if float(facts.get("confidence") or 0) < SUMMARY_MIN_CONFIDENCE:
+            return None
+    except (TypeError, ValueError):
+        return None
+    today = now.astimezone(KST).date()
+    deadline = next_application(facts, today) or deadline_of(facts, today)
+    if deadline and parse_at(deadline["at"])[0] < today:
+        deadline = None
+    target, how = (" ".join(str(facts.get(k) or "").split()) for k in ("target", "how_to_apply"))
+    parts = [f"대상: {escape(target)}" if target else "", f"⏰ {_when(deadline['at'])} 마감" if deadline else "",
+             f"신청: {escape(how)}" if how else ""]
+    parts = [p for p in parts if p]
+    return "📌 " + " · ".join(parts) if parts else None
+
+
+def render(item: dict, mentions: list[str] | None = None, now: datetime | None = None) -> str:
     label = CATEGORY_LABEL.get(str(item.get("category_id")), "공지")
     title = SAFE_TITLE if _risky(item) else escape(str(item["title"]))
     lines = [f"**[{label}]** {title}"]
+    if summary := summary_line(item, now or datetime.now(UTC)):
+        lines.append(summary)
     posted, updated = str(item.get("posted_date") or ""), str(item.get("updated_date") or "")
     when = f"{posted} (수정 {updated})" if updated and posted and updated != posted else posted
     # dates are our own ISO strings; only the department comes from the site
@@ -147,8 +192,20 @@ def render_edit_note(item: dict, changed: list[str], now: datetime) -> str:
     """The reply under an edited notice. Boards without a 수정일 show the day the change was seen."""
     posted, updated = str(item.get("posted_date") or ""), str(item.get("updated_date") or "")
     day = updated if updated and updated != posted else now.astimezone(KST).date().isoformat()
-    head = f"{EDIT_NOTE_PREFIX} · {day}" + (" · 제목 변경" if "title" in changed else "")
+    head = f"{EDIT_NOTE_PREFIX} · {day}" + (" · 제목이 바뀌었어요" if "title" in changed else "")
     return f"{head}\n<{item['url']}>"
+
+
+def render_reminder(at: str, now: datetime) -> str | None:
+    """"⏰ 신청 마감 D-3 · 11/18(수) 24:00까지"; None once the day has passed. A deadline at the day's end is
+    stored as 23:59:59 and shown as 24:00."""
+    parsed = parse_at(at)
+    if parsed is None:
+        return None
+    days_left = (parsed[0] - now.astimezone(KST).date()).days
+    if days_left < 0:
+        return None
+    return f"{REMIND_PREFIX} {'D-day' if days_left == 0 else f'D-{days_left}'} · {_when(at)}까지"
 
 
 def posted_at(message_id: str) -> datetime | None:
@@ -222,13 +279,15 @@ def _claim_reply(delivery, dkey: dict, today: str, now: datetime) -> str | None:
     return "takeover" if old.get("reply_day") == today and old.get("reply_state") == "claimed" else "new"
 
 
-def _earlier_reply(send, token: str, channel: str, message_id: str, today: str) -> str | None:
-    """Today's edit note under message_id, if a dead attempt already posted it (the latest 50 messages)."""
+def _earlier_reply(send, token: str, channel: str, message_id: str, today: str,
+                   prefix: str = EDIT_NOTE_PREFIX) -> str | None:
+    """Today's reply (edit note or reminder) under message_id, if a dead attempt already posted it
+    (the latest 50 messages)."""
     recent = send("GET", f"/channels/{channel}/messages?limit=50", token)
     for m in recent if isinstance(recent, list) else []:
         sent = posted_at(str(m.get("id")))
         if ((m.get("message_reference") or {}).get("message_id") == message_id
-                and str(m.get("content", "")).startswith(EDIT_NOTE_PREFIX)
+                and str(m.get("content", "")).startswith(prefix)
                 and sent and sent.astimezone(KST).date().isoformat() == today):
             return str(m["id"])
     return None
@@ -291,7 +350,7 @@ def _post(item, dkey, channel_id, delivery, token, roles, send, now) -> str:
     allowed = {"parse": [], "roles": mentions} if mentions else NO_PINGS
     try:
         message = send("POST", f"/channels/{channel_id}/messages", token, {
-            "content": render(item, mentions), "allowed_mentions": allowed, "flags": SUPPRESS_EMBEDS,
+            "content": render(item, mentions, now), "allowed_mentions": allowed, "flags": SUPPRESS_EMBEDS,
             "nonce": _nonce(dkey["PK"], dkey["SK"]), "enforce_nonce": True})
     except RateLimited:
         # Discord refused it, so nothing was posted: free the claim, or the retry a few seconds from
@@ -318,7 +377,7 @@ def _edit(job, item, dkey, record, delivery, token, send, now) -> str:
     try:
         # Edits don't notify anyone; the same roles stay allowed so the message keeps them as mentions.
         send("PATCH", f"/channels/{record_channel}/messages/{message_id}", token,
-             {"content": render(item, mentions),
+             {"content": render(item, mentions, now),
               "allowed_mentions": {"parse": [], "roles": mentions} if mentions else NO_PINGS})
     except NotFound:
         return "message_gone"  # someone deleted it; don't bring it back
@@ -358,6 +417,72 @@ def _edit(job, item, dkey, record, delivery, token, send, now) -> str:
     return "edited_replied"
 
 
+def _claim_remind(delivery, dkey: dict, level: int, now: datetime) -> str | None:
+    """Take one D-level's reminder: "new", "takeover" (an attempt that died, maybe after Discord got
+    the reply) or None when it is out, gone or in flight."""
+    ts = int(now.timestamp())
+    try:
+        old = delivery.update_item(
+            Key=dkey, UpdateExpression="SET #r = :claimed, #at = :now",
+            ConditionExpression="attribute_not_exists(#r) OR (#r = :claimed AND #at < :stale)",
+            ExpressionAttributeNames={"#r": f"remind_d{level}", "#at": f"remind_d{level}_at"},
+            ExpressionAttributeValues={":claimed": "claimed", ":now": ts, ":stale": ts - int(STALE_CLAIM.total_seconds())},
+            ReturnValues="ALL_OLD",
+        ).get("Attributes") or {}
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return None
+        raise
+    return "takeover" if old.get(f"remind_d{level}") == "claimed" else "new"
+
+
+def _remind(job, item, dkey, record, delivery, token, send, now) -> str:
+    deadline = next_application(item.get("extracted"), now.astimezone(KST).date())
+    if deadline is None or deadline["at"] != job.get("at"):
+        return "deadline_changed"  # re-read since the job was made; tomorrow's run decides again
+    content = render_reminder(deadline["at"], now)
+    if content is None:
+        return "deadline_passed"
+    claims = {level: c for level in sorted({int(x) for x in job.get("levels") or []}, reverse=True)
+              if (c := _claim_remind(delivery, dkey, level, now))}
+    if not claims:
+        return "already_reminded"
+    message_id, channel = str(record["message_id"]), str(record["channel_id"])
+    ts = int(now.timestamp())
+
+    def mark(state: str, extra: dict | None = None) -> None:
+        for level in claims:
+            names = {"#r": f"remind_d{level}", **({"#id": f"remind_d{level}_id"} if extra else {})}
+            delivery.update_item(Key=dkey, UpdateExpression="SET #r = :s" + (", #id = :id" if extra else ""),
+                                 ExpressionAttributeNames=names, ExpressionAttributeValues={":s": state, **(extra or {})})
+
+    try:
+        send("GET", f"/channels/{channel}/messages/{message_id}", token)  # still there?
+        today = now.astimezone(KST).date().isoformat()
+        note_id = (_earlier_reply(send, token, channel, message_id, today, REMIND_PREFIX)
+                   if "takeover" in claims.values() else None)
+        if note_id is None:
+            note_id = str(send("POST", f"/channels/{channel}/messages", token, {
+                "content": content,
+                "allowed_mentions": {"parse": [], "replied_user": False},
+                "flags": SUPPRESS_EMBEDS,
+                "message_reference": {"message_id": message_id, "channel_id": channel, "fail_if_not_exists": True},
+                "nonce": _nonce(dkey["PK"], "remind", deadline["at"], *map(str, claims)), "enforce_nonce": True,
+            })["id"])
+    except NotFound:
+        mark("gone")  # deleted on Discord: no reminder can hang under it
+        return "message_gone"
+    except RateLimited:
+        # Discord refused: free the claims so the retry takes them over right away
+        for level in claims:
+            _release(delivery, dkey, "SET #at = :zero", "#r = :claimed AND #at = :mine",
+                     {":zero": 0, ":claimed": "claimed", ":mine": ts},
+                     {"#r": f"remind_d{level}", "#at": f"remind_d{level}_at"})
+        raise
+    mark("sent", {":id": note_id})
+    return "reminded"
+
+
 def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str],
                roles: dict[str, str] | None = None, send=_discord, now: datetime | None = None) -> str:
     now = now or datetime.now(UTC)
@@ -373,6 +498,12 @@ def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str]
         # taken down (collector_admin takedown): a late or redriven job must not post it again
         return "removed"
     dkey = {"PK": f"{job['key']['PK']}|{job['key']['SK']}", "SK": f"CH#{job['channel']}"}
+
+    if action == "remind":
+        found_key, record = _find_record(delivery, dkey)
+        if not record:
+            return "nothing_to_remind"  # never announced, or taken down
+        return _remind(job, item, found_key, record, delivery, token, send, now)
 
     if action == "keep":  # the notice's ttl moved with nothing the message shows: no Discord call
         found_key, record = _find_record(delivery, dkey)
@@ -489,5 +620,5 @@ def handler(event, context, sleep=time.sleep):
         _come_back_after(postponed, limited)
     log("discord_done", **outcomes, retries=len(failures))
     metrics(DiscordPosted=outcomes.get("posted", 0), DiscordEditNotes=outcomes.get("edited_replied", 0),
-            DiscordRetries=len(failures))
+            DiscordReminders=outcomes.get("reminded", 0), DiscordRetries=len(failures))
     return {"batchItemFailures": failures}

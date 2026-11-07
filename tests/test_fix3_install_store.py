@@ -1,12 +1,10 @@
-"""Review-3 fixes: one PC can't end another PC's grant (MF3), the installers enforce the pinned hashes
-and stop a running Windows agent first (S18, S52), /setup and /privacy say what the code does (S40,
-S41), and build_lambda.sh refuses a release cut from other kw-mcp code (C4)."""
+"""Review-3 fixes: one PC can't end another PC's grant (MF3), /privacy says what the code does (S40,
+S41), and build_lambda.sh refuses a release cut from other kw-mcp code (C4). The installer scripts
+(S18, S52) are gone: the Claude Desktop extension installs the agent."""
 
 from __future__ import annotations
 
-import inspect
 import json
-import os
 import re
 import subprocess
 import sys
@@ -14,7 +12,6 @@ import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from kw_mcp import agent
 from test_bridge import (  # noqa: F401
     FakeDevice,
     env,
@@ -69,120 +66,12 @@ def test_revoke_grant_without_the_callers_row_touches_nothing(env):  # noqa: F81
     assert store.revoke_grant(t, "u_owner", "g_shared") is False  # already gone
 
 
-# --- S18 / S52: the installer scripts ------------------------------------------------------------
+# --- S40 / S41: what /privacy says -------------------------------------------------------------------
 
-def _stub(folder: Path, name: str, body: str) -> None:
-    path = folder / name
-    path.write_text("#!/bin/sh\n" + body)
-    path.chmod(0o755)
-
-
-def _run_install_sh(tmp_path: Path, script: str, static_dir: Path, fail_hash: bool) -> tuple[subprocess.CompletedProcess, list[str]]:
-    """Run the served install.sh with uv, curl, kw-mcp and launchctl replaced by stubs that log."""
-    home = tmp_path / "home"
-    bin_dir = home / ".local" / "bin"
-    bin_dir.mkdir(parents=True)
-    log = tmp_path / "calls.log"
-    _stub(bin_dir, "uv", 'echo "uv $*" >> "$LOG"\n'
-                         'if [ "$1 $2" = "tool dir" ]; then echo "$HOME/tools"; fi\n'
-                         'if [ "$1 $2" = "pip install" ] && [ -n "${FAIL_HASH:-}" ]; then exit 1; fi\n')
-    _stub(bin_dir, "curl", 'echo "curl $*" >> "$LOG"\n'
-                           'while [ $# -gt 1 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\n'
-                           'cp "$STATIC/$(basename "$1")" "$out"\n')
-    _stub(bin_dir, "kw-mcp", 'echo "kw-mcp $*" >> "$LOG"\n')
-    _stub(bin_dir, "launchctl", 'echo "launchctl $*" >> "$LOG"\n')
-    path = tmp_path / "install.sh"
-    path.write_text(script.replace(" < /dev/tty", ""))  # no terminal under pytest; nothing else changes
-    run_env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(home), "LOG": str(log), "STATIC": str(static_dir),
-               "TMPDIR": str(tmp_path)}
-    if fail_hash:
-        run_env["FAIL_HASH"] = "1"
-    done = subprocess.run(["sh", str(path), "kwc_test-invite"], env=run_env, capture_output=True, text=True,
-                          timeout=60, check=False)
-    return done, log.read_text().splitlines() if log.exists() else []
-
-
-def test_install_sh_reinstalls_every_dependency_by_its_pinned_hash(client, static, key, tmp_path):  # noqa: F811
-    m = ship(static, key)
-    pins = m["constraints"]["file"]
-    script = client.get("/install.sh").text
-    done, calls = _run_install_sh(tmp_path, script, static, fail_hash=False)
-    assert done.returncode == 0, done.stderr
-    tool = next(i for i, line in enumerate(calls) if line.startswith("uv tool install "))
-    pip = next(i for i, line in enumerate(calls) if line.startswith("uv pip install "))
-    link = next(i for i, line in enumerate(calls) if line.startswith("kw-mcp link "))
-    assert tool < pip < link
-    home = tmp_path / "home"
-    assert re.fullmatch(rf"uv pip install --quiet --python {re.escape(str(home))}/tools/kw-mcp/bin/python "
-                        rf"--require-hashes --no-deps --reinstall --no-build -r \S+/{re.escape(pins)}", calls[pip])
-    assert calls[link] == f"kw-mcp link kwc_test-invite --server {install_base(script)}"
-    assert not [line for line in calls if "uninstall" in line or line.startswith("launchctl")]
-    assert (home / ".config" / "kw-campus" / "releases" / pins).is_file()
-
-
-def test_install_sh_removes_the_agent_when_a_hash_does_not_match(client, static, key, tmp_path):  # noqa: F811
-    ship(static, key)
-    done, calls = _run_install_sh(tmp_path, client.get("/install.sh").text, static, fail_hash=True)
-    assert done.returncode == 1 and "did not match its pinned hash" in done.stderr
-    assert f"launchctl bootout gui/{os.getuid()}/{agent.LAUNCHD_LABEL}" in calls
-    assert "uv tool uninstall kw-mcp" in calls
-    assert not [line for line in calls if line.startswith("kw-mcp ")]  # nothing unchecked gets started
-    assert not (tmp_path / "home" / ".config" / "kw-campus" / "releases").exists()
-
-
-def install_base(script: str) -> str:
-    return re.search(r"--server \"([^\"]+)\"", script).group(1)
-
-
-def test_install_ps1_stops_the_running_agent_then_checks_hashes(client, static, key):  # noqa: F811
-    m = ship(static, key)
-    ps1 = client.get("/install.ps1").text
-    stop = ps1.index("if (Test-AgentLock)")
-    tool = ps1.index("uv tool install --force")
-    python_missing = ps1.index("if (-not (Test-Path -LiteralPath $toolPy))")
-    hashes = ps1.index("uv pip install --quiet --python $toolPy --require-hashes --no-deps --reinstall --no-build -r $pins")
-    link = ps1.index("kw-mcp link $invite")
-    assert (ps1.index("Get-FileHash") < stop < ps1.index("throw 'The running KW Campus agent did not stop.") < tool
-            < python_missing < hashes < link)
-    # uv's tool folder is the one native output the script reads, and it is read as UTF-8 (not the
-    # console's code page 949), so a Korean profile folder name survives; the encoding is put back.
-    assert ps1.count("uv tool dir") == 1 and ps1.count("$(uv ") == 1
-    saved = ps1.index("$consoleEncoding = [Console]::OutputEncoding")
-    utf8 = ps1.index("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8")
-    read = ps1.index('try { $toolDir = "$(uv tool dir)".Trim() } finally { [Console]::OutputEncoding = $consoleEncoding }')
-    no_dir = ps1.index("if ($LASTEXITCODE -ne 0 -or -not $toolDir) { throw")
-    assert saved < utf8 < read < no_dir < ps1.index("$toolEnv = Join-Path $toolDir 'kw-mcp'") < stop
-    assert ps1.index("$toolPy = Join-Path $toolEnv 'Scripts\\python.exe'") < python_missing
-    # a missing Python has its own message; both failures remove the login entry and the tool
-    missing_branch, hash_branch = ps1[python_missing:hashes], ps1[hashes:link]
-    assert "Remove-Agent" in missing_branch and "dependencies could not be checked" in missing_branch
-    assert "pinned hash" not in missing_branch
-    assert "Remove-Agent" in hash_branch and "did not match its pinned hash" in hash_branch
-    remove = ps1[ps1.index("function Remove-Agent"):stop]
-    assert f"-Name '{agent.WINDOWS_RUN_VALUE}'" in remove and "uv tool uninstall kw-mcp" in remove
-    # PowerShell 7 must not throw on uv's exit code before the script's own check runs the cleanup
-    assert ps1.index("$PSNativeCommandUseErrorActionPreference = $false") < ps1.index("Get-Command uv")
-    assert f"-ne '{m['sha256']}'" in ps1  # the download is still checked before anything is stopped
-    # The names the agent itself uses (kw_mcp.agent, read-only here).
-    assert agent.CONFIG_DIR == Path.home() / ".config" / "kw-campus"
-    assert "Join-Path $env:USERPROFILE '.config\\kw-campus'" in ps1
-    assert "Join-Path $cfg 'agent.lock'" in ps1 and "Join-Path $cfg 'agent.pid'" in ps1
-    lock_source = inspect.getsource(agent._try_lock)
-    assert "handle.seek(0)" in lock_source and "msvcrt.LK_NBLCK, 1)" in lock_source  # byte 0, length 1
-    assert "$fs.Lock(0, 1)" in ps1
-    assert ps1.count(str(agent.LEGACY_LOCK_PORT)) == 2 and 'GetBytes("exit`n")' in ps1
-    assert f"-Name '{agent.WINDOWS_RUN_VALUE}'" in ps1 and "uv tool uninstall kw-mcp" in ps1
-    assert not re.search(r"\$pid\b", ps1, re.IGNORECASE)  # $PID is PowerShell's own process id
-    assert "__" not in ps1
-
-
-# --- S40 / S41: what /setup and /privacy say -------------------------------------------------------
-
-def test_setup_and_privacy_keep_the_snapshot_qualifier(client):  # noqa: F811
-    setup, privacy = client.get("/setup").text, client.get("/privacy").text
-    for page in (setup, privacy):
-        assert "최대 1분 다시 쓰" in page and "다음 요청을 받을 때나 서버 인스턴스가 내려갈 때" in page
-    assert "최대 1분 동안 다시 쓴 뒤 메모리에서 버립니다" not in setup
+def test_privacy_keeps_the_snapshot_qualifier(client):  # noqa: F811
+    privacy = client.get("/privacy").text
+    assert "최대 1분 다시 쓰" in privacy and "다음 요청을 받을 때나 서버 인스턴스가 내려갈 때" in privacy
+    assert "최대 1분 동안 다시 쓴 뒤 메모리에서 버립니다" not in privacy
 
 
 def test_privacy_periods_and_collector_facts_come_from_the_code(client):  # noqa: F811

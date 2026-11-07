@@ -9,10 +9,13 @@
   CONN#<conn>      META            uid (TTL 3 h; for $disconnect cleanup)
   CLIENT#<id>      META            client_name, redirect_uris (DCR; TTL 7 d until first token, then 365 d
                                    from the last token exchange)
-  AUTHREQ#<nonce>  META            pending authorize request (TTL 10 min, single use)
+  AUTHREQ#<nonce>  META            pending authorize request (TTL 30 min, single use)
   CODE#<sha256>    META            authorization code, with its grant id (TTL 5 min, single use)
   REFRESH#<sha256> META            refresh token from before grants: taken once and moved into a new grant
-  PAIR#<sha256>    META            one-time connection code from the PC agent (TTL 15 min)
+  PAIR#<sha256>    META            one-time connection code from the PC agent, with net: a keyed hash of the
+                                   PC's network address (TTL 15 min); /connect only looks at it, /oauth/approve
+                                   takes it
+  PAIRS#<uid>#<hour> META          connection codes this device got in that hour (TTL 2 h)
   RESULT#<req>     META            slot opened per request; the PC agent's AES-GCM ciphertext until the bridge
                                    reads it, then only its hash, so a retried post is answered (TTL 2 min)
   INFLIGHT#<uid>   META            agent requests open right now for this device (TTL 60 s)
@@ -35,7 +38,7 @@ from botocore.exceptions import ClientError
 BRIDGE_TABLE = os.environ.get("KW_BRIDGE_TABLE", "kw-bridge")
 
 CONN_TTL = 3 * 3600
-AUTHREQ_TTL = 600
+AUTHREQ_TTL = 1800  # the student may first install Claude or find the connector settings
 CODE_TTL = 300
 GRANT_TTL = 120 * 86400  # about one semester, counted from the approval; refreshing doesn't extend it
 PAIR_TTL = 900
@@ -234,8 +237,27 @@ def count_attempt(t, nonce: str) -> int:
     return int(out["Attributes"]["attempts"])
 
 
-def put_pair(t, code_hash: str, uid: str) -> None:
-    t.put_item(Item={"PK": f"PAIR#{code_hash}", "SK": "META", "uid": uid, "ttl": _now() + PAIR_TTL})
+def put_pair(t, code_hash: str, uid: str, net: str | None = None) -> None:
+    item = {"PK": f"PAIR#{code_hash}", "SK": "META", "uid": uid, "ttl": _now() + PAIR_TTL}
+    if net:  # which network asked for it: /connect/claim sets its cookie only for a browser on the same one
+        item["net"] = net
+    t.put_item(Item=item)
+
+
+def count_pair(t, uid: str, per_hour: int) -> bool:
+    """True while this device has had fewer than per_hour connection codes this hour."""
+    now = _now()
+    return _conditional(t.update_item, Key={"PK": f"PAIRS#{uid}#{now // 3600}", "SK": "META"},
+                        UpdateExpression="SET n = if_not_exists(n, :zero) + :one, #ttl = :exp",
+                        ConditionExpression="attribute_not_exists(n) OR n < :max",
+                        ExpressionAttributeNames={"#ttl": "ttl"},
+                        ExpressionAttributeValues={":one": 1, ":zero": 0, ":max": per_hour, ":exp": now + 7200})
+
+
+def peek_pair(t, code_hash: str) -> dict | None:
+    """The pending connection code's row (uid, ttl) without using it up."""
+    item = t.get_item(Key={"PK": f"PAIR#{code_hash}", "SK": "META"}).get("Item")
+    return item if item and int(item.get("ttl", 0)) >= _now() else None
 
 
 def take_pair(t, code_hash: str) -> str | None:

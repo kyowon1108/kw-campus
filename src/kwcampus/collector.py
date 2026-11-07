@@ -4,6 +4,9 @@ Runs on a schedule, only when the kill switch is on and each server's gate allow
 board goes first with one request to www.kw.ac.kr; the department servers get one request each
 (the 인공지능융합대학 widget shares its server's), and the Wix blog feeds one per host every 2 hours.
 Every couple of hours a second www request reads the 취업게시판 or the FAQ, 61 s after the first.
+
+The page runs (event {"phase": "pages"}, 10 minutes after each daytime list run) read queued notice
+pages instead, one per server, and pull facts out of them (extract.py). Same kill switch.
 """
 
 from __future__ import annotations
@@ -14,7 +17,16 @@ from datetime import UTC, datetime
 
 import boto3
 
-from kwcampus import aicon, deptboards, params, politeness, store, wixfeeds, wwwboards
+from kwcampus import (
+    aicon,
+    deptboards,
+    extract,
+    params,
+    politeness,
+    store,
+    wixfeeds,
+    wwwboards,
+)
 from kwcampus.config import (
     COLLECTOR_ENABLED_PARAM,
     NOTICE_SOURCE,
@@ -100,6 +112,11 @@ def handler(event, context):
         return datetime.now(UTC)
 
     time_left = (lambda: context.get_remaining_time_in_millis() / 1000) if context else None
+    if (event or {}).get("phase") == "pages":
+        if not params.is_true(COLLECTOR_ENABLED_PARAM):
+            log("collector_skip", reason="disabled")
+            return {"status": "disabled"}
+        return {"pages": extract.collect(now, table, clock=clock, time_left=time_left)}
     try:
         out = run(now, table, clock=clock)
     except Exception as e:  # noqa: BLE001 - the other servers must still get their turn

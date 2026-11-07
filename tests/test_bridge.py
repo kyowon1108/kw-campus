@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from mcp.server.mcpserver.exceptions import ToolError
 from starlette.testclient import TestClient
 
-from kwcampus import params, public_data
+from kwcampus import invites, params, public_data
 from kwcampus.bridge import app as bridge
 from kwcampus.bridge import crypto, shapes, store, ws
 from kwcampus.config import KST
@@ -133,7 +133,9 @@ def authorize(client, verifier="v" * 43, name="Claude"):
     page = client.get("/oauth/authorize", params={
         "response_type": "code", "client_id": reg["client_id"], "redirect_uri": REDIRECT, "state": "s1",
         "code_challenge": crypto.pkce_s256(verifier), "code_challenge_method": "S256"})
-    assert page.status_code == 200 and "읽기 전용" in page.text and "<b>claude.ai</b>" in page.text
+    # the app named comes from the redirect host, not the self-chosen client name
+    assert page.status_code == 200 and "<p>Claude에서 내 KLAS 정보를 볼 수 있게 연결해요.</p>" in page.text
+    assert "직접 커넥터를 추가한 게 아니면 이 창을 닫아 주세요" in page.text
     nonce = json.loads(re.search(r"const nonce = (\"[^\"]+\");", page.text).group(1))
     return reg, nonce
 
@@ -204,7 +206,12 @@ def test_full_flow_tools_come_from_the_agent(env):
 
     listed = mcp_call(c, tokens["access_token"], "tools/list").json()["result"]["tools"]
     assert {"this_week", "today_briefing", "my_notices", "my_assignments", "latest_notices",
-            "list_notice_categories"} <= {t["name"] for t in listed}
+            "list_notice_categories", "school_guide", "department_curriculum"} <= {t["name"] for t in listed}
+
+    # the knowledge base answers from the Lambda itself: no message to the PC
+    sent_before = len(env["sent"])
+    guide = tool(c, tokens["access_token"], "school_guide", question="복전 몇 학점?")["structuredContent"]
+    assert guide["answers"] and guide["answers"][0]["sources"] and len(env["sent"]) == sent_before
 
     rows = tool(c, tokens["access_token"], "my_assignments")["structuredContent"]["result"]
     assert rows[0]["title"] == "HW3" and rows[0]["course"] == "데이터마이닝"
@@ -482,6 +489,7 @@ def test_invite_withdrawal_stops_devices_it_let_in(env, aws):
     reg, tokens = oauth(c, device)
     aws["ssm"].put_parameter(Name="/kw/mcp/tokens", Type="String", Value="[]", Overwrite=True)
     params.clear_cache()
+    invites.clear_cache()  # the minute an answer is kept, over
     assert mcp_call(c, tokens["access_token"], "tools/list").status_code == 401
     assert refresh(c, reg, tokens["refresh_token"]).json()["error"] == "invalid_grant"
     assert c.post("/device/pair", json=signed(device, "pair")).json()["error"] == "invite_revoked"
@@ -516,7 +524,9 @@ def test_tool_error_when_agent_not_connected(env):
     register(c, device)
     _, tokens = oauth(c, device)
     out = tool(c, tokens["access_token"], "my_courses")
-    assert out["isError"] and "에이전트가 연결돼 있지 않습니다" in out["content"][0]["text"]
+    text = out["content"][0]["text"]
+    assert out["isError"] and "PC가 꺼져 있거나 잠자기 상태라 KLAS를 못 열었어요" in text
+    assert "PC를 켜고 로그인한 다음 다시 물어봐 주세요" in text and "PC 없이도 볼 수 있어요" in text
 
 
 def test_inflight_and_per_minute_limits(env):
@@ -539,15 +549,17 @@ def test_inflight_and_per_minute_limits(env):
     assert limited["isError"] and "1분" in limited["content"][0]["text"]
 
 
-def test_installer_pages_are_mounted_on_the_bridge(env, tmp_path, monkeypatch):
-    # The scripts, /setup, /privacy and /dist themselves are tested in test_install.py.
+def test_pages_are_mounted_on_the_bridge(env, tmp_path, monkeypatch):
+    # /start, /privacy and /dist themselves are tested in test_install.py; /connect in test_onboarding.py.
     from kwcampus.bridge import install
 
     c = env["client"]
     monkeypatch.setattr(install, "STATIC_DIR", tmp_path)
-    assert c.get("/install.sh").status_code == 503  # no signed release shipped
-    assert "kw-mcp code" in c.get("/setup").text and "보호책임자" in c.get("/privacy").text
+    assert "kw-campus.mcpb" in c.get("/start").text and "보호책임자" in c.get("/privacy").text
+    assert c.get("/setup", follow_redirects=False).headers["location"] == "/start"
     assert c.get("/dist/kw-campus.mcpb").status_code == 404
+    for gone in ("/install.sh", "/install.ps1"):  # no terminal installer any more
+        assert c.get(gone).status_code == 404
 
 
 def test_public_json_api_is_served_with_the_invite_token(env):
@@ -663,7 +675,7 @@ def test_every_op_the_bridge_sends_is_one_the_agent_knows():
     tree = ast.parse(inspect.getsource(bridge))
     calls = {node.args[0].value: {k.arg for k in node.keywords} for node in ast.walk(tree)
              if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "agent_call"}
-    assert len(calls) == 17
+    assert len(calls) == 21
     for op, args in calls.items():
         assert op in agent.CALLS, op
         # The agent also takes the optional ids its lists hand out (agent.OPTIONAL_ARGS); every
@@ -736,6 +748,19 @@ def test_graduation_goes_to_the_agent(env):
     store.add_connection(env["table"], device.uid, "agent", 2)
     _, tokens = oauth(c, device)
     assert tool(c, tokens["access_token"], "my_graduation")["structuredContent"] == {"op": "graduation_progress"}
+
+
+def test_graduation_and_multi_major_simulations_go_to_the_agent(env):
+    c, device = env["client"], FakeDevice()
+    register(c, device)
+    store.add_connection(env["table"], device.uid, "agent", 3)
+    _, tokens = oauth(c, device)
+    token = tokens["access_token"]
+    assert tool(c, token, "my_graduation_outlook")["structuredContent"] == {"op": "graduation_outlook"}
+    assert tool(c, token, "my_academic_status")["structuredContent"] == {"op": "academic_status"}
+    assert tool(c, token, "my_multi_major")["structuredContent"] == {"op": "multi_major_options"}  # both left out
+    assert tool(c, token, "my_multi_major", track=" 빅데이터 ", track_type="연계")["structuredContent"] == {
+        "op": "multi_major_options", "track": "빅데이터", "track_type": "연계"}
 
 
 def test_new_reads_go_to_the_agent(env):
@@ -897,7 +922,7 @@ def test_my_notices_clamps_days_and_takes_the_students_department(env):
     # The department is the student's own, from the agent's 학적; a name the model passes is not used.
     dept = tool(c, tokens["access_token"], "my_notices", department="전자공학과")["structuredContent"]
     # a protocol-1 agent can't answer the department request: the rest still answers
-    assert "department" not in dept and "kw-mcp update" in dept["department_note"] and dept["public_data"] == "ok"
+    assert "department" not in dept and "KW CAMPUS 확장을 다시 설치" in dept["department_note"] and dept["public_data"] == "ok"
 
 
 def test_snapshot_cache_is_swept_on_every_request(env):

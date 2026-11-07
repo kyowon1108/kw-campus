@@ -468,3 +468,49 @@ def redact_human_fields(
         department=_redact_and_cap(department, 200),
         body=_redact_and_cap(body, 4000),
     )
+
+
+# --- notice bodies -----------------------------------------------------------------------------
+# A body names its contact person in ways a title rarely does: "문의: 학생복지팀 홍길동", "담당자 홍길동
+# 주무관", "홍길동(02-940-5114)". redact_body masks those on top of redact_text, line by line. Titles
+# keep redact_text alone, so REDACTION_LEVEL (norm_v on stored titles) does not move.
+_CONTACT_LABEL = re.compile(r"(?:담당자|담당|문의처|문의|연락처|작성자|성명|이름)\s*[:：)\]】]")
+# name-like words looked at after a contact label, on the same line
+_AFTER_LABEL_WORDS = 3
+_STAFF_TITLE = re.compile(
+    r"\s*(?:주무관|팀장|과장|계장|차장|부장|실장|센터장|처장|원장|직원|담당자|담당|매니저|연구원|행정원)(?![가-힣])")
+_NEXT_TO_CONTACT = re.compile(r"\s*\(?\s*\[REDACTED_(?:PHONE|EMAIL)\]")
+_CONTACT_BEFORE = re.compile(r"\[REDACTED_(?:PHONE|EMAIL)\][)\]]?[\s,/]*$")
+
+
+def _contact_names(line: str) -> set[tuple[int, int]]:
+    runs = list(_HANGUL_RUN.finditer(line))
+    spans: set[tuple[int, int]] = set()
+    for label in _CONTACT_LABEL.finditer(line):
+        after = [run for run in runs if run.start() >= label.end()][:_AFTER_LABEL_WORDS]
+        spans.update(run.span() for run in after if _is_name(run.group(0)))
+    for run in runs:
+        if not _is_name(run.group(0)):
+            continue
+        rest, before = line[run.end():], line[: run.start()]
+        if _STAFF_TITLE.match(rest) or _NEXT_TO_CONTACT.match(rest) or _CONTACT_BEFORE.search(before):
+            spans.add(run.span())
+    return spans
+
+
+def redact_body(value: str) -> str:
+    """redact_text for a notice body, plus contact people: a name-like word among the three words after
+    a contact label (담당자:, 문의), before a staff title (주무관, 팀장) or next to a masked phone number
+    or e-mail address. Line breaks are kept."""
+    out = []
+    for line in value.splitlines():
+        text = redact_text(line)
+        for start, end in sorted(_contact_names(text), reverse=True):
+            text = text[:start] + NAME + text[end:]
+        out.append(text)
+    return "\n".join(out)
+
+
+def looks_like_full_name(word: str) -> bool:
+    """A Hangul word shaped like a whole person's name (three syllables, a common surname first)."""
+    return _is_full_name(word)

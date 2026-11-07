@@ -23,8 +23,9 @@ if [ ! -f "$RELEASE/latest.json" ]; then
 fi
 # Signatures (wheel, constraints, extension) against kw_mcp.release.PUBLIC_KEY, and every file's hash.
 uv run --project "$KW_MCP_DIR" --frozen --quiet python -m kw_mcp.release check "$RELEASE"
-# The released version is the tree's pyproject.toml version, and the wheel's kw_mcp/*.py equal the
-# tree's src/kw_mcp/*.py byte for byte (the comparison release.sign_mcpb makes for the extension).
+# The released version is the tree's pyproject.toml version, and the wheel's kw_mcp code and data
+# (*.py, and the rules/knowledge *.json) equal the tree's src/kw_mcp byte for byte (the comparison
+# release.sign_mcpb makes for the extension).
 uv run --project "$KW_MCP_DIR" --frozen --quiet python - "$RELEASE" "$KW_MCP_DIR" <<'PY'
 import json
 import sys
@@ -39,10 +40,11 @@ if manifest["version"] != version:
     sys.exit(f"error: {release} holds kw-mcp {manifest['version']}, but {tree} is {version}. "
              "Release this version with scripts/release.sh in kw-mcp first.")
 src = tree / "src"
-in_tree = {p.relative_to(src).as_posix(): p.read_bytes() for p in (src / "kw_mcp").rglob("*.py")
-           if "__pycache__" not in p.parts}
+compared = (".py", ".json")
+in_tree = {p.relative_to(src).as_posix(): p.read_bytes() for p in (src / "kw_mcp").rglob("*")
+           if p.is_file() and p.name.endswith(compared) and "__pycache__" not in p.parts}
 with zipfile.ZipFile(release / manifest["wheel"]) as wheel:
-    in_wheel = {n: wheel.read(n) for n in wheel.namelist() if n.startswith("kw_mcp/") and n.endswith(".py")}
+    in_wheel = {n: wheel.read(n) for n in wheel.namelist() if n.startswith("kw_mcp/") and n.endswith(compared)}
 if in_wheel != in_tree:
     differ = sorted(n for n in in_tree.keys() | in_wheel.keys() if in_tree.get(n) != in_wheel.get(n))
     sys.exit(f"error: the code in {manifest['wheel']} differs from {src}/kw_mcp ({', '.join(differ[:5])}). "
@@ -64,14 +66,17 @@ uv pip install "$RELEASE/$WHEEL" --no-deps --target "$TMP/lambda" --python-platf
 # Committed files only: no ignored session state, caches or local files in the production bundle.
 git archive --format=tar HEAD src/kwcampus | tar -x -C "$TMP" && mv "$TMP/src/kwcampus" "$TMP/lambda/" && rmdir "$TMP/src"
 cp scripts/run_public_mcp.sh "$TMP/lambda/run.sh" && chmod +x "$TMP/lambda/run.sh"
-# The bridge serves the release to PCs: /install.sh and /install.ps1 install that wheel with those
-# pins, agents update from latest.json, and /setup links the extension.
+# The bridge serves the release from /dist: /start links the extension, and agents already installed
+# update from latest.json and the wheel and pins it names.
 STATIC="$TMP/lambda/kwcampus/bridge/static"
 mkdir -p "$STATIC"
 cp "$RELEASE/$WHEEL" "$RELEASE/$CONSTRAINTS" "$RELEASE/$MCPB" "$RELEASE/latest.json" "$STATIC/"
 uv run --project "$KW_MCP_DIR" --frozen --quiet python -m kw_mcp.release check "$STATIC" >/dev/null
 find "$TMP/lambda" -name '__pycache__' -prune -exec rm -rf {} +
-for f in run.sh kwcampus/__init__.py kw_mcp/__init__.py kwcampus/bridge/static/latest.json; do
+# anthropic: the collector's notice extraction (kwcampus/extract.py) imports it; pypdf and olefile (kw-mcp's
+# dependencies, in the export above) read the attachments of notices in the page runs
+for f in run.sh kwcampus/__init__.py kw_mcp/__init__.py anthropic/__init__.py pypdf/__init__.py olefile/__init__.py \
+         kwcampus/bridge/static/latest.json; do
   [ -e "$TMP/lambda/$f" ] || { echo "error: the bundle lacks $f" >&2; exit 1; }
 done
 
