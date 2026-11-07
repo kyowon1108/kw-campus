@@ -157,7 +157,8 @@ def compose(label: str, b: dict | None, x: dict | None, q: dict | None, inv: dic
             alarm_names: list[str] | None) -> tuple[str, bool]:
     """(message, whether everything is fine). None for a part that couldn't be read."""
     failed = None if x is None else x["ExtractFail"] + x["ExtractRefused"]
-    fine = (b is not None and not (b["off"] or b["paused"] or b["stale"])
+    # quiet boards are normal (department boards often go weeks without a post): a count only, never a warning
+    fine = (b is not None and not (b["off"] or b["paused"])
             and failed == 0
             and q is not None and q["dead"] == 0 and q["waiting"] < BACKLOG_WARN
             and inv is not None and alarm_names == [])
@@ -166,7 +167,7 @@ def compose(label: str, b: dict | None, x: dict | None, q: dict | None, inv: dic
     lines = [f"⚠️ {label} 확인할 게 있어요"]
     lines.append("- 게시판: " + (UNREAD if b is None else " · ".join((
         f"꺼짐 {len(b['off'])}{_names(b['off'])}", f"잠시 멈춤 {len(b['paused'])}{_names(b['paused'])}",
-        f"한동안 새 글 없음 {b['stale']}", f"새 공지 {b['new']}"))))
+        f"조용한 게시판 {b['stale']}", f"새 공지 {b['new']}"))))
     lines.append("- 공지 읽기: " + (UNREAD if x is None else
                                 f"완료 {x['ExtractOk']} · 실패 {failed} · 한도로 미룸 {x['ExtractSkippedCap']}"))
     lines.append("- 디스코드: " + (UNREAD if q is None else

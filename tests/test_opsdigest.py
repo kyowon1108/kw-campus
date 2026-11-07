@@ -144,7 +144,7 @@ def test_problems_get_a_short_report_with_counts_and_names_only(ops):
     new = len([s for s in public_data.SOURCES if s not in opsdigest.NOT_WATCHED]) - 1 + 1
     assert text.splitlines() == [
         "⚠️ 어제 확인할 게 있어요",
-        f"- 게시판: 꺼짐 1 (dept-ee) · 잠시 멈춤 2 (61.111.8.4, dept-law) · 한동안 새 글 없음 1 · 새 공지 {new}",
+        f"- 게시판: 꺼짐 1 (dept-ee) · 잠시 멈춤 2 (61.111.8.4, dept-law) · 조용한 게시판 1 · 새 공지 {new}",
         "- 공지 읽기: 완료 5 · 실패 3 · 한도로 미룸 0",
         "- 디스코드: 대기 0 · 실패 1 · 재시도 4",
         "- 초대: 1 (전체 1)",
@@ -218,3 +218,13 @@ def test_the_sender_posts_an_ops_job_to_the_ops_channel_only_and_pings_nobody(aw
     assert discord.handle_job({**job, "content": "  "}, aws["public"], aws["delivery"], "token", channels,
                               send=send) == "empty"
     assert len(send.calls) == 1
+
+
+def test_quiet_boards_alone_are_not_a_warning():
+    from kwcampus import opsdigest
+
+    text, fine = opsdigest.compose("어제", {"off": [], "paused": [], "stale": 29, "new": 13},
+                                   {"ExtractOk": 0, "ExtractFail": 0, "ExtractRefused": 0, "ExtractSkippedCap": 0,
+                                    "DiscordRetries": 0},
+                                   {"waiting": 0, "dead": 0}, {"period": 0, "total": 7}, [])
+    assert fine and text.startswith("✅ 어제 이상 없음")
