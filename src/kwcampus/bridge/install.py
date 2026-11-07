@@ -15,6 +15,7 @@ they carry, then fetch the wheel and pins it names.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from functools import cache
 from pathlib import Path
@@ -96,8 +97,8 @@ START_PAGE = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <li><p>디스코드 #설치-안내에서 ‘설치하기’를 눌러 초대 코드를 받아요.</p></li>
 <li><p><a href="https://claude.ai/download" target="_blank" rel="noopener">Claude 데스크톱</a>을 설치하고 로그인해요.</p></li>
 <li><p>kw-campus.mcpb를 더블클릭하고 학번·비밀번호·초대 코드를 넣어요.</p>
-<a class="btn" href="/dist/kw-campus.mcpb">kw-campus.mcpb 받기</a>
-<p class="muted">설치 창이 바로 닫히면 <a href="/dist/kw-campus.zip">kw-campus.zip</a>을 풀어 Claude 설정 → 확장 프로그램 → 고급 설정 → ‘압축 해제된 확장 설치’로 넣어요.</p></li>
+<a class="btn" href="/dist/kw-campus.mcpb__V__">kw-campus.mcpb 받기</a>
+<p class="muted">설치 창이 바로 닫히면 <a href="/dist/kw-campus.zip__V__">kw-campus.zip</a>을 풀어 Claude 설정 → 확장 프로그램 → 고급 설정 → ‘압축 해제된 확장 설치’로 넣어요.</p></li>
 <li><p>웹·폰에서도 쓰려면 Claude 데스크톱에 “웹이랑 폰에서도 쓰게 연결해 줘”라고 말해요.</p></li>
 </ol>
 
@@ -130,7 +131,10 @@ if (ok) {
 
 
 def start_page(script_nonce: str) -> str:
-    return START_PAGE.replace("__STYLE__", PAGE_STYLE).replace("__NONCE__", script_nonce)
+    rel = current_release()
+    # ?v=<version> gives each release its own cache key, so a browser never reuses an older download
+    version = f"?v={rel['version']}" if rel and re.fullmatch(r"[0-9][0-9A-Za-z.]*", str(rel["version"])) else ""
+    return START_PAGE.replace("__STYLE__", PAGE_STYLE).replace("__NONCE__", script_nonce).replace("__V__", version)
 
 
 # Rendered by privacy_page(): each __X__ value comes from the constant that enforces it.
@@ -331,7 +335,10 @@ def routes():
                                 headers={"Cache-Control": "no-cache"})
         if name in (MCPB_NAME, MCPB_ZIP_NAME) and (STATIC_DIR / MCPB_NAME).is_file():
             media = "application/zip" if name == MCPB_ZIP_NAME else "application/octet-stream"
-            return FileResponse(STATIC_DIR / MCPB_NAME, media_type=media, filename=name)
+            # no-cache: every release ships with the same 1980 Last-Modified (reproducible zips), so without it a
+            # browser that once fetched an older release keeps handing out that copy for years
+            return FileResponse(STATIC_DIR / MCPB_NAME, media_type=media, filename=name,
+                                headers={"Cache-Control": "no-cache"})
         return PlainTextResponse("not found", status_code=404)
 
     return [("/start", start), ("/setup", setup), ("/privacy", privacy), ("/dist/{name}", dist)]

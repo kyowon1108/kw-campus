@@ -101,7 +101,9 @@ def test_start_page(client):
     steps = re.search(r'<ol class="steps">(.*?)</ol>', page, re.DOTALL).group(1)
     assert steps.count("<li>") == 4
     assert "디스코드 #설치-안내에서 ‘설치하기’" in steps and 'href="https://claude.ai/download"' in steps
-    assert 'href="/dist/kw-campus.mcpb"' in steps and 'href="/dist/kw-campus.zip"' in steps
+    # no release in this bundle: plain links; with one, each link carries ?v=<version> (its own cache key)
+    assert re.search(r'href="/dist/kw-campus\.mcpb(\?v=[0-9][0-9A-Za-z.]*)?"', steps)
+    assert re.search(r'href="/dist/kw-campus\.zip(\?v=[0-9][0-9A-Za-z.]*)?"', steps)
     assert "학번·비밀번호·초대 코드" in steps and "“웹이랑 폰에서도 쓰게 연결해 줘”라고 말해요" in steps
     # two short notes and one footer line
     assert "비밀번호는 내 PC에만 저장돼요." in page and "PC가 꺼져 있으면 웹·폰에서 내 정보는 안 보여요." in page
@@ -142,6 +144,9 @@ def test_extension_downloads(client, static):
     assert client.get("/dist/kw-campus.mcpb").content == b"PK mcpb"
     assert client.get("/dist/kw-klas.mcpb").content == b"PK mcpb"  # links handed out before 1.0.0
     assert client.get("/dist/kw-klas.zip").content == b"PK mcpb"
+    # every release has the same 1980 Last-Modified: a browser must revalidate, never reuse an older copy
+    assert client.get("/dist/kw-campus.mcpb").headers["cache-control"] == "no-cache"
+    assert client.get("/dist/kw-campus.mcpb?v=1.1.0").content == b"PK mcpb"
     zipped = client.get("/dist/kw-campus.zip")  # same file for "Install Unpacked Extension"
     assert zipped.content == b"PK mcpb" and zipped.headers["content-type"] == "application/zip"
     assert client.get("/dist/latest.json").status_code == 404
