@@ -244,11 +244,10 @@ class KwCampusStack(cdk.Stack):
         ops_digest.add_to_role_policy(iam.PolicyStatement(
             actions=["sqs:GetQueueAttributes"], resources=[queue.queue_arn, dlq.queue_arn]))
         ops_digest.add_to_role_policy(iam.PolicyStatement(actions=["sqs:SendMessage"], resources=[queue.queue_arn]))
-        # GetMetricData takes no resource (AWS offers none for it); the alarms are the kw-* ones
-        ops_digest.add_to_role_policy(iam.PolicyStatement(actions=["cloudwatch:GetMetricData"], resources=["*"]))
+        # GetMetricData and DescribeAlarms take no resource (an alarm ARN is refused at run time: the
+        # deployed digest got AccessDenied); both only read, and the code keeps to the kw-* alarms
         ops_digest.add_to_role_policy(iam.PolicyStatement(
-            actions=["cloudwatch:DescribeAlarms"],
-            resources=[f"arn:aws:cloudwatch:{self.region}:{self.account}:alarm:kw-*"]))
+            actions=["cloudwatch:GetMetricData", "cloudwatch:DescribeAlarms"], resources=["*"]))
 
         # rule watcher: the collectors' gate rows (ORIGIN#*) and its own state (RULEWATCH#*) in kw-public, the
         # collectors' kill switch, and one send to the Discord queue

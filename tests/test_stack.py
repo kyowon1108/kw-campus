@@ -397,14 +397,15 @@ def test_ops_digest_reads_only_what_it_counts(tmp_path):
          "Condition": {"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["DINVITES#*"]}}},
     ]
     # opsdigest.QUERY_ATTRIBUTES is checked against this list in test_opsdigest
-    by_action = {s["Action"]: s for s in statements if "dynamodb" not in str(s["Action"])}
-    assert set(by_action) == {"sqs:GetQueueAttributes", "sqs:SendMessage", "cloudwatch:GetMetricData",
-                              "cloudwatch:DescribeAlarms"}
+    by_action = {tuple(s["Action"]) if isinstance(s["Action"], list) else s["Action"]: s
+                 for s in statements if "dynamodb" not in str(s["Action"])}
+    assert set(by_action) == {"sqs:GetQueueAttributes", "sqs:SendMessage",
+                              ("cloudwatch:GetMetricData", "cloudwatch:DescribeAlarms")}
     queues = by_action["sqs:GetQueueAttributes"]["Resource"]
     assert queues == [{"Fn::GetAtt": ["DiscordQueueF83490F5", "Arn"]}, {"Fn::GetAtt": ["DiscordDlq7CEACF49", "Arn"]}]
     assert by_action["sqs:SendMessage"]["Resource"] == {"Fn::GetAtt": ["DiscordQueueF83490F5", "Arn"]}
-    assert by_action["cloudwatch:GetMetricData"]["Resource"] == "*"  # AWS has no resource for it
-    assert by_action["cloudwatch:DescribeAlarms"]["Resource"]["Fn::Join"][1][-1] == ":alarm:kw-*"
+    # read-only CloudWatch calls that AWS doesn't scope to a resource
+    assert by_action[("cloudwatch:GetMetricData", "cloudwatch:DescribeAlarms")]["Resource"] == "*"
     text = str(statements)
     assert "ssm:" not in text and "PutItem" not in text and "UpdateItem" not in text and "Scan" not in text
     assert "INVITE#" not in text and "DMEMBER#" not in text  # counters only, never an invite or a member
