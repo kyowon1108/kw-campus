@@ -76,6 +76,11 @@ THUMB_DAILY_CAP = 10
 THUMB_BYTES = 1536 * 1024  # kw_mcp.notices.Limits.image_bytes
 
 
+def margin(page) -> int:
+    """Spare requests of a server the nightly sweep never takes: a tenth of its daily cap, at least one."""
+    return max(1, int(page.daily_cap) // 10)
+
+
 def file_wanted(name: str) -> bool:
     """A file whose text is read: a document kw_mcp.attachments reads, not named like a roster."""
     return bool(_FILE_OK.search(name)) and not _ROSTER_FILE.search(name)
@@ -199,8 +204,9 @@ class PoliteGate:
 
     def __init__(self, public, now: Callable[[], datetime], sleep=asyncio.sleep, refused=Exception,
                  extra_today: int = 0, gap_s: float | None = None, fetched: str | None = None,
-                 budget: int | None = None, deadline: float | None = None):
+                 budget: int | None = None, deadline: float | None = None, keep: bool = False):
         self.public, self.now, self.sleep, self.refused = public, now, sleep, refused
+        self.keep = keep  # the sweep: each server keeps its margin() of spare requests
         self.extra_today = max(0, extra_today)
         # an operator's catch-up run, or a notice's own images and files, may come closer than the minute
         self.interval = timedelta(seconds=max(1.0, gap_s)) if gap_s else None
@@ -227,7 +233,7 @@ class PoliteGate:
         for _ in range(10):
             now = self.now()
             extra = self.extra(now)
-            if extract.spare(self.public, page, now) + extra < 1:
+            if extract.spare(self.public, page, now) + extra - (margin(page) if self.keep else 0) < 1:
                 raise self.refused(f"{host}: 오늘 이 서버에 보낼 수 있는 요청을 다 썼습니다.", "budget")
             # a shorter gap never undercuts the host's robots.txt Crawl-delay (job.kw.ac.kr: 10 s)
             interval = self.interval and max(self.interval, timedelta(seconds=politeness.crawl_delay(url)))
@@ -397,7 +403,7 @@ def page_run(table, notice: dict, page, url: str, html: str, clock: Callable[[],
              time_left: Callable[[], float] | None = None, read=None,
              inner_transport: Callable[[], httpx.AsyncBaseTransport] | None = None, sleep=None,
              skip: str | None = None, unchanged: Callable[[str], bool] | None = None,
-             already: frozenset[str] = frozenset()) -> Assets:
+             already: frozenset[str] = frozenset(), keep: bool = False) -> Assets:
     """What a notice whose page (`html`, from `url` on `page`'s server) a page run just fetched shows and
     what of it was read. The listing costs no request. skip: read nothing, and count everything planned as
     skipped for this reason ("privacy" for a title that may name people, "budget" when the page took the
@@ -405,7 +411,8 @@ def page_run(table, notice: dict, page, url: str, html: str, clock: Callable[[],
     assets, so nothing is asked for (how "unchanged"). how is also "host" for a host kw_mcp.notices doesn't
     read yet (a board collected ahead of the extension's release: the body goes alone). The caller gives the
     page's server its minute back afterwards. already: asset keys read on an earlier try of this notice
-    version: counted as read, not asked for again."""
+    version: counted as read, not asked for again. keep (the nightly sweep): every server asked keeps its
+    margin() of spare requests untouched, and the slack is asked for up front."""
     from kw_mcp import notices
 
     try:
@@ -416,7 +423,7 @@ def page_run(table, notice: dict, page, url: str, html: str, clock: Callable[[],
         return Assets(how="host")
     left = ASSET_DEADLINE_S if time_left is None else min(ASSET_DEADLINE_S, time_left() - extract.MODEL_S)
     gate = PoliteGate(table, clock, sleep or asyncio.sleep, refused=notices.Refused, gap_s=politeness.ASSET_GAP_S,
-                      fetched=fetched, deadline=time.monotonic() + max(left, 0))
+                      fetched=fetched, deadline=time.monotonic() + max(left, 0), keep=keep)
     read = read or notices.read_notice
 
     def transport() -> httpx.AsyncBaseTransport:
@@ -440,8 +447,8 @@ def page_run(table, notice: dict, page, url: str, html: str, clock: Callable[[],
             return _skip_all(got, plan_images, plan_files, "privacy")
         if not plan_images and not plan_files:
             return got
-        why = skip or ("time" if left < ASSET_MIN_S else
-                       "budget" if extract.spare(table, page, clock()) < len(plan_images) + len(plan_files) else None)
+        need = len(plan_images) + len(plan_files) + (margin(page) + ASSET_SLACK if keep else 0)
+        why = skip or ("time" if left < ASSET_MIN_S else "budget" if extract.spare(table, page, clock()) < need else None)
         if why:
             got.how = {"privacy": "privacy", "time": "no_time"}.get(why, "no_spare")
             return _skip_all(got, plan_images, plan_files, why)

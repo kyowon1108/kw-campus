@@ -64,6 +64,24 @@ def test_schedule_is_weekday_daytime_kst_without_retries(tmp_path):
     })
 
 
+def test_the_sweep_runs_every_night_after_the_last_list_run_on_the_collector(tmp_path):
+    """sweep.py: its own phase, every day (weekends too) 22:00-23:40 KST, after the 21:00 list run; the collector
+    function (one at a time: reserved concurrency 1), no retries."""
+    import kw_campus_stack
+
+    assert kw_campus_stack.SWEEP_SCHEDULE == "cron(0/20 22-23 ? * * *)"
+    t = template(tmp_path)
+    schedules = t.find_resources("AWS::Scheduler::Schedule")
+    sweep = next(s["Properties"] for s in schedules.values() if s["Properties"].get("Name") == "kw-collector-sweep")
+    assert sweep["ScheduleExpression"] == "cron(0/20 22-23 ? * * *)"
+    assert sweep["ScheduleExpressionTimezone"] == "Asia/Seoul"
+    assert sweep["Target"]["Input"] == '{"phase": "sweep"}' and sweep["Target"]["RetryPolicy"]["MaximumRetryAttempts"] == 0
+    pages = next(s["Properties"] for s in schedules.values() if s["Properties"].get("Name") == "kw-collector-pages")
+    assert sweep["Target"]["Arn"] == pages["Target"]["Arn"]  # the collector itself
+    t.has_resource_properties("AWS::Lambda::Function", {"FunctionName": "kw-collector",
+                                                         "ReservedConcurrentExecutions": 1})
+
+
 def test_collector_cannot_read_discord_secrets(tmp_path):
     t = template(tmp_path)
     policies = t.find_resources("AWS::IAM::Policy")

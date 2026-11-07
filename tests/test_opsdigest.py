@@ -84,7 +84,7 @@ def test_all_well_is_two_short_lines(ops):
     assert job == {"action": "ops", "channel": "ops", "id": "digest|2026-11-10",
                    "content": f"✅ 어제 이상 없음 · 새 공지 {watched} · 초대 3\n"
                               f"읽기: 새 {watched} · 완료 0 · 일부 0 · 대기 {watched} · 제목만 0 · 큐 0(가장 오래 0시간) · "
-                              "못 읽고 만료 0"}
+                              "못 읽고 만료 0 · 다시 읽기 남음 미집계"}
     [asked] = cw.asked
     assert asked["StartTime"] == datetime(2026, 11, 9, tzinfo=KST) and asked["EndTime"] == datetime(2026, 11, 10,
                                                                                                     tzinfo=KST)
@@ -149,7 +149,8 @@ def test_problems_get_a_short_report_with_counts_and_names_only(ops):
         "⚠️ 어제 확인할 게 있어요",
         f"- 게시판: 꺼짐 1 (dept-ee) · 잠시 멈춤 2 (61.111.8.4, dept-law) · 조용한 게시판 1 · 새 공지 {new}",
         "- 공지 읽기: 완료 5 · 실패 3 · 한도로 미룸 0",
-        f"- 읽기 상태: 새 {new} · 완료 0 · 일부 0 · 대기 {new} · 제목만 0 · 큐 0(가장 오래 0시간) · 못 읽고 만료 0",
+        (f"- 읽기 상태: 새 {new} · 완료 0 · 일부 0 · 대기 {new} · 제목만 0 · 큐 0(가장 오래 0시간) · 못 읽고 만료 0 · "
+         "다시 읽기 남음 미집계"),
         "- 디스코드: 대기 0 · 실패 1 · 재시도 4",
         "- 초대: 1 (전체 1)",
         "- 알람: collector-needs-human, discord-dlq",
@@ -273,7 +274,7 @@ def test_reading_health_counts_new_notices_by_how_they_were_read(ops, monkeypatc
     watched = len([s for s in public_data.SOURCES if s not in opsdigest.NOT_WATCHED])
     line = next(x for x in job["content"].splitlines() if x.startswith("- 읽기 상태"))
     assert line == (f"- 읽기 상태: 새 {watched + 7} · 완료 3 · 일부 2 · 대기 {watched + 1} · 제목만 1 · "
-                    "큐 1(가장 오래 5시간) · 못 읽고 만료 1")
+                    "큐 1(가장 오래 5시간) · 못 읽고 만료 1 · 다시 읽기 남음 미집계")
     assert opsdigest.queue_health(public, now) == {"queue": 1, "oldest_h": 5}
 
 

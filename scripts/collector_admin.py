@@ -40,7 +40,9 @@ Requests go through the collectors' own gate in kw-public: one per server a minu
 and only what each server's daily cap has to spare after today's list runs (all of it on a weekend),
 so on a weekday it may read little. --extra-today N lifts that cap by N per server, but only while no
 list run is left today (the collectors check the plain cap); the minute between requests stays. Every Claude call goes into the spend ledger
-(../claude-spend/ledger.py) as "notice-backfill"; the run stops once --budget USD is used up. Only the
+as "notice-backfill"; the run stops once --budget USD is used up. The ledger is the ledger.py at KW_SPEND_LEDGER
+(KW_SPEND_LEDGER=/path/to/claude-spend/ledger.py uv run python scripts/collector_admin.py extract-backfill ...),
+else ../claude-spend/ledger.py next to this repository; without one, --apply refuses to run. Only the
 extraction fields are written (extracted, extract_v, extracted_at, model, body_hash), which the
 dispatcher never turns into a Discord job, and the read record. Stop it any time and run it again: a
 notice is written only when it is done, and done notices are not picked again.
@@ -66,7 +68,6 @@ from kwcampus.config import (
     DISCORD_TOKEN_PARAM,
     KST,
     NOTICE_SOURCE,
-    NOTICE_TTL,
     PUBLIC_TABLE,
 )
 from kwcampus.discordapi import NotFound, call, clean_token, token_problem
@@ -283,25 +284,9 @@ async def run_backfill(public, candidates: list[dict], max_notices: int, budget:
     return counts
 
 
-def _hashed_by(notice: dict) -> str:
-    """Whose text the stored body_hash is of: "page" (a page run hashes the page's own text) or "reader" (this
-    backfill hashes kw_mcp's). Notices from before body_hash_by: the page runs answered with OpenAI's models."""
-    if notice.get("body_hash_by"):
-        return str(notice["body_hash_by"])
-    return "page" if str(notice.get("model") or "").startswith("gpt-") else "reader"
-
-
 def _unchanged(notice: dict, digest: str) -> bool:
-    """The text Claude would read is the one the stored facts came from. The same hash when it was made the
-    same way; a hash of the page run's text can't be compared, so then only if the notice has no recorded edit
-    since its facts were stored (store.upsert moves the ttl on every change). No stored hash: unknown."""
-    stored = notice.get("body_hash")
-    if not stored or not notice.get("extracted_at"):
-        return False
-    if _hashed_by(notice) == "reader":
-        return stored == digest
-    changed_at = int(notice.get("ttl") or 0) - int(NOTICE_TTL.total_seconds())
-    return int(notice["extracted_at"]) >= changed_at
+    """The text Claude would read (kw_mcp's, hashed here) is the one the stored facts came from."""
+    return extract.same_text(notice, digest, "reader")
 
 
 def request_bound(notice: dict) -> int:
@@ -397,7 +382,9 @@ def main(argv: list[str] | None = None) -> int:
             print("dry run: nothing read or written (add --apply)")
             return 0
         if spend is None:
-            print("no spend ledger (../claude-spend/ledger.py or KW_SPEND_LEDGER): not running", file=sys.stderr)
+            print(f"no spend ledger at {os.environ.get('KW_SPEND_LEDGER') or extract._DEFAULT_LEDGER}: set "
+                  "KW_SPEND_LEDGER to the path of claude-spend's ledger.py (it tracks the --budget); not running",
+                  file=sys.stderr)
             return 2
         try:
             import kw_mcp.notices  # noqa: F401 - images and attachments come through it

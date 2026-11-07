@@ -283,6 +283,19 @@ def test_a_changed_layout_is_recorded_as_failed(aws):
         "status": "failed", "missing": ["body"]}
 
 
+def test_a_queued_page_counts_its_own_tries_not_an_earlier_versions(aws):
+    """The queue row's tries: a notice read three times in an older version starts again at one."""
+    table = aws["public"]
+    keys(aws)
+    key = {"PK": "SRC#dept-ee", "SK": "N#646"}
+    store.upsert(table, notice("dept-ee", 646, "dept-ee", EE_URL))
+    table.update_item(Key=key, UpdateExpression="SET #r = :r", ExpressionAttributeNames={"#r": "read"},
+                      ExpressionAttributeValues={":r": {"status": "partial", "body": "ok", "tries": 3}})
+    extract.collect(NOW, table, fetch=fetcher([], {EE_URL: "<html><body>새 디자인</body></html>"}),
+                    anthropic_client=FakeClaude())
+    assert item(table, key)["read"]["tries"] == 1
+
+
 # --- 총학생회: its text from the list, its poster from Supabase storage -------------------------------------
 
 COUNCIL_URL = "https://www.kwu-studentcouncil.co.kr/notices/cl1799000000000newpost1"

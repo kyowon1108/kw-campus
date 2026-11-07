@@ -27,6 +27,9 @@ EXTRA_COLLECT_SCHEDULES = {"CollectEveningSchedule": ("kw-collector-evening", "c
 # Ten minutes after each daytime list run: read queued notice pages (one per server, from the day's
 # spare requests) and pull facts out of them with OpenAI (extract.py).
 PAGES_SCHEDULE = "cron(10/20 9-18 ? * MON-FRI *)"
+# Every night, weekends too, 22:00-23:40 KST every 20 minutes: the sweep reads again older notices with no
+# finished read (sweep.py), from what the day left each server after its last list run (21:00).
+SWEEP_SCHEDULE = "cron(0/20 22-23 ? * * *)"
 # Weekdays 07:30 KST: cafeteria menu / academic calendar refresh (0-2 www requests a run).
 CAMPUS_SCHEDULE = "cron(30 7 ? * MON-FRI *)"
 # Weekdays 08:30 KST: D-3 / D-1 reminders under announced notices (reminders.py).
@@ -403,7 +406,8 @@ class KwCampusStack(cdk.Stack):
             )
         collector_runs = {"CollectSchedule": ("kw-collector-tick", COLLECT_SCHEDULE, None),
                           **{k: (name, expr, None) for k, (name, expr) in EXTRA_COLLECT_SCHEDULES.items()},
-                          "CollectPagesSchedule": ("kw-collector-pages", PAGES_SCHEDULE, '{"phase": "pages"}')}
+                          "CollectPagesSchedule": ("kw-collector-pages", PAGES_SCHEDULE, '{"phase": "pages"}'),
+                          "CollectSweepSchedule": ("kw-collector-sweep", SWEEP_SCHEDULE, '{"phase": "sweep"}')}
         for construct_id, (name, expression, payload) in collector_runs.items():
             scheduler.CfnSchedule(
                 self, construct_id,

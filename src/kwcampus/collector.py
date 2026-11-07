@@ -7,7 +7,9 @@ board goes first with one request to www.kw.ac.kr; the department servers get on
 Every couple of hours a second www request reads the 취업게시판 or the FAQ, 61 s after the first.
 
 The page runs (event {"phase": "pages"}, 10 minutes after each daytime list run) read queued notice
-pages instead, one per server, and pull facts out of them (extract.py). Same kill switch.
+pages instead, one per server, and pull facts out of them (extract.py). Same kill switch. The night runs
+(event {"phase": "sweep"}, every night from 22:00) read again older notices with no finished read, from the
+day's leftover requests (sweep.py; also its own switch).
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from kwcampus import (
     politeness,
     smallboards,
     store,
+    sweep,
     wixfeeds,
     wwwboards,
 )
@@ -114,10 +117,13 @@ def handler(event, context):
         return datetime.now(UTC)
 
     time_left = (lambda: context.get_remaining_time_in_millis() / 1000) if context else None
-    if (event or {}).get("phase") == "pages":
+    phase = (event or {}).get("phase")
+    if phase in ("pages", "sweep"):
         if not params.is_true(COLLECTOR_ENABLED_PARAM):
             log("collector_skip", reason="disabled")
             return {"status": "disabled"}
+        if phase == "sweep":  # its own switch too (sweep.SWITCH_PARAM); it never raises
+            return {"sweep": sweep.collect(now, table, clock=clock, time_left=time_left)}
         return {"pages": extract.collect(now, table, clock=clock, time_left=time_left)}
     try:
         out = run(now, table, clock=clock)

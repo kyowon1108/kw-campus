@@ -12,8 +12,10 @@ boards, servers and alarms only: no notice titles, no Discord members, no invite
   ExtractOk, ExtractFail + ExtractRefused and ExtractSkippedCap;
 - reading health: of the period's new notices, how many were read in full (complete, body_only,
   privacy_skip), in part (partial, failed), are still pending (no read record, or a retry planned) or had
-  only a title to read; the page queue (BODYQ) and its oldest row's age; and notices first seen 14 days
-  before the period that were never read (their queue row ran out): any of those makes the day worth a look.
+  only a title to read; the page queue (BODYQ) and its oldest row's age; notices first seen 14 days
+  before the period that were never read (their queue row ran out): any of those makes the day worth a look;
+  and how many older notices the sweep still has to read again (sweep.remaining: "+" while some source hasn't
+  been walked yet).
   Also sent as Digest* metrics;
 - Discord delivery: jobs waiting on kw-discord, jobs in kw-discord-dlq, the sender's retries;
 - invites: the DINVITES#<date> counters of the period and the running total (DINVITES#total);
@@ -24,7 +26,8 @@ read says so ("확인 못 함") and counts as something to look at.
 
 The message goes to the Discord queue as an "ops" job; the sender posts it to the "ops" channel of
 /kw/discord/channels (scripts/discord_setup.py sets it). This function holds no Discord secret.
-Reads: kw-public GetItem on ORIGIN#* and SRC#* (state rows) and MARK#* (when read records began), Query on
+Reads: kw-public GetItem on ORIGIN#* and SRC#* (state rows) and MARK#* (when read records began, the sweep's
+state), Query on
 SRC#* for first_seen, seed, removed, extract_v and the read record only (QUERY_ATTRIBUTES), Query on BODYQ for
 queued_at only (both always projected), kw-bridge GetItem on DINVITES#* only,
 GetQueueAttributes on the two Discord queues, cloudwatch:GetMetricData and DescribeAlarms (kw-*).
@@ -46,6 +49,7 @@ from kwcampus import (
     politeness,
     public_data,
     smallboards,
+    sweep,
     wixfeeds,
 )
 from kwcampus.config import DISCORD_QUEUE_URL, KST, NOTICE_SOURCE, PUBLIC_TABLE
@@ -227,9 +231,11 @@ def reading_line(b: dict | None, rq: dict | None) -> str:
     """How the period's new notices were read (boards' "read"), and the page queue (queue_health)."""
     if b is None or rq is None or "read" not in b:
         return UNREAD
-    r = b["read"]
+    r, swept = b["read"], rq.get("sweep", "unread")
+    rest = (UNREAD if swept == "unread" else "미집계" if swept is None
+            else f"{swept[0]}{'' if swept[1] else '+'}")  # +: not every source walked yet
     return (f"새 {b['new']} · 완료 {r['done']} · 일부 {r['partial']} · 대기 {r['pending']} · 제목만 {r['title']} · "
-            f"큐 {rq['queue']}(가장 오래 {rq['oldest_h']}시간) · 못 읽고 만료 {r['expired']}")
+            f"큐 {rq['queue']}(가장 오래 {rq['oldest_h']}시간) · 못 읽고 만료 {r['expired']} · 다시 읽기 남음 {rest}")
 
 
 def compose(label: str, b: dict | None, x: dict | None, q: dict | None, inv: dict | None,
@@ -280,6 +286,9 @@ def run(now: datetime, public, bridge, cw, sqs) -> dict[str, object]:
     inv = _part("invites", lambda: invite_counts(bridge, dates))
     alarm_names = _part("alarms", lambda: alarms(cw))
     rq = _part("page_queue", lambda: queue_health(public, now))
+    swept = _part("sweep", lambda: sweep.remaining(public) or "never")  # its own part: it can't hide the queue's
+    if rq is not None:
+        rq = {**rq, "sweep": None if swept == "never" else swept if swept is not None else "unread"}
     text, fine = compose(label, b, x, q, inv, alarm_names, rq)
     if b is not None and rq is not None:
         r = b["read"]

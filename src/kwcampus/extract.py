@@ -100,7 +100,7 @@ from kwcampus import (
     store,
     wixfeeds,
 )
-from kwcampus.config import COLLECTOR_VERSION, KST, WWW_DAILY_CAP
+from kwcampus.config import COLLECTOR_VERSION, KST, NOTICE_TTL, WWW_DAILY_CAP
 from kwcampus.fetch import TLS, WORST_CASE_S, fetch_list_page, is_challenge
 from kwcampus.kwnotice.redaction import looks_like_full_name, redact_body, redact_text
 from kwcampus.kwnotice.source import NOTICE_HOST
@@ -121,6 +121,10 @@ _KEY_SHAPES = {"anthropic": re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,400}"),
                "openai": re.compile(r"sk-[A-Za-z0-9_\-]{16,400}")}
 CAP_PARAM = "/kw/collector/extract-daily-cap"
 DEFAULT_CAP = 40
+# Of those, the sweep of older notices (sweep.py) never takes the last DEFAULT_SWEEP_RESERVE: they are for
+# new and edited notices. SSM SWEEP_RESERVE_PARAM overrides it; no parameter is needed.
+SWEEP_RESERVE_PARAM = "/kw/collector/extract-sweep-reserve"
+DEFAULT_SWEEP_RESERVE = 15
 EFFORT = "low"
 MAX_TOKENS = 16000  # Anthropic bills the tokens produced, not the cap; a low cap only truncates
 MAX_OUTPUT_TOKENS = 800  # OpenAI: reasoning tokens come out of this before the answer
@@ -309,6 +313,12 @@ def spare(table, page: Page, now: datetime) -> int:
 def daily_cap() -> int:
     raw = (params.get(CAP_PARAM) or "").strip()
     return max(0, int(raw)) if raw.isascii() and raw.isdigit() else DEFAULT_CAP
+
+
+def sweep_reserve() -> int:
+    """Model calls a day the sweep (sweep.py) leaves for new notices: SWEEP_RESERVE_PARAM, else the default."""
+    raw = (params.get(SWEEP_RESERVE_PARAM) or "").strip()
+    return max(0, int(raw)) if raw.isascii() and raw.isdigit() else DEFAULT_SWEEP_RESERVE
 
 
 def used_today(table, today: str) -> int:
@@ -782,14 +792,20 @@ def public_facts(item: dict) -> dict:
 
 # --- the queue and one page ---------------------------------------------------------------------
 
-def queue_rows(table, now: datetime) -> list[dict]:
+def queue_items(table) -> list[dict]:
+    """Every row of the page queue, due or not."""
     rows, kwargs = [], {"KeyConditionExpression": Key("PK").eq(store.BODY_QUEUE), "ConsistentRead": True}
     while True:
         page = table.query(**kwargs)
         rows.extend(page["Items"])
         if "LastEvaluatedKey" not in page:
-            break
+            return rows
         kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+
+def queue_rows(table, now: datetime, items: list[dict] | None = None) -> list[dict]:
+    """The rows due now, oldest first."""
+    rows = queue_items(table) if items is None else items
     live = [r for r in rows if int(r.get("ttl", 0)) > now.timestamp() and int(r.get("not_before", 0)) <= now.timestamp()]
     return sorted(live, key=lambda r: (int(r.get("queued_at", 0)), str(r["SK"])))
 
@@ -1065,11 +1081,18 @@ def _ask(providers: list[str], notice: dict, sent: str, images: tuple, asks: dic
     raise _Stop("auth_failed")
 
 
-def _extract(table, row: dict, notice: dict, page: Page, result, clock, today: str, cap: int,
-             providers: list[str], asks: dict, assets) -> tuple[str, bool, str]:
-    """One fetched page: its facts and read record onto the notice. `assets(html, unchanged)` lists and reads
-    the page's images and files (notice_assets.page_run). Returns (outcome, keep the queue row, reason);
-    raises _Stop to end the run."""
+@dataclass
+class PageRead:
+    """A fetched page read: its text, the text's hash, and what of its images and files was read."""
+    original: str
+    digest: str
+    got: object
+
+
+def read_page(table, row: dict, notice: dict, page: Page, result, clock, assets) -> PageRead | tuple[str, bool, str]:
+    """One fetched page: its text and assets (`assets(html, unchanged, already)`: notice_assets.page_run), or the
+    outcome when there is nothing more to do (blocked, failed, no_body, unchanged) as (outcome, keep the queue
+    row, reason). `row` is the queue row ({} for the sweep)."""
     reason = result.block_reason
     original = body_text(result.html, page.selector) if reason is None and result.html else None
     if reason is None and original is None and is_challenge(result.html):
@@ -1086,8 +1109,9 @@ def _extract(table, row: dict, notice: dict, page: Page, result, clock, today: s
     if original is None:  # the board's layout changed: a human should look at the reader
         log("extract_no_body", notice=notice["SK"])
         metrics(ExtractFail=1)
-        store_read(table, notice, read_record("failed", "failed", no_assets(), int(row.get("tries", 0)) + 1, clock(),
-                                              "no_body"))
+        prior = row.get("tries", 0) if row else (notice.get("read") or {}).get("tries")  # no row: the sweep
+        tries = int(prior or 0) + 1
+        store_read(table, notice, read_record("failed", "failed", no_assets(), tries, clock(), "no_body"))
         return "no_body", False, "no_body"
     _fix_posted_date(table, notice, page, result.html)
     digest = body_hash(original)
@@ -1097,7 +1121,39 @@ def _extract(table, row: dict, notice: dict, page: Page, result, clock, today: s
     got = assets(result.html, lambda fp: settled and (notice.get("read") or {}).get("assets_fp") == fp, already)
     if got.how == "unchanged":
         return "unchanged", False, ""
-    return _conclude(table, row, notice, original, digest, got, clock, today, cap, providers, asks)
+    return PageRead(original, digest, got)
+
+
+def _extract(table, row: dict, notice: dict, page: Page, result, clock, today: str, cap: int,
+             providers: list[str], asks: dict, assets) -> tuple[str, bool, str]:
+    """One fetched queued page: its facts and read record onto the notice. Returns (outcome, keep the queue row,
+    reason); raises _Stop to end the run."""
+    done = read_page(table, row, notice, page, result, clock, assets)
+    if not isinstance(done, PageRead):
+        return done
+    return _conclude(table, row, notice, done.original, done.digest, done.got, clock, today, cap, providers, asks)
+
+
+def hashed_by(notice: dict) -> str:
+    """Whose text the stored body_hash is of: "page" (a page run hashes the page's own text) or "reader" (the
+    backfill hashes kw_mcp's). Notices from before body_hash_by: the page runs answered with OpenAI's models."""
+    if notice.get("body_hash_by"):
+        return str(notice["body_hash_by"])
+    return "page" if str(notice.get("model") or "").startswith("gpt-") else "reader"
+
+
+def same_text(notice: dict, digest: str, path: str) -> bool:
+    """The text read now (hashed the `path` way: "page" or "reader") is the one the stored facts came from. The
+    same hash when it was made the same way; a hash made the other way can't be compared, so then only if the
+    notice has no recorded edit since its facts were stored (store.upsert moves the ttl on every change). No
+    stored hash: unknown, so False."""
+    stored = notice.get("body_hash")
+    if not stored or not notice.get("extracted_at"):
+        return False
+    if hashed_by(notice) == path:
+        return stored == digest
+    changed_at = int(notice.get("ttl") or 0) - int(NOTICE_TTL.total_seconds())
+    return int(notice["extracted_at"]) >= changed_at
 
 
 def _settled(notice: dict, digest: str) -> bool:
@@ -1244,15 +1300,30 @@ def _feed(table, row: dict, notice: dict, clock, today: str, cap: int, providers
     return _conclude(table, row, notice, original, digest, got, clock, today, cap, providers, asks)
 
 
+def providers_ready() -> list[str]:
+    """The providers whose key is in SSM, the chosen one first. A missing key of the chosen one is a failure;
+    the fallback's key is optional."""
+    providers = []
+    for i, provider in enumerate(provider_order()):
+        try:
+            api_key(provider)
+            providers.append(provider)
+        except ModelError:
+            if i == 0:
+                log("extract_auth_failed", provider=provider, status=0)
+                metrics(ExtractAuthFail=1)
+    return providers
+
+
 def collect(now: datetime, table, fetch=fetch_list_page, clock: Callable[[], datetime] | None = None,
             time_left: Callable[[], float] | None = None, cap: int | None = None,
             anthropic_client=None, openai_send: Callable[[dict, str], dict] = openai_post, read=None,
             inner_transport=None, sleep=None, thumb_transport=None) -> dict[str, object]:
     """Read queued pages: at most one per server, each only with the server's spare requests for today.
-    Every queued notice gets a read record, a notice with no page to read included (title_only). cap:
-    today's model calls (the SSM cap by default). read, inner_transport, sleep: how the images and files are
-    read (kw_mcp.notices.read_notice, the network, asyncio.sleep by default); thumb_transport: 총학생회's
-    posters (the network by default)."""
+    Every queued notice gets a read record, a notice with no page to read included (title_only). cap: today's
+    model calls (the SSM cap by default). read, inner_transport, sleep: how the images and files are read
+    (kw_mcp.notices.read_notice, the network, asyncio.sleep by default); thumb_transport: 총학생회's posters
+    (the network by default). Older notices are the nightly sweep's (sweep.py)."""
     clock = clock or (lambda: now)
     rows = queue_rows(table, now)
     if not rows:
@@ -1305,15 +1376,7 @@ def collect(now: datetime, table, fetch=fetch_list_page, clock: Callable[[], dat
         readable.append((row, notice, found))
 
     try:
-        providers = []
-        for i, provider in enumerate(provider_order()) if readable else ():  # no page for a call that can't be made
-            try:
-                api_key(provider)
-                providers.append(provider)
-            except ModelError:
-                if i == 0:  # the fallback's key is optional
-                    log("extract_auth_failed", provider=provider, status=0)
-                    metrics(ExtractAuthFail=1)
+        providers = providers_ready() if readable else []  # no page is read for a model call that can't be made
         if readable and not providers:
             raise _Stop("auth_failed")
         for row, notice, found in readable:
