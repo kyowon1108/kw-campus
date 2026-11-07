@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import UTC, datetime
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from botocore.exceptions import ClientError
 from kw_mcp import notices
@@ -135,11 +135,28 @@ def _redacted(data: dict) -> dict:
     return out
 
 
+# Other names of a site we read: the same server and board, so the link students paste works too.
+# dongmoon.kw.ac.kr is the 총동문회 gnuboard over http only; www.kwuaa.com serves it over https.
+HOST_ALIASES = {"dongmoon.kw.ac.kr": "www.kwuaa.com", "kwuaa.com": "www.kwuaa.com"}
+
+
+def _canonical(url: str) -> str:
+    """A link on an alias host, read from the site's own https name (path and query kept)."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    host = (parts.hostname or "").lower()
+    if host not in HOST_ALIASES or parts.username is not None or parts.password is not None or parts.port:
+        return url
+    return urlunsplit(("https", HOST_ALIASES[host], parts.path, parts.query, ""))
+
+
 def _target(url: str, post_id: str) -> str:
-    """The URL to read: the one given, else the stored notice's own link for post_id, else one built
-    from the id (a notice already past the store's 120 days)."""
+    """The URL to read: the one given (an alias host moved to the site's own name), else the stored
+    notice's own link for post_id, else one built from the id (a notice already past the store's 120 days)."""
     if url.strip():
-        return url.strip()
+        return _canonical(url.strip())
     if not post_id.strip():
         return ""
     try:

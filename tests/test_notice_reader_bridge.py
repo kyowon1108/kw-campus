@@ -364,3 +364,19 @@ def test_instructions_point_school_questions_here():
     line = next(x for x in bridge.INSTRUCTIONS.splitlines() if "read_notice" in x)
     assert "search_notices" in line and "학칙" in line and "장학" in line
     assert "웹 검색" in bridge.INSTRUCTIONS
+
+
+def test_alumni_alias_links_are_read_from_the_sites_https_name(env, school):
+    """Students paste http://dongmoon.kw.ac.kr/... (the same 총동문회 board, http only): the connector reads the
+    same post from https://www.kwuaa.com, path and query kept; other hosts and tricks stay as given."""
+    from pathlib import Path
+
+    assert notice_reader._canonical("http://dongmoon.kw.ac.kr/bbs/board.php?bo_table=notice&wr_id=86") == ALUMNI_POST_URL
+    assert notice_reader._canonical("https://kwuaa.com/bbs/board.php?bo_table=notice&wr_id=86#top") == ALUMNI_POST_URL
+    for kept in ("https://www.kw.ac.kr/ko/life/notice.jsp", "http://user@dongmoon.kw.ac.kr/bbs/board.php?wr_id=1",
+                 "http://dongmoon.kw.ac.kr:8080/bbs/board.php?wr_id=1", "http://[bad"):
+        assert notice_reader._canonical(kept) == kept
+    school.pages[ALUMNI_POST_URL] = html((Path(__file__).parent / "fixtures" / "gnuboard_kwuaa_notice_86.html").read_text())
+    blocks = asyncio.run(notice_reader.read_notice(url="http://dongmoon.kw.ac.kr/bbs/board.php?bo_table=notice&wr_id=86"))
+    assert json.loads(blocks[0].text)["title"] == "2026년도 광운대학교 총동문회 장학생 선발 안내"
+    assert [str(r.url) for r in school.requests] == [ALUMNI_POST_URL]
