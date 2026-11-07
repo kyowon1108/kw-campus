@@ -497,3 +497,19 @@ def test_without_a_bridge_url_the_install_channel_waits(ssm):
     install = next(c for c in api.channels if c["name"] == "설치-안내")
     saved = json.loads(ssm.get_parameter(Name="/kw/discord/roles")["Parameter"]["Value"])
     assert saved["install"] == {"channel": install["id"], "message": api.messages[install["id"]][0]["id"]}
+
+
+def test_notice_channel_topics_are_short_labels(ssm):
+    """Every notice channel carries one short label; old wording like "봇만 글을 씁니다" is replaced."""
+    api = FakeDiscord()
+    run(api, ssm, apply=True)
+    ids = json.loads(ssm.get_parameter(Name=ds.DISCORD_CHANNELS_PARAM)["Parameter"]["Value"])
+    by_id = {c["id"]: c for c in api.channels}
+    for key, topic in ds.NOTICE_TOPICS.items():
+        assert by_id[ids[key]]["topic"] == topic
+    by_id[ids["academic"]]["topic"] = "학사 공지. 봇만 글을 씁니다."
+    api.writes.clear()
+    run(api, ssm, apply=True)
+    assert api.writes == [("PATCH", f"/channels/{ids['academic']}")] and by_id[ids["academic"]]["topic"] == "학사 공지"
+    for t in (*ds.NOTICE_TOPICS.values(), ds.MENU_TOPIC, ds.INSTALL_TOPIC, ds.DEPARTMENT_TOPIC, ds.REPORT_TOPIC):
+        assert "봇" not in t and not t.endswith((".", "요", "다")) and len(t) <= 20

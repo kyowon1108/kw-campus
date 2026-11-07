@@ -106,14 +106,17 @@ BOT_RUNTIME = VIEW_CHANNEL | SEND_MESSAGES | EMBED_LINKS | READ_MESSAGE_HISTORY 
 ONLY_MENTIONS = 1  # guild default_message_notifications: 0 = all messages, 1 = only @mentions
 
 NOTICE_CHANNEL_KEYS = ("notice", "academic", "scholarship", "career", "international")
+# One short label per channel, the same shape everywhere (the channel list reads like a menu).
+NOTICE_TOPICS = {"notice": "학교 홈페이지 공지", "academic": "학사 공지", "scholarship": "장학 공지",
+                 "career": "취업 공지", "international": "국제 공지"}
 MENU_CHANNEL = "알림-설정"
-MENU_TOPIC = "받고 싶은 공지 알림을 골라요."
+MENU_TOPIC = "받을 공지 알림 고르기"
 INSTALL_CHANNEL = "설치-안내"
-INSTALL_TOPIC = "설치하기를 누르면 내 초대 코드와 설치 링크가 와요."
+INSTALL_TOPIC = "KW CAMPUS 설치와 초대 코드"
 DEPARTMENT_CHANNEL = "학과-공지"
-DEPARTMENT_TOPIC = "단과대·학과 게시판 공지예요."
+DEPARTMENT_TOPIC = "단과대·학과 공지"
 REPORT_CHANNEL = "제보-검토"
-REPORT_TOPIC = "들어온 제보예요. 운영자만 봐요."
+REPORT_TOPIC = "들어온 제보"
 REPORT_DESCRIPTION = "틀린 정보 알리기"
 SETUP_DESCRIPTION = "설치 링크와 내 초대 코드 받기"
 COMMANDS = ((REPORT_COMMAND, REPORT_DESCRIPTION), (SETUP_COMMAND, SETUP_DESCRIPTION))
@@ -366,6 +369,14 @@ class Setup:
             self.needed |= int(o["allow"]) | int(o["deny"])
         return out
 
+    def _topic(self, channel: dict, topic: str) -> None:
+        if channel.get("topic") != topic:
+            self.needed |= MANAGE_CHANNELS
+            self.step("~", f"#{channel['name']} 채널 주제 고치기: {topic}")
+            if self.apply:
+                self.api.call("PATCH", f"/channels/{channel['id']}", {"topic": topic})
+                channel["topic"] = topic
+
     def _find_or_create(self, guild_id: str, bot_id: str, notice: dict, name: str, topic: str,
                         known_id: str | None, by_id: dict, channels: list[dict], mention: bool) -> tuple[str, bool]:
         parent_id = notice.get("parent_id")
@@ -375,11 +386,7 @@ class Setup:
              and c.get("parent_id") == parent_id), None)
         if channel:
             self.step("=", f"#{channel['name']} 있음 ({channel['id']})")
-            if channel.get("topic") != topic:
-                self.needed |= MANAGE_CHANNELS
-                self.step("~", f"#{channel['name']} 채널 주제 고치기: {topic}")
-                if self.apply:
-                    self.api.call("PATCH", f"/channels/{channel['id']}", {"topic": topic})
+            self._topic(channel, topic)
             return str(channel["id"]), False
         self.needed |= MANAGE_CHANNELS
         overwrites = self._new_overwrites(by_id.get(str(parent_id)), guild_id, bot_id, mention)
@@ -474,6 +481,7 @@ class Setup:
                 self.step("!", f"{DISCORD_CHANNELS_PARAM}의 '{key}' 채널을 서버에서 찾지 못했습니다. 건너뜁니다.")
                 continue
             self.step("=", f"#{by_id[cid]['name']} ({key})")
+            self._topic(by_id[cid], NOTICE_TOPICS[key])
             targets.append((by_id[cid]["name"], cid, True, False))
         menu_id, created = self._find_or_create(guild_id, bot_id, notice, MENU_CHANNEL, MENU_TOPIC,
                                                 (saved.get("menu") or {}).get("channel"), by_id, channels, False)
@@ -496,6 +504,7 @@ class Setup:
             # set by hand: still read-only, and the bot may mention college roles there
             dept_id = configured
             self.step("=", f"#{by_id[configured]['name']} (department)")
+            self._topic(by_id[configured], DEPARTMENT_TOPIC)
             targets.append((by_id[configured]["name"], configured, True, False))
         elif configured:
             self.step("!", f"{DISCORD_CHANNELS_PARAM}의 'department' 채널({configured})을 서버에서 찾지 못했습니다. "
