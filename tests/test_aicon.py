@@ -79,7 +79,7 @@ def test_widget_and_e3_boards_share_one_request_a_run(aws):
     assert e3 == [aicon.WIDGET_URL, E3[0].list_url, aicon.WIDGET_URL, E3[1].list_url, aicon.WIDGET_URL, E3[2].list_url]
     origins = {i["PK"] for i in table.scan()["Items"] if i["PK"].startswith("ORIGIN#")}
     assert f"ORIGIN#{aicon.SERVER}" in origins and f"ORIGIN#{aicon.HOST}" not in origins
-    assert {b.key for b in E3} == {"kwlife", "kwlaw", "kwgame", "kwsports", "ingenium"}
+    assert {b.key for b in E3} == {"kwlife", "kwlaw", "kwgame", "kwsports", "ingenium", "liberal", "semi", "huss", "inno"}
 
 
 def test_the_old_host_gate_moves_to_the_server(aws):
@@ -196,7 +196,8 @@ def test_a_server_block_still_counts_for_e3(aws):
 def test_empty_widget_counts_toward_e3s_empty_round(aws):
     table, at = aws["public"], NOW
     empty = FetchResult("<html><body>점검 중</body></html>", None, 200)
-    for _ in range(3):  # the widget and E3's boards all come back empty: a whole round is 6 answers
+    assert deptboards.round_size(aicon.SERVER) == 10
+    for _ in range(5):  # the widget and E3's 9 boards all come back empty: a whole round is 10 answers
         aicon.collect(at, table, fetch=lambda url: empty)
         deptboards.collect(at, table, fetch=lambda url, **kw: empty)
         at += timedelta(minutes=20)

@@ -173,7 +173,12 @@ def test_the_extension_reads_the_cap_from_this_server(table, monkeypatch, count,
 def test_the_extension_lists_the_boards_kwcampus_collects():
     from kw_mcp import combined
 
-    assert combined.DEPARTMENT_BOARDS == {CATEGORY_LABEL[cid] for cid in public_data.DEPARTMENT_IDS}
+    # 자율전공학부's board is collected ahead of the released extension (kw-mcp 1.1.0): its rows reach my_notices
+    # (a row whose category is my department is mine), only the scope note still calls it uncollected. Add it
+    # to kw-mcp's DEPARTMENT_BOARDS in the next release, then drop it here.
+    ahead: set[str] = set()  # boards collected ahead of the released extension; empty since kw-mcp 1.2
+    assert combined.DEPARTMENT_BOARDS == {CATEGORY_LABEL[cid] for cid in public_data.DEPARTMENT_IDS} - ahead
+    assert not ahead & combined.DEPARTMENT_BOARDS
     assert combined.DEPARTMENT_LIMIT == public_data.DEPARTMENT_LIMIT and combined.LEGACY_LIMIT == public_data.MAX_LIMIT
 
 
@@ -218,6 +223,35 @@ def test_my_notices_says_how_far_back_a_full_answer_reached(env, monkeypatch):
     assert len(out["department"]) == public_data.DEPARTMENT_LIMIT and scope["truncated"] is True
     assert scope["covered_from"] == min(n["posted_date"] for n in out["department"])
     assert f"{scope['covered_from']} 이후 글만 확인했습니다" in scope["note"]
+
+
+def test_search_notices_by_a_department_without_a_board(env):
+    """정보융합학부 posts on the 인공지능융합대학 board (department set). The connector's search_notices and
+    latest_notices take the department's name: its posts and the college-wide ones, and of a notice posted
+    for every school (aicon-3522/3523/3524/3526) only its own copy, never another school's."""
+    c, _, token = _connected(env)
+    table, title = env["public"], "2026-2 졸업작품 발표회 안내"
+    for no, school in ((3522, "컴퓨터정보공학부"), (3523, "소프트웨어학부"), (3524, "정보융합학부"), (3526, "로봇학부")):
+        put(table, "aicon", no, title, "dept-aicon", "2026-11-04", department=school)
+    put(table, "aicon", 3519, title, "dept-aicon", "2026-11-03", department="인공지능융합대학")  # also college-wide
+    put(table, "aicon", 3510, "2026-2 학생회 선거 안내", "dept-aicon", "2026-11-02", department="인공지능융합대학")
+    put(table, "aicon", 3509, "로봇학부 캡스톤 안내", "dept-aicon", "2026-11-02", department="로봇학부")
+    put(table, "dept-ee", 700, "전자공학과 졸업작품 발표회 안내", "dept-ee", "2026-11-04")
+    public_data.clear_cache()
+
+    found = tool(c, token, "search_notices", query="", category="정보융합학부")["structuredContent"]["result"]
+    assert ids(found) == ["aicon-3524", "aicon-3510"]
+    assert [r["department"] for r in found] == ["정보융합학부", "인공지능융합대학"]
+    assert [r["category"] for r in found] == ["인공지능융합대학"] * 2
+    words = tool(c, token, "search_notices", query="졸업작품", category="정보 융합 학부")["structuredContent"]["result"]
+    assert ids(words) == ["aicon-3524"]
+    latest = tool(c, token, "latest_notices", category="정보융합학부")["structuredContent"]["result"]
+    assert ids(latest) == ["aicon-3524", "aicon-3510"]
+    robots = tool(c, token, "search_notices", query="졸업작품", category="로봇학부")["structuredContent"]["result"]
+    assert ids(robots) == ["aicon-3526"]
+    # the college itself still gives every school's copy: one board posting one title per school is not folded
+    college = tool(c, token, "search_notices", query="졸업작품", category="인공지능융합대학")["structuredContent"]["result"]
+    assert sorted(ids(college)) == ["aicon-3519", "aicon-3522", "aicon-3523", "aicon-3524", "aicon-3526"]
 
 
 def test_my_notices_names_a_department_without_a_board(env, monkeypatch):

@@ -12,6 +12,13 @@ This function reads the bot token, the public key and the role map, and writes i
 kw-bridge table (env KW_BRIDGE_TABLE; invites.py keeps only their hashes). An invite is shown once,
 to the member who asked, and never logged. A report is kept nowhere but in the operators' Discord
 channel.
+
+Operator commands, /초대회수 member:@user (withdraw every invite issued to that member) and /초대현황
+(today's count, the total, the per-member cap): registered with default_member_permissions = Manage
+Server, so Discord shows them to admins only, and checked again here against the member's own
+permissions (Manage Server or Administrator). They work in any channel, and the answer is ephemeral:
+only the admin who ran them sees it. Restricting them to #운영 would need one more SSM read in the
+3-second path and adds nothing, since nobody else sees the answer either way.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import base64
 import json
 import os
 import time
+from datetime import datetime
 
 import boto3
 from botocore.config import Config
@@ -32,6 +40,7 @@ from kwcampus.config import (
     DISCORD_PUBLIC_KEY_PARAM,
     DISCORD_ROLES_PARAM,
     DISCORD_TOKEN_PARAM,
+    KST,
 )
 from kwcampus.discordapi import (
     NotFound,
@@ -58,6 +67,12 @@ REPORT_FIELDS = (("what", "무엇이 틀렸거나 바뀌었나요?", 2, 5, 1000,
                  ("where", "어디서 봤나요? (선택)", 1, 0, 100, False, "예: Claude 답변, 디스코드 공지"))
 SETUP_START = "kwsetup:start"  # the 설치하기 button in #설치-안내
 SETUP_COMMAND = "설치"  # the guild slash command beside /제보 (scripts/discord_setup.py registers it)
+REVOKE_COMMAND = "초대회수"  # admins only: /초대회수 member:@user
+REVOKE_OPTION = "member"
+STATUS_COMMAND = "초대현황"  # admins only
+ADMINISTRATOR, MANAGE_GUILD = 1 << 3, 1 << 5
+ADMIN_PERMISSIONS = MANAGE_GUILD  # the commands' default_member_permissions
+USER_OPTION = 6  # application command option type USER
 START_PATH = "/start"  # the bridge's install page; an invite rides in its #fragment, never sent to a server
 MAX_BODY = 64 * 1024
 MAX_SKEW_S = 60  # a signed request older than this is a replay
@@ -90,6 +105,19 @@ INSTALL_CONTENT = (
 SETUP_LATER = "지금은 초대 코드를 못 만들어요. 잠시 뒤에 다시 눌러 주세요."
 SETUP_DAY_FULL = "오늘은 초대 코드가 다 나갔어요. 내일 다시 눌러 주세요."
 SORRY_LATER = "지금은 안 돼요. 잠시 뒤에 다시 해 주세요."
+ADMIN_ONLY = "운영자만 쓰는 명령이에요."
+
+
+def admin_commands() -> list[dict]:
+    """/초대회수 and /초대현황 as scripts/discord_setup.py registers them: visible to Manage Server only."""
+    perms = str(ADMIN_PERMISSIONS)
+    return [
+        {"name": REVOKE_COMMAND, "description": "멤버가 받은 초대 코드 모두 회수", "type": 1,
+         "default_member_permissions": perms,
+         "options": [{"type": USER_OPTION, "name": REVOKE_OPTION, "description": "회수할 멤버", "required": True}]},
+        {"name": STATUS_COMMAND, "description": "오늘·전체 초대 코드 수", "type": 1,
+         "default_member_permissions": perms},
+    ]
 
 
 def _rows(buttons: list[dict]) -> list[dict]:
@@ -221,6 +249,51 @@ def _setup(user: str) -> tuple[dict, str]:
     return reply, "setup_issued"
 
 
+def is_admin(member: dict) -> bool:
+    """The member's permissions in this channel (Discord computes them, overwrites included) hold
+    Manage Server or Administrator. The server owner has every bit."""
+    raw = str(member.get("permissions") or "")
+    return raw.isascii() and raw.isdigit() and bool(int(raw) & (MANAGE_GUILD | ADMINISTRATOR))
+
+
+def _option(data: dict, name: str) -> str:
+    return next((str(o.get("value") or "") for o in data.get("options") or []
+                 if isinstance(o, dict) and o.get("name") == name), "")
+
+
+def _admin(data: dict, admin: str) -> tuple[dict, str]:
+    """/초대회수 and /초대현황, for an admin already checked. A withdrawal is logged with who did it and how
+    many (an audit trail); the member it hit and the invite hashes never go to the logs."""
+    table_name = os.environ.get("KW_BRIDGE_TABLE", "")
+    if not table_name:
+        log("admin_not_configured")
+        return _say(SORRY_LATER), "admin_not_ready"
+    t = boto3.resource("dynamodb", config=BRIDGE_DB).Table(table_name)
+    try:
+        if data.get("name") == STATUS_COMMAND:
+            today = datetime.now(KST).date().isoformat()
+            day, total = invites.day_count(t, today), invites.totals(t)
+            text = (f"오늘 {day}개 · 전체 {total['n']}개 (회수 {total['revoked']}개)\n"
+                    f"-# 한 사람당 {invites.MAX_PER_MEMBER}개, 하루 모두 합쳐 {invites.DAILY_MAX}개까지 나가요.")
+            return _say(text), "invite_status"
+        target = _option(data, REVOKE_OPTION)
+        if not is_snowflake(target):
+            return _say("회수할 멤버를 골라 주세요."), "revoke_no_member"
+        withdrawn, issued = invites.revoke_member(t, target)
+    except ClientError as e:
+        log("admin_failed", error=str((e.response.get("Error") or {}).get("Code") or "ClientError")[:60])
+        return _say(SORRY_LATER), "admin_failed"
+    except BotoCoreError as e:
+        log("admin_failed", error=type(e).__name__)
+        return _say(SORRY_LATER), "admin_failed"
+    log("invites_revoked", by=admin, withdrawn=withdrawn)
+    if not issued:
+        return _say(f"<@{target}> 님은 디스코드에서 받은 초대 코드가 없어요."), "revoke_none"
+    if not withdrawn:
+        return _say(f"<@{target}> 님 초대 코드는 이미 다 회수했어요."), "revoke_none"
+    return _say(f"<@{target}> 님 초대 코드 {withdrawn}개를 회수했어요. 1분 안에 연결이 끊겨요."), "revoked"
+
+
 def handle(payload: dict, cfg: dict, token: str | None, send=_discord, reload=None) -> tuple[dict, str]:
     """(interaction response, outcome for the log). reload() re-reads the role map, bypassing the
     cache, for a known topic whose role isn't in the cached map yet (setup ran a moment ago)."""
@@ -241,6 +314,10 @@ def handle(payload: dict, cfg: dict, token: str | None, send=_discord, reload=No
             return report_form(), "report_form"
         if data.get("name") == SETUP_COMMAND:
             return _setup(user)
+        if data.get("name") in (REVOKE_COMMAND, STATUS_COMMAND):
+            if not is_admin(member):  # Discord hides them from others; a stale client may still send one
+                return _say(ADMIN_ONLY), "admin_refused"
+            return _admin(data, user)
         return _say(f"지금은 쓰지 않는 명령이에요. `/{SETUP_COMMAND}`나 `/{REPORT_COMMAND}`를 써 주세요."), "unsupported"
     if kind == MODAL_SUBMIT:
         if data.get("custom_id") == REPORT_SUBMIT:
@@ -321,6 +398,6 @@ def handler(event, context):
         response, outcome = _say(SORRY_LATER), "error"
     log("interaction", outcome=outcome)
     failed = outcome in ("role_failed", "no_token", "not_ready", "error", "report_failed", "report_not_ready",
-                         "setup_not_ready", "setup_failed")
+                         "setup_not_ready", "setup_failed", "admin_not_ready", "admin_failed")
     metrics(InteractionOk=0 if failed else 1, InteractionFailed=1 if failed else 0)
     return _http(200, response)

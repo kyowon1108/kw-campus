@@ -101,3 +101,84 @@ def test_same_day_order_is_first_seen_then_number(table):
     put(table, "kw-notice", 55001, "메인 공지 먼저", "general", first_seen=20)
     put(table, "aicon", 3517, "위젯 공지", "dept-aicon", "2026-11-04", first_seen=30)
     assert ids(public_data.latest(table, None, 10)) == ["55002", "55001", "dept-ee-900", "aicon-3517"]
+
+
+def test_a_department_without_a_board_reads_its_colleges_board():
+    r, d = public_data.resolve_category, public_data.departments_of
+    assert r("정보융합학부") == r("정보 융합 학부") == r("정보융합학부 공지") == {"dept-aicon"}
+    assert d("정보융합학부") == d("정보 융합 학부") == d("인공지능융합대학 정보융합학부") == {"정보융합학부"}
+    assert r("국제통상학부") == r("경영학부") == {"dept-biz"} and d("경영학부") == {"경영학부"}
+    # a department with its own board, a college, a word that names no department: no department filter
+    assert r("전자공학과") == {"dept-ee"} and r("자율전공학부") == {"dept-liberal"}
+    for value in ("전자공학과", "자율전공학부", "인공지능융합대학", "학과", None):
+        assert d(value) == set(), value
+    # two departments of one college: both filter the college board (not the whole board)
+    assert r("정보융합학부 로봇학부") == {"dept-aicon"} and d("정보융합학부 로봇학부") == {"정보융합학부", "로봇학부"}
+    with pytest.raises(public_data.UnknownCategory):
+        r("없는학부")
+    with pytest.raises(public_data.UnknownCategory):  # two colleges' boards: refused, never mixed
+        r("정보융합학부 경영학부")
+
+
+def test_a_departments_view_of_its_college_board(table):
+    put(table, "aicon", 3524, "졸업작품 발표회 안내", "dept-aicon", "2026-11-04", department="정보융합학부")
+    put(table, "aicon", 3523, "졸업작품 발표회 안내", "dept-aicon", "2026-11-04", department="소프트웨어학부")
+    put(table, "aicon", 3519, "졸업작품 발표회 안내", "dept-aicon", "2026-11-03", department="인공지능융합대학")
+    put(table, "aicon", 3400, "졸업작품 발표회 안내", "dept-aicon", "2026-09-01", department="인공지능융합대학")
+    put(table, "aicon", 3518, "[REDACTED_NAME] 교수 특강", "dept-aicon", "2026-11-03", department="정보융합학부")
+    put(table, "aicon", 3517, "[REDACTED_NAME] 교수 특강", "dept-aicon", "2026-11-03", department="")
+    put(table, "dept-biz", 2551, "취업박람회", "dept-biz", "2026-11-04", department="경영대학")
+    rows = public_data.latest(table, "정보융합학부", 10)
+    # the college-wide copy of the same week gives way to the department's; an older one is another notice,
+    # and masked titles never count as the same
+    assert ids(rows) == ["aicon-3524", "aicon-3518", "aicon-3517", "aicon-3400"]
+    assert ids(public_data.search(table, "발표회", "정보융합학부")) == ["aicon-3524", "aicon-3400"]
+    assert ids(public_data.latest(table, "국제통상학부", 10)) == ["dept-biz-2551"]  # 경영대학's posts are college-wide
+    assert len(public_data.latest(table, "인공지능융합대학", 10)) == 6  # the college itself: every copy
+
+
+def test_two_departments_without_boards_keep_only_their_rows(table):
+    """"정보융합학부 로봇학부": both departments' rows and the college-wide ones, never the whole college board
+    (other schools' posts) as when only a single department was filtered."""
+    for no, school in ((3524, "정보융합학부"), (3526, "로봇학부"), (3523, "소프트웨어학부"), (3522, "컴퓨터정보공학부")):
+        put(table, "aicon", no, "졸업작품 발표회 안내", "dept-aicon", "2026-11-04", department=school)
+    put(table, "aicon", 3519, "졸업작품 발표회 안내", "dept-aicon", "2026-11-03", department="인공지능융합대학")
+    put(table, "aicon", 3510, "학생회 선거 안내", "dept-aicon", "2026-11-02", department="인공지능융합대학")
+    put(table, "aicon", 3509, "소프트웨어학부 캡스톤 안내", "dept-aicon", "2026-11-02", department="소프트웨어학부")
+    rows = public_data.latest(table, "정보융합학부 로봇학부", 10)
+    assert ids(rows) == ["aicon-3526", "aicon-3524", "aicon-3510"]  # each department's copy, not the college-wide one
+    assert {r["department"] for r in rows} == {"정보융합학부", "로봇학부", "인공지능융합대학"}
+    assert ids(public_data.search(table, "캡스톤", "정보융합학부 로봇학부")) == []
+
+
+def facts(**extra):
+    base = {"deadlines": [{"kind": "신청마감", "at": "2026-11-18T23:59:59+09:00", "text": "11.18.(수) 24:00까지"}],
+            "target": "재학생", "eligibility": ["직전학기 12학점 이상"], "how_to_apply": "KLAS > 장학 > 장학금신청",
+            "amount": "200만원", "contact_office": "학생복지팀 (02-940-5114)", "category_hint": "장학",
+            "summary": "재학생 대상 2학기 장학생 선발", "sources_used": ["body"]}
+    return {**base, **extra}
+
+
+def test_search_finds_the_read_facts_after_the_titles(table):
+    put(table, "kw-notice", 1, "2026학년도 2학기 교내장학 안내", "registration-scholarship", "2026-11-05",
+        extracted=facts())
+    put(table, "kw-notice", 2, "프론티어장학금 신청 안내", "registration-scholarship", "2026-11-01")  # never read
+    put(table, "kw-notice", 3, "성적우수 장학 안내", "registration-scholarship", "2026-11-06",
+        extracted=facts(summary="프론티어장학금과 함께 받을 수 없음", eligibility=["직전학기 15학점 이상"]))
+    assert ids(public_data.search(table, "12학점")) == ["1"]  # only in the eligibility
+    assert ids(public_data.search(table, "장학 klas 200만원")) == ["3", "1"]  # every word, across title and facts
+    assert ids(public_data.search(table, "장학 없는말")) == []
+    # a title match comes first, then a newer notice that has the word only in its facts
+    assert ids(public_data.search(table, "프론티어장학금")) == ["2", "3"]
+    assert ids(public_data.search(table, "")) == ["3", "1", "2"]  # no words: newest first, as before
+
+
+def test_search_never_reaches_what_the_facts_mask(table):
+    # stored before the current masking rules: the name is masked on the way out, so never found
+    put(table, "kw-notice", 1, "근로장학생 모집", "registration-scholarship",
+        extracted=facts(how_to_apply="홍길동 조교에게 이메일 hong@kw.ac.kr로 제출"))
+    row = public_data.get(table, "1")
+    assert "홍길동" not in row["extracted"]["how_to_apply"] and "hong@" not in row["extracted"]["how_to_apply"]
+    assert public_data.search(table, "홍길동") == [] and public_data.search(table, "hong@kw.ac.kr") == []
+    assert public_data.search(table, "5114") == []  # the contact line is not searched
+    assert ids(public_data.search(table, "조교에게 제출")) == ["1"]  # what is shown is searched

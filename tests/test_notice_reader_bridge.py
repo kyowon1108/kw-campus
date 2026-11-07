@@ -97,20 +97,35 @@ def _count(env, host: str) -> dict:
 
 # --- one list of hosts ----------------------------------------------------------------------------
 
+# Boards kw-campus collects ahead of the released extension (kw-mcp 1.1.0, whose tables the bridge also
+# runs): their notices are listed and searched, but read_notice can't open those on new hosts, and their
+# post ids don't map to a URL, until kw-mcp's DEPT_BOARDS lists them. Add them there in the next kw-mcp
+# release, then empty this set.
+AHEAD_OF_KW_MCP: frozenset[str] = frozenset()
+
+
 def test_allowed_hosts_are_the_collectors_hosts():
-    assert notices.DEPT_BOARDS == {b.key: (b.name, b.host, b.path, b.group) for b in deptboards.BOARDS}
+    known = [b for b in deptboards.BOARDS if b.key not in AHEAD_OF_KW_MCP]
+    assert AHEAD_OF_KW_MCP <= {b.key for b in deptboards.BOARDS} and not AHEAD_OF_KW_MCP & set(notices.DEPT_BOARDS)
+    assert notices.DEPT_BOARDS == {b.key: (b.name, b.host, b.path, b.group) for b in known}
     assert notices.WIX_SITES == {f.key: (f.name, f.host) for f in wixfeeds.FEEDS}
     assert {notices.WWW_BOARDS[b.source] for b in wwwboards.BOARDS} == {b.path for b in wwwboards.BOARDS}
-    assert notices.PAGE_HOSTS == {"www.kw.ac.kr", aicon.HOST, *(b.host for b in deptboards.BOARDS),
+    assert notices.PAGE_HOSTS == {"www.kw.ac.kr", aicon.HOST, *(b.host for b in known),
                                   *(f.host for f in wixfeeds.FEEDS)}
     assert notices.DEPARTMENT_OF_HOST[aicon.HOST] == aicon.CATEGORY_NAME
     assert all(host in politeness.ROBOTS for host in notices.PAGE_HOSTS)  # every page host was checked by hand
-    assert "job.kw.ac.kr" in politeness.ROBOTS and "job.kw.ac.kr" not in notices.PAGE_HOSTS
+    assert "job.kw.ac.kr" in politeness.ROBOTS and "job.kw.ac.kr" in notices.PAGE_HOSTS  # 경력개발팀 (Crawl-delay 10)
 
 
 def test_every_collected_notice_link_is_readable():
-    """school_notices / latest_notices / search_notices / get_notice rows carry `url`; the reader takes it."""
-    links = [b.post_url("123") for b in deptboards.BOARDS] + [b.post_url("456") for b in wwwboards.BOARDS]
+    """school_notices / latest_notices / search_notices / get_notice rows carry `url`; the reader takes it
+    (but for the boards on hosts the released kw-mcp doesn't know yet)."""
+    ahead = [b for b in deptboards.BOARDS if b.host not in notices.PAGE_HOSTS]
+    assert {b.key for b in ahead} <= AHEAD_OF_KW_MCP
+    for b in ahead:
+        with pytest.raises(notices.NoticeError):
+            notices.check_url(b.post_url("123"))
+    links = [b.post_url("123") for b in deptboards.BOARDS if b not in ahead] + [b.post_url("456") for b in wwwboards.BOARDS]
     links += [str(build_detail_url(DUID("53151"))), f"https://{aicon.HOST}/administration/notice.php?admin_mode=read&no=3525"]
     links += [f"https://{f.host}/post/some-post" for f in wixfeeds.FEEDS]
     for link in links:

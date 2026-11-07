@@ -256,6 +256,7 @@ class RobotsCheck:
     checked: str  # KST date of the last look by hand (one GET of /robots.txt)
     result: str  # what came back
     disallow: tuple[str, ...] = ()  # rules for "User-agent: *" (none names kw-campus); * and $ as in RFC 9309
+    crawl_delay: float = 0  # Crawl-delay seconds: the least gap after a request to this host (crawl_delay())
 
 
 _NO_FILE = "no robots.txt (404)"
@@ -265,6 +266,8 @@ _NO_FILE = "no robots.txt (404)"
 # robots_age_check raises NeedsHuman every weekday morning until then.
 ROBOTS: dict[str, RobotsCheck] = {
     "www.kw.ac.kr": RobotsCheck("2026-11-06", "no robots.txt (200 with the site's HTML error page, no rules)"),
+    # rulewatch.py only: five regulation pages a week (its own server)
+    "rule.kw.ac.kr": RobotsCheck("2026-11-07", "no robots.txt (200 with the 규정관리시스템 HTML page, no rules)"),
     "aicon.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
     # E1
     "ei.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
@@ -275,9 +278,12 @@ ROBOTS: dict[str, RobotsCheck] = {
     "snme.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
     "semicon.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
     "law.kw.ac.kr": RobotsCheck("2026-11-06", "User-agent: * / Allow: /"),
-    # Not collected; shares E1. Recorded so nobody adds its boards by mistake (Crawl-delay: 10).
+    # 경력개발팀: only /community/notice.php is collected; the 채용 boards (/recommend/, /job/) are disallowed.
+    # Crawl-delay: 10: list requests are a minute apart anyway; a page run's images and files wait 10 s, not 3.
     "job.kw.ac.kr": RobotsCheck("2026-11-06", "User-agent: * with Disallow rules, Crawl-delay: 10", (
-        "/recommend/", "/mobile/recommend/", "/internship/", "/job/", "/give/story.php", "/notice/news.php")),
+        "/recommend/", "/mobile/recommend/", "/internship/", "/job/", "/give/story.php", "/notice/news.php"),
+        crawl_delay=10),
+    "startup.kw.ac.kr": RobotsCheck("2026-11-07", "User-agent: * / Allow: /"),
     # E2
     "archi.kw.ac.kr": RobotsCheck("2026-11-06", "no robots.txt (302 to an error page)"),
     "chss.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
@@ -287,12 +293,20 @@ ROBOTS: dict[str, RobotsCheck] = {
     "dnaci.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
     "kwpa.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
     "biz.kw.ac.kr": RobotsCheck("2026-11-06", "no robots.txt (302 to an error page)"),
+    "kwiie.kw.ac.kr": RobotsCheck("2026-11-07", _NO_FILE),
+    "humanrights.kw.ac.kr": RobotsCheck("2026-11-07", "no robots.txt (302 to an error page)"),
+    "oia.kw.ac.kr": RobotsCheck("2026-11-07", _NO_FILE),
+    "grad.kw.ac.kr": RobotsCheck("2026-11-07", _NO_FILE),
     # E3
     "kwlife.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
     "kwlaw.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
     "kwgame.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
     "kwsports.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
     "ingenium.kw.ac.kr": RobotsCheck("2026-11-06", "User-agent: * / Allow: /"),
+    "liberal.kw.ac.kr": RobotsCheck("2026-11-07", "User-agent: * / Allow: /"),
+    "semi.kw.ac.kr": RobotsCheck("2026-11-07", "User-agent: * / Allow: /"),
+    "huss.kw.ac.kr": RobotsCheck("2026-11-07", "User-agent: * / Allow: /"),
+    "inno.kw.ac.kr": RobotsCheck("2026-11-07", "User-agent: * / Allow: / / Sitemap"),
     # E4
     "chemng.kw.ac.kr": RobotsCheck("2026-11-06", _NO_FILE),
     "sports.kw.ac.kr": RobotsCheck("2026-11-06", "User-agent: * / Allow: /"),
@@ -307,6 +321,13 @@ ROBOTS: dict[str, RobotsCheck] = {
 def _rule(pattern: str) -> re.Pattern[str]:
     body = re.escape(pattern.rstrip("$")).replace(r"\*", ".*")
     return re.compile(body + ("$" if pattern.endswith("$") else ""))
+
+
+def crawl_delay(url: str) -> float:
+    """Seconds robots.txt asks between requests to this URL's host (Crawl-delay); 0 when it asks nothing.
+    A gate passing a gap shorter than MIN_INTERVAL (a notice's images and files) waits at least this."""
+    check = ROBOTS.get(urlsplit(url).hostname or "")
+    return check.crawl_delay if check else 0
 
 
 def robots_allows(url: str) -> bool:

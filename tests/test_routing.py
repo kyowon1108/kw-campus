@@ -1,4 +1,4 @@
-from kwcampus import deptboards, wixfeeds
+from kwcampus import deptboards, routing, wixfeeds
 from kwcampus.routing import (
     CATEGORY_TO_CHANNEL,
     TOPIC_BY_KEY,
@@ -31,11 +31,31 @@ def test_topics_follow_channels_and_colleges():
 
 
 def test_every_department_board_and_feed_belongs_to_a_college():
-    categories = ["dept-aicon", *(b.category_id for b in deptboards.BOARDS), *(f.category_id for f in wixfeeds.FEEDS)]
+    categories = ["dept-aicon", *(b.category_id for b in deptboards.BOARDS if not b.office),
+                  *(f.category_id for f in wixfeeds.FEEDS)]
     missing = [c for c in categories if not (topic_for(c) and TOPIC_BY_KEY[topic_for(c)].college)]
     assert missing == [], "add these to routing.COLLEGE_OF"
     # and no college role is left without a board
     assert {t.key for t in TOPICS if t.college} == {topic_for(c) for c in categories}
+
+
+def test_office_boards_go_to_their_channels_never_to_a_college():
+    offices = {b.category_id for b in deptboards.BOARDS if b.office}
+    assert offices == routing.OFFICE_CATEGORIES and offices <= set(CATEGORY_TO_CHANNEL)
+    assert {c: topic_for(c) for c in sorted(offices)} == {
+        "office-career": "career",  # 경력개발팀
+        "office-grad": "academic",  # 일반대학원
+        "office-humanrights": "general",  # 인권센터
+        "office-huss": "academic",  # HUSS 사업단
+        "office-inno": "general",  # 대학혁신사업단
+        "office-kwiie": "general",  # 한국어교육센터
+        "office-oia": "international",  # 국제처 유학생
+        "office-semi": "academic",  # 반도체특성화대학사업단
+        "office-startup": "general",  # 창업지원단
+    }
+    assert not any(urgent_source(c) for c in offices)  # 긴급 stays the main board's and the job board's
+    assert topic_for("dept-electricjob") == "ei" and topic_for("dept-liberal") == "ingenium"
+    assert is_urgent("[긴급] 교육 장소 변경 안내") and not urgent_source("office-huss")
 
 
 def test_topic_keys_and_role_names_are_unique():

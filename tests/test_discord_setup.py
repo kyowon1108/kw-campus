@@ -184,7 +184,7 @@ def test_apply_sets_everything_up_and_a_second_run_is_a_no_op(ssm):
     # 제보 goes to a channel @everyone can't see; only the bot (and admins) read it
     assert int(overwrite(api, report["id"], GUILD)["deny"]) & ds.VIEW_CHANNEL
     assert int(overwrite(api, report["id"], BOT)["allow"]) & ds.SEND_MESSAGES
-    assert [c["name"] for c in api.commands] == ["제보", "설치"]
+    assert [c["name"] for c in api.commands] == ["제보", "설치", "초대회수", "초대현황"]
 
     api.writes.clear()
     code, out = run(api, ssm, apply=True)
@@ -491,7 +491,7 @@ def test_without_a_bridge_url_the_install_channel_waits(ssm):
     assert "--bridge-url" in out and not any(c["name"] == "설치-안내" for c in api.channels)
     saved = json.loads(ssm.get_parameter(Name="/kw/discord/roles")["Parameter"]["Value"])
     assert "install" not in saved
-    assert [c["name"] for c in api.commands] == ["제보", "설치"]  # /설치 needs only the Lambda's settings
+    assert [c["name"] for c in api.commands] == ["제보", "설치", "초대회수", "초대현황"]  # need only the Lambda's settings
 
     code, out = run(api, ssm, apply=True)  # later, with the URL
     install = next(c for c in api.channels if c["name"] == "설치-안내")
@@ -513,3 +513,85 @@ def test_notice_channel_topics_are_short_labels(ssm):
     assert api.writes == [("PATCH", f"/channels/{ids['academic']}")] and by_id[ids["academic"]]["topic"] == "학사 공지"
     for t in (*ds.NOTICE_TOPICS.values(), ds.MENU_TOPIC, ds.INSTALL_TOPIC, ds.DEPARTMENT_TOPIC, ds.REPORT_TOPIC):
         assert "봇" not in t and not t.endswith((".", "요", "다")) and len(t) <= 20
+
+
+# --- #운영 and the admin-only invite commands ---------------------------------------------------------
+
+def with_ops_channel(api: FakeDiscord, everyone_sees: bool = True) -> str:
+    """The owner's private 운영 category with #운영 in it (as on the live server)."""
+    api.channels.append({"id": "500", "name": "운영", "type": 4, "permission_overwrites": [
+        {"id": GUILD, "type": 0, "allow": "0", "deny": str(ds.VIEW_CHANNEL)}]})
+    api.channels.append({"id": "501", "name": "운영", "type": 0, "parent_id": "500", "guild_id": GUILD,
+                         "permission_overwrites": [] if everyone_sees else [
+                             {"id": GUILD, "type": 0, "allow": "0", "deny": str(ds.VIEW_CHANNEL)}]})
+    return "501"
+
+
+def test_the_ops_channel_is_found_in_its_category_and_kept_private(ssm):
+    api = FakeDiscord()
+    ops = with_ops_channel(api)
+    code, out = run(api, ssm)  # dry run first: nothing written
+    assert code == 0 and api.writes == [] and '"ops": "501"' in out
+    code, out = run(api, ssm, apply=True)
+    assert code == 0, out
+    bot = overwrite(api, ops, BOT)
+    assert bot["type"] == 1 and int(bot["allow"]) == ds.VIEW_CHANNEL | ds.SEND_MESSAGES | ds.EMBED_LINKS | \
+        ds.READ_MESSAGE_HISTORY
+    everyone = overwrite(api, ops, GUILD)
+    assert int(everyone["deny"]) & ds.VIEW_CHANNEL and not int(everyone["allow"]) & ds.VIEW_CHANNEL
+    channels = json.loads(ssm.get_parameter(Name=ds.DISCORD_CHANNELS_PARAM)["Parameter"]["Value"])
+    assert channels == {**CHANNELS, "ops": ops}
+    assert overwrite(api, "209", BOT) is None  # a same-named channel outside the 운영 category is left alone
+
+    api.writes.clear()
+    code, out = run(api, ssm, apply=True)
+    assert code == 0 and api.writes == [] and "바꿀 것이 없습니다" in out
+
+
+def test_an_ops_channel_already_hidden_only_gets_the_bot(ssm):
+    api = FakeDiscord()
+    ops = with_ops_channel(api, everyone_sees=False)
+    run(api, ssm, apply=True)
+    assert ("PUT", f"/channels/{ops}/permissions/{GUILD}") not in api.writes
+    assert ("PUT", f"/channels/{ops}/permissions/{BOT}") in api.writes
+
+
+def test_without_the_ops_channel_nothing_is_made_and_the_owner_is_told(ssm):
+    api = FakeDiscord()
+    code, out = run(api, ssm, apply=True)
+    assert code == 0 and "'운영' 분류 안에 #운영 채널이 없어 건너뜁니다" in out
+    assert not any(c["name"] == "운영" and c["type"] == 4 for c in api.channels)  # never created
+    channels = json.loads(ssm.get_parameter(Name=ds.DISCORD_CHANNELS_PARAM)["Parameter"]["Value"])
+    assert "ops" not in channels
+
+
+def test_the_ops_key_sits_beside_a_new_department_channel(ssm):
+    api = FakeDiscord()
+    ops = with_ops_channel(api)
+    run(api, ssm, apply=True, department=True)
+    dept = next(c for c in api.channels if c["name"] == "학과-공지")
+    channels = json.loads(ssm.get_parameter(Name=ds.DISCORD_CHANNELS_PARAM)["Parameter"]["Value"])
+    assert channels == {**CHANNELS, "department": dept["id"], "ops": ops}
+
+
+def test_invite_commands_are_registered_for_admins_only(ssm):
+    api = FakeDiscord()
+    _, out = run(api, ssm)
+    assert "/초대회수 명령 만들기 (서버 관리 권한만 보임)" in out and "/초대현황 명령 만들기 (서버 관리 권한만 보임)" in out
+    run(api, ssm, apply=True)
+    by_name = {c["name"]: c for c in api.commands}
+    for name in ("초대회수", "초대현황"):
+        assert by_name[name]["default_member_permissions"] == str(ds.MANAGE_GUILD) and by_name[name]["type"] == 1
+    for name in ("제보", "설치"):
+        assert "default_member_permissions" not in by_name[name]  # everyone's commands stay everyone's
+    [member] = by_name["초대회수"]["options"]
+    assert (member["type"], member["name"], member["required"]) == (6, "member", True)
+    assert "options" not in by_name["초대현황"]
+
+    # someone opened /초대회수 to everyone by hand: put back
+    by_name["초대회수"]["default_member_permissions"] = None
+    api.writes.clear()
+    _, out = run(api, ssm, apply=True)
+    assert "/초대회수 명령 고치기" in out
+    assert next(c for c in api.commands if c["name"] == "초대회수")["default_member_permissions"] == str(ds.MANAGE_GUILD)
+    assert [w for w in api.writes if "commands" in w[1]] == [("POST", f"/applications/{BOT}/guilds/{GUILD}/commands")]

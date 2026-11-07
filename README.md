@@ -39,10 +39,10 @@ uv run python -c "from kw_mcp.agent import make_invite; import sys; print(make_i
 ## 5단계: 학과 공지 (인공지능융합대학)
 
 - 출처: 인공지능융합대학 홈의 "대학 공지" 위젯(`https://aicon.kw.ac.kr/main/main.php`). 요청 한 번으로 4개 학부(컴퓨터정보공학부·소프트웨어학부·정보융합학부·로봇학부)의 최신 공지 5개를 받습니다. 학부 게시판 1페이지는 고정 글뿐이라 새 글은 위젯에서만 보입니다.
-- 수집: 메인 게시판과 같은 예약 실행(평일 09:00~18:40 20분마다와 21:00)에서 E3 학과 게시판과 번갈아 요청합니다. 차례는 시각이 아니라 이 서버에 마지막으로 요청한 쪽(`last_by`)으로 정하므로 21:00 실행도 번갈아 갑니다. 게시판이 차례를 못 쓰면 위젯은 80분 뒤에 다시 갑니다. ce/cs/ic/cni는 이 호스트의 별칭이고 kwlife·kwlaw·kwgame·kwsports·ingenium도 같은 서버(E3, 211.233.72.248)에 있어서, 요청 간격·하루 상한(32회)·쿨다운은 이 서버 하나 기준이고 학과 게시판과 같이 씁니다. 예전 `ORIGIN#aicon.kw.ac.kr` 상태(쿨다운·차단 횟수·오늘 횟수)는 첫 실행 때 `ORIGIN#211.233.72.248`로 옮기고 지웁니다.
-- 실패: 서버 신호(403·429·보안문자 화면·연결 실패·5xx)만 E3에 기록합니다. 위젯 주소의 404·리디렉트·바뀐 화면은 위젯만 40분 → 80분 → … 최대 24시간 쉬고(SourceFailed 지표), 학과 게시판은 그대로 돕니다. 빈 목록은 E3의 빈 응답 횟수에 더해, 위젯과 게시판 한 바퀴(6번) 내내 비면 서버를 쉬게 합니다. 첫 수집은 기준점만 저장합니다(알림 없음). 이 사이트가 실패해도 메인 게시판 수집은 그대로 끝납니다.
+- 수집: 메인 게시판과 같은 예약 실행(평일 09:00~18:40 20분마다와 21:00)에서 E3 학과 게시판과 번갈아 요청합니다. 차례는 시각이 아니라 이 서버에 마지막으로 요청한 쪽(`last_by`)으로 정하므로 21:00 실행도 번갈아 갑니다. 게시판이 차례를 못 쓰면 위젯은 80분 뒤에 다시 갑니다. ce/cs/ic/cni는 이 호스트의 별칭이고 kwlife·kwlaw·kwgame·kwsports·ingenium·liberal·semi·huss·inno도 같은 서버(E3, 211.233.72.248)에 있어서, 요청 간격·하루 상한(32회)·쿨다운은 이 서버 하나 기준이고 학과 게시판과 같이 씁니다. 예전 `ORIGIN#aicon.kw.ac.kr` 상태(쿨다운·차단 횟수·오늘 횟수)는 첫 실행 때 `ORIGIN#211.233.72.248`로 옮기고 지웁니다.
+- 실패: 서버 신호(403·429·보안문자 화면·연결 실패·5xx)만 E3에 기록합니다. 위젯 주소의 404·리디렉트·바뀐 화면은 위젯만 40분 → 80분 → … 최대 24시간 쉬고(SourceFailed 지표), 학과 게시판은 그대로 돕니다. 빈 목록은 E3의 빈 응답 횟수에 더해, 위젯과 게시판 한 바퀴(10번) 내내 비면 서버를 쉬게 합니다. 첫 수집은 기준점만 저장합니다(알림 없음). 이 사이트가 실패해도 메인 게시판 수집은 그대로 끝납니다.
 - 링크: 위젯의 href는 쓰지 않고, 이 사이트의 공지 링크에서 잡은 글 번호로 `https://aicon.kw.ac.kr/administration/notice.php?admin_mode=read&no=<번호>`를 만듭니다. 다른 호스트로 가는 링크는 버립니다.
-- 학부 게시판 2쪽(`department_office/lecture.php?site_type=N&page=2`)은 읽지 않습니다. E3 요청 1회를 위젯과 게시판 5개가 이미 나눠 쓰고 있어, 4개를 더하면 E3 게시판마다 3시간 20분이던 간격이 6시간으로 늘어납니다. 2쪽 글은 대부분 위젯에 먼저 나오고, 따로 읽으면 같은 글이 다른 글 번호(`aicon-<번호>`와 학부 게시판 번호)로 두 번 저장됩니다.
+- 학부 게시판 2쪽(`department_office/lecture.php?site_type=N&page=2`)은 읽지 않습니다. E3 요청 1회를 위젯과 게시판 9개가 이미 나눠 쓰고 있어(게시판마다 6시간), 4개를 더하면 그 간격이 8시간 40분으로 늘어납니다. 2쪽 글은 대부분 위젯에 먼저 나오고, 따로 읽으면 같은 글이 다른 글 번호(`aicon-<번호>`와 학부 게시판 번호)로 두 번 저장됩니다.
 - 저장: `kw-public`의 `SRC#aicon`. 공개 데이터에서 글 번호는 `aicon-<번호>`, 분류는 "인공지능융합대학"(별칭 "인융대"; "학과"는 모든 학과·단과대). 학교 공지 검색·최신 공지·`my_notices`의 `department`에 같이 나옵니다.
 - 알림: 분류 `dept-aicon` → 채널 키 `department`. `/kw/discord/channels`에 `department`가 없으면 학교-공지(`notice`) 채널로 보냅니다.
 
@@ -53,16 +53,20 @@ uv run python -c "from kw_mcp.agent import make_invite; import sys; print(make_i
 
 | 서버 | 게시판 (키: BOARD_CODE) | 게시판마다 읽는 간격 |
 |---|---|---|
-| E1 61.111.8.4 | 전자정보공과대학 ei:notice, 전자공학과 ee:bachelor, 전자통신공학과 elcomm:officenotice, 전자융합공학과 radiowave:notice, 전기공학과 electric:notice, 전자재료공학과 snme:college, 반도체시스템공학부 semicon:notice, 법학부 law:notice | 2시간 40분 |
-| E2 61.111.6.200 | 건축공학과 archi:note, 인문사회과학대학 chss:notice, 국어국문학과 korean:notice, 영어산업학과 english:notice(EUC-KR), 산업심리학과 psy:notice, 동북아문화산업학부 dnaci:notice, 행정학과 kwpa:faculty, 경영대학 biz:note | 2시간 40분 |
-| E3 211.233.72.248 | 인공지능융합대학 위젯(위 절), 참빛인재대학 kwlife:notice, 금융부동산법무학과 kwlaw:notice, 게임콘텐츠학과 kwgame:notice, 스포츠상담재활학과 kwsports:notice, 인제니움학부대학 ingenium:notice | 위젯 40분, 게시판 3시간 20분 |
+| E1 61.111.8.4 | 전자정보공과대학 ei:notice, 전자공학과 ee:bachelor, 전자통신공학과 elcomm:officenotice, 전자융합공학과 radiowave:notice, 전기공학과 electric:notice, 전자재료공학과 snme:college, 반도체시스템공학부 semicon:notice, 법학부 law:notice, 전기공학과 취업정보 electricjob:job, 경력개발팀 career(BOARD_CODE 없음), 창업지원단 startup:notice | 3시간 40분 |
+| E2 61.111.6.200 | 건축공학과 archi:note, 인문사회과학대학 chss:notice, 국어국문학과 korean:notice, 영어산업학과 english:notice(EUC-KR), 산업심리학과 psy:notice, 동북아문화산업학부 dnaci:notice, 행정학과 kwpa:faculty, 경영대학 biz:note, 한국어교육센터 kwiie:notice, 인권센터 humanrights:notice, 국제처 유학생 oia:note, 일반대학원 grad:notice | 4시간 |
+| E3 211.233.72.248 | 인공지능융합대학 위젯(위 절), 참빛인재대학 kwlife:notice, 금융부동산법무학과 kwlaw:notice, 게임콘텐츠학과 kwgame:notice, 스포츠상담재활학과 kwsports:notice, 인제니움학부대학 ingenium:notice, 자율전공학부 liberal:notice, 반도체특성화대학사업단 semi:notice, HUSS 사업단 huss:notice, 대학혁신사업단 inno:notice | 위젯 40분, 게시판 6시간 |
 | E4 114.203.87.122 | 화학공학과 chemng, 스포츠융합과학과 sports (B형) | 40분 |
 
 - 1페이지의 고정 글도 읽고(경영대학은 85행 중 65행이 고정), 새 글은 위치가 아니라 글 번호(UID·no)와 등록일로 판단합니다. 처음 보는 글이 지난번 1페이지의 가장 큰 번호보다 크거나, 등록일이 최근 14일 안이면 새 글입니다. 번호가 작고 오래된 글(1페이지로 밀려 올라온 글, 120일이 지나 다시 보이는 글)은 알림 없이 저장합니다. 그래서 게시판 번호가 다시 매겨지거나 한 번 파싱에 실패한 글도 놓치지 않습니다. 1페이지의 가장 큰 번호가 내려가면(최신 글 삭제, 번호 재설정) `dept_uid_regressed` 로그와 UidRegressed 지표를 남기고 그 페이지를 새 기준으로 씁니다. 같은 번호의 글이 제목과 등록일만 바꿔 다시 올라오면(새 학기 [필독]) 수정으로 저장하고 등록일과 ttl도 새로 씁니다. 경영대학처럼 번호에 쉼표가 있는 행("2,157")도 일반 글로 읽습니다.
 - 한 게시판이 빈 목록을 주면 그 게시판만 건너뛰고, 한 바퀴(그 서버의 게시판 수만큼, E3는 위젯까지) 내내 빈 목록이면 서버를 쉬게 합니다. 게시판 하나의 404·리디렉트·바뀐 화면은 서버를 쉬게 하지 않고 그 게시판만 2시간 → 4시간 → … 최대 24시간 쉽니다.
-- kwsports는 2024년 글 3개뿐이고 kwgame도 글이 5개라 거의 바뀌지 않습니다. 자율전공학부(liberal)와 job.kw.ac.kr 게시판은 아직 넣지 않았습니다.
+- 게시판을 더해도 요청 수는 그대로입니다(서버마다 실행당 1회, 하루 31회 + 여유 1회 = 32회). 늘어나는 것은 게시판마다 다시 읽는 간격뿐이고, 공지 본문 읽기(extract.py)의 몫도 그대로 하루 상한에서 남은 실행 수를 뺀 만큼입니다.
+- kwsports는 2024년 글 3개뿐이고 kwgame도 글이 5개라 거의 바뀌지 않습니다(E3 차례를 줄이려면 이 둘부터 뺄 만합니다).
+- 넣지 않은 곳: 건축공학과 자료실(마지막 글이 2025-03 졸업논문 합본이고 2026-10 글은 제목 없는 광고), 지능형로봇학과(share.kw.ac.kr, `table.tbl-noti`라 지금 읽기 방식에 맞지 않음), 경영대학 첫 화면 위젯(이미 읽는 biz 공지 게시판 글로 연결되고 목록 모양이 다름), 현장실습(robots.txt가 `/index.do`만 허용하고 그 첫 화면은 다른 모양), 산학협력단(`type=view&uid` 게시판), 경력개발팀 채용정보(robots.txt가 `/recommend/`를 막음), 광운대신문 RSS(Wix 피드가 아님).
 - 저장: 게시판마다 `SRC#dept-<키>`(예: `SRC#dept-ee`). 글 번호는 `dept-ee-<UID>`, 분류와 부서는 학과·단과대 이름입니다(별칭 "전정대", "인사대", "경영대", "참빛", "인제니움"). 첫 수집은 기준점만 저장합니다(알림 없음).
 - 알림: 분류 `dept-<키>` → 채널 키 `department`(없으면 학교-공지). 구독 역할은 단과대 단위입니다(`routing.COLLEGE_OF`, 예: `경영대학 알림`).
+- 학교 부서·사업단 게시판(`office=True`)은 분류가 `office-<키>`이고 학과로 치지 않습니다. 채널은 `routing.CATEGORY_TO_CHANNEL`: 경력개발팀 → 취업, 국제처 유학생 → 국제, 반도체특성화대학사업단·HUSS 사업단·일반대학원 → 학사, 한국어교육센터·인권센터·대학혁신사업단·창업지원단 → 학교-공지(일반). 이 게시판들은 긴급 역할을 울리지 않습니다.
+- 게시판이 따로 없는 학부(정보융합학부·컴퓨터정보공학부·소프트웨어학부·로봇학부·경영학부·국제통상학부)를 분류로 주면 단과대 게시판에서 그 학부 글과 단과대 전체 글만 돌려줍니다(`kw_mcp.combined.COLLEGE_OF_DEPARTMENT`). 같은 글이 단과대 전체와 그 학부로 함께 올라오면 학부 쪽 글을 돌려줍니다.
 
 ## 학과 블로그 피드 (Wix)
 
@@ -149,7 +153,7 @@ uv run --with 'botocore[crt]' python scripts/discord_setup.py --department-chann
 uv run --with 'botocore[crt]' python scripts/discord_setup.py --department-channel --apply   # 적용
 ```
 
-`--apply`가 하는 일: 구독 역할 만들기(권한 없음, 멤버는 멘션 불가) → #알림-설정 만들기(`--department-channel`이면 #학과-공지도) → 채널 권한 설정 → SSM `/kw/discord/roles` 쓰기 → 버튼 메시지 올리기/고치기(새 메시지면 그 ID를 다시 씀) → `--department-channel`이면 `/kw/discord/channels`에 `department` 추가. `--region`의 기본값은 `ap-northeast-2`입니다.
+`--apply`가 하는 일: 구독 역할 만들기(권한 없음, 멤버는 멘션 불가) → #알림-설정 만들기(`--department-channel`이면 #학과-공지도) → 채널 권한 설정 → #운영 권한 맞추기(아래 '운영') → SSM `/kw/discord/roles` 쓰기 → 버튼 메시지 올리기/고치기(새 메시지면 그 ID를 다시 씀) → `--department-channel`이면 `/kw/discord/channels`에 `department` 추가, #운영을 찾았으면 `ops` 추가 → `/제보`·`/설치`와 운영자용 `/초대회수`·`/초대현황` 등록. `--region`의 기본값은 `ap-northeast-2`입니다.
 
 처음 켤 때 순서:
 1. `cdk deploy` 뒤 출력 `DiscordInteractionsUrl`을 확인합니다.
@@ -168,6 +172,30 @@ uv run --with 'botocore[crt]' python scripts/discord_setup.py --department-chann
 
 @everyone 역할에 `@everyone, @here, 모든 역할 멘션하기`가 켜져 있으면 멤버 누구나 구독 역할을 멘션해 구독자 전원을 부를 수 있습니다. 끄는 것을 권합니다. 봇은 공지 채널에서 따로 허용받아 영향이 없습니다. 끄는 건 `--apply` 뒤에 합니다. 봇은 자기에게 있는 권한만 채널에 줄 수 있어서, 먼저 끄면 공지 채널의 봇 멘션 허용을 설정하지 못합니다.
 
+## 운영
+
+운영 분류 안의 비공개 채널 #운영에 두 가지가 올라옵니다. `discord_setup.py --apply`가 이 채널을 이름으로 찾아 봇에 보기·보내기·링크 첨부·기록 보기를 주고, @everyone에게는 숨긴 채로 두고, ID를 `/kw/discord/channels`의 `ops`에 씁니다. 채널을 만들지는 않습니다. 두 함수 모두 Discord 큐에 `ops` 작업을 넣고 sender가 #운영에만 올립니다(멘션 없음).
+
+- **아침 점검** (`kw-opsdigest`, 평일 08:40): 전날(월요일에는 금~일)을 숫자로만 보여 줍니다. 공지 제목·멤버·초대 코드는 넣지 않고, 이름은 게시판·서버·알람 이름만 씁니다.
+  - 괜찮으면 한 줄: `✅ 어제 이상 없음 · 새 공지 12 · 초대 3`
+  - 아니면 `⚠️ 어제 확인할 게 있어요` 아래에 게시판(꺼짐·잠시 멈춤·한동안 새 글 없음·새 공지), 공지 읽기(완료·실패·한도로 미룸), 디스코드(대기·실패·재시도), 초대(그 기간·전체), 켜진 `kw-*` 알람. 못 읽은 항목은 `확인 못 함`.
+  - '한동안 새 글 없음'은 메인 게시판 3일, 취업게시판 7일, 나머지 21일 기준이고 FAQ는 보지 않습니다.
+- **규정 변경 감시** (`kw-rulewatch`, 월요일 09:00): 학칙·학칙 시행세칙·다전공 내규 2개·조기졸업 규정은 rule.kw.ac.kr의 최신 `SEQ_HISTORY`로, 학사안내·장학 페이지 9개(bachelor_info01·03·07·08·11·12, summary, scholarship01·02)는 본문 해시로 봅니다. 바뀌면 `📘 학칙이 바뀌었어요 (2026.10.28 → 2026.11.20) · <링크> · 지식베이스 다시 만들기 필요`가 올라옵니다.
+  - 처음 본 페이지는 기록만 합니다(kw-public `RULEWATCH#<id>`). 못 읽은 페이지는 그대로 두고 `kw-collector-needs-human`이 울립니다.
+  - 수집기와 같은 서버별 게이트, robots 기록, `/kw/collector/enabled` 스위치를 씁니다. www는 그날 목록 수집에 쓰고 남는 몫만 써서, 못 본 페이지는 다음 주에 먼저 봅니다.
+- **운영자 명령**: 서버 관리 권한이 있는 사람에게만 보이고, 처리할 때도 권한을 다시 확인합니다. 어느 채널에서나 쓸 수 있고 답은 쓴 사람에게만 보입니다.
+  - `/초대회수 member:@멤버`: 그 멤버가 디스코드에서 받은 초대 코드를 모두 회수합니다. 그 코드로 연결한 PC와 커넥터는 1분 안에 끊깁니다. 멤버의 한도(3개)는 쓴 채로 남아 새 코드를 받지 못합니다.
+  - `/초대현황`: 오늘·전체 초대 수와 한도(한 사람당 3개, 하루 50개).
+
+### 초대를 DynamoDB 한 곳으로 옮기기
+
+손으로 만든 초대(SSM `/kw/mcp/tokens`)와 디스코드에서 받은 초대(kw-bridge `INVITE#`)를 kw-bridge 하나로 모읍니다.
+1. `uv run python scripts/invites_admin.py migrate`로 계정·테이블 ARN과 숫자를 보고 `--apply --expect-account <계정ID>`로 옮깁니다. 목록의 해시마다 `INVITE#<hash>`(issued_to·source `manual`)가 생기고, 그 초대의 PC 수(`devices`)는 그대로입니다. 다시 돌려도 바뀌는 것이 없습니다. 전체 초대 수(`DINVITES#total`)도 이때 맞춥니다. SSM 목록이 비었거나 없으면 아무것도 쓰지 않고 멈춥니다.
+2. `cdk deploy -c invitesSsm=0`으로 배포합니다. Bridge·PublicMcp에 `KW_INVITES_SSM=0`이 붙어 SSM 목록을 읽지 않고, `/kw/mcp/tokens` 읽기 권한도 빠집니다. 되돌리려면 플래그 없이 다시 배포합니다. 이 배포 전까지는 옮긴 초대도 SSM 목록에 있어야 살아 있어서, 목록에서 해시를 빼면 예전처럼 회수됩니다.
+3. 일주일쯤 문제가 없으면 소유자 확인을 받고 `aws ssm delete-parameter --region ap-northeast-2 --name /kw/mcp/tokens`로 지운 뒤, `infra/cdk.json`의 context에 `"invitesSsm": "0"`을 넣어 둡니다. **목록을 지운 뒤 플래그 없이 배포하면 손으로 만든 초대가 모두 끊깁니다.**
+
+그 뒤 손으로 만든 초대 하나를 회수할 때는 `scripts/invites_admin.py revoke --hash <sha256>`(계획만) → `--apply --expect-account <계정ID>`를 씁니다. 2번 배포 전이라면 SSM 목록에서도 빼야 끊깁니다(명령이 알려 줌).
+
 ## 스위치와 비밀값 (SSM, CDK가 만들지 않음)
 
 | 파라미터 | 의미 |
@@ -175,10 +203,10 @@ uv run --with 'botocore[crt]' python scripts/discord_setup.py --department-chann
 | `/kw/collector/enabled` | `true`일 때만 수집. 없으면 꺼짐 |
 | `/kw/collector/notify` | `true`일 때만 Discord 전송. 없으면 꺼짐 |
 | `/kw/discord/bot-token` | 봇 토큰 (SecureString). 본인이 직접 넣음 |
-| `/kw/discord/channels` | `{"notice": "<채널ID>", "academic": ..., "scholarship": ..., "career": ..., "international": ..., "department": ...}` (`department`는 선택) |
+| `/kw/discord/channels` | `{"notice": "<채널ID>", "academic": ..., "scholarship": ..., "career": ..., "international": ..., "department": ..., "ops": ...}` (`department`는 선택, `ops`는 `discord_setup.py`가 #운영을 찾아 씀) |
 | `/kw/discord/public-key` | Discord 앱의 공개키(Ed25519, 16진수). 버튼 요청 서명 확인용. 본인이 직접 넣음 |
 | `/kw/discord/roles` | `scripts/discord_setup.py`가 씀: `{"guild": ..., "roles": {주제: 역할ID}, "menu": {"channel", "message"}}` |
-| `/kw/mcp/tokens` | 초대·공개 MCP 토큰의 SHA-256 해시 목록 (JSON 배열) |
+| `/kw/mcp/tokens` | 초대·공개 MCP 토큰의 SHA-256 해시 목록 (JSON 배열). `invitesSsm=0`으로 배포한 뒤로는 읽지 않음(위 '초대를 DynamoDB 한 곳으로 옮기기') |
 | `/kw/bridge/jwt-secret` | 액세스 토큰 서명 키 (SecureString) |
 
 bridge 비밀값은 값이 화면에 나오지 않게 한 번만 만듭니다.
@@ -211,6 +239,8 @@ bridge Lambda에는 kw-mcp의 서명된 릴리스가 그대로 들어갑니다(K
 3. 아래처럼 `cdk deploy`로 배포합니다.
 
 PC 에이전트는 `latest.json`을 보고 스스로 업데이트하므로, 에이전트를 바꿨다면 kw-mcp의 version을 꼭 올려 새로 릴리스하세요(같은 버전이면 아무도 받지 않음).
+
+**데이터만 바꿀 때** (학사 안내 지식베이스, 졸업·다전공 규칙): kw-mcp에서 `scripts/release.sh data` → 여기서 `./scripts/build_lambda.sh` → `cdk deploy`. `build_lambda.sh`는 `../kw-mcp/dist/data`가 있으면 `kw_mcp.release check-data`(서명·해시)를 통과해야 번들에 넣고, 없으면 전처럼 빌드합니다. 연결 서버는 `/dist/data/`에서 `data.json`과 거기 적힌 파일만 내려 주고, 자기 `school_guide`·`department_curriculum`도 이 자료를 씁니다(`run.sh`가 `KW_DATA_DIR` 설정).
 
 ```bash
 cd infra

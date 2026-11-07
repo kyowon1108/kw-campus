@@ -31,6 +31,10 @@ PAGES_SCHEDULE = "cron(10/20 9-18 ? * MON-FRI *)"
 CAMPUS_SCHEDULE = "cron(30 7 ? * MON-FRI *)"
 # Weekdays 08:30 KST: D-3 / D-1 reminders under announced notices (reminders.py).
 REMIND_SCHEDULE = "cron(30 8 ? * MON-FRI *)"
+# Weekdays 08:40 KST: the ops digest in #운영 (opsdigest.py).
+OPS_DIGEST_SCHEDULE = "cron(40 8 ? * MON-FRI *)"
+# Mondays 09:00 KST: have the regulations or the 학사안내 pages changed? (rulewatch.py)
+RULE_WATCH_SCHEDULE = "cron(0 9 ? * MON *)"
 # Per-route limits on the bridge (requests/s, burst). Each route here has its own bucket; everything
 # else (the pages and downloads, junk paths) shares the stage default of 10/20. Signup-like routes get much
 # less. /mcp has its own bucket, so junk on other paths can't crowd out the connectors. Agents'
@@ -68,6 +72,9 @@ class KwCampusStack(cdk.Stack):
     def __init__(self, scope: Construct, cid: str, *, asset_path: str, alarm_email: str | None = None, **kwargs):
         super().__init__(scope, cid, **kwargs)
         ssm_arn = f"arn:aws:ssm:{self.region}:{self.account}:parameter"
+        # -c invitesSsm=0 once scripts/invites_admin.py migrate has run: invites live in kw-bridge only
+        # (KW_INVITES_SSM=0 on the functions that check them) and nothing may read /kw/mcp/tokens any more.
+        invites_ssm = str(self.node.try_get_context("invitesSsm")).strip() != "0"
 
         # deletion_protection: RETAIN only covers stack deletes; this also refuses a console or CLI
         # delete-table, which nothing could undo (none of the tables has point-in-time recovery).
@@ -159,6 +166,15 @@ class KwCampusStack(cdk.Stack):
         campus = fn("Campus", "kwcampus.campus.handler", 150, retries=0)
         reminders = fn("Reminders", "kwcampus.reminders.handler", 60, {"KW_DISCORD_QUEUE_URL": queue.queue_url},
                        retries=0)
+        # #운영: the morning digest (counts only) and the weekly regulation / 학사안내 change watcher. Both put
+        # "ops" jobs on the Discord queue; the sender posts them, so neither holds a Discord secret.
+        ops_digest = fn("OpsDigest", "kwcampus.opsdigest.handler", 60, {
+            "KW_DISCORD_QUEUE_URL": queue.queue_url, "KW_DISCORD_DLQ_URL": dlq.queue_url,
+            "KW_BRIDGE_TABLE": bridge_table.table_name}, retries=0)
+        # Up to 14 pages a minute apart per server (regulations, then www): about 10 minutes at most.
+        # 512 MB for parsing the 1.2 MB 다전공 page. retries=0: a failed run waits for next Monday.
+        rule_watch = fn("RuleWatch", "kwcampus.rulewatch.handler", 900, {"KW_DISCORD_QUEUE_URL": queue.queue_url},
+                        memory=512, retries=0, max_event_age=cdk.Duration.minutes(5))
         lwa = lambda_.LayerVersion.from_layer_version_arn(self, "LwaLayer", LWA_LAYER)
         web_env = {"AWS_LAMBDA_EXEC_WRAPPER": "/opt/bootstrap", "AWS_LWA_PORT": "8080",
                    "AWS_LWA_READINESS_CHECK_PATH": "/healthz"}
@@ -208,6 +224,43 @@ class KwCampusStack(cdk.Stack):
         reminders.add_to_role_policy(iam.PolicyStatement(
             actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/collector/notify"]))
 
+        # ops digest: only what the message counts. kw-public: the gate and source state rows and the notices'
+        # first_seen (ORIGIN#*, SRC#*); kw-bridge: the invite counters (DINVITES#*); the two Discord queues'
+        # sizes and one send to the first; the KwCampus metrics and the kw-* alarms. No SSM, no table writes.
+        ops_digest.add_to_role_policy(iam.PolicyStatement(
+            actions=["dynamodb:GetItem"], resources=[public.table_arn],
+            conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["ORIGIN#*", "SRC#*"]}}))
+        # The notices' Query may return only what opsdigest.QUERY_ATTRIBUTES projects (no titles). AWS wants
+        # the key attributes in dynamodb:Attributes too: the key condition names them.
+        ops_digest.add_to_role_policy(iam.PolicyStatement(
+            actions=["dynamodb:Query"], resources=[public.table_arn],
+            conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["SRC#*"]},
+                        "ForAllValues:StringEquals": {"dynamodb:Attributes": [
+                            "PK", "SK", "first_seen", "seed", "removed"]},
+                        "StringEqualsIfExists": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"}}))
+        ops_digest.add_to_role_policy(iam.PolicyStatement(
+            actions=["dynamodb:GetItem"], resources=[bridge_table.table_arn],
+            conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["DINVITES#*"]}}))
+        ops_digest.add_to_role_policy(iam.PolicyStatement(
+            actions=["sqs:GetQueueAttributes"], resources=[queue.queue_arn, dlq.queue_arn]))
+        ops_digest.add_to_role_policy(iam.PolicyStatement(actions=["sqs:SendMessage"], resources=[queue.queue_arn]))
+        # GetMetricData takes no resource (AWS offers none for it); the alarms are the kw-* ones
+        ops_digest.add_to_role_policy(iam.PolicyStatement(actions=["cloudwatch:GetMetricData"], resources=["*"]))
+        ops_digest.add_to_role_policy(iam.PolicyStatement(
+            actions=["cloudwatch:DescribeAlarms"],
+            resources=[f"arn:aws:cloudwatch:{self.region}:{self.account}:alarm:kw-*"]))
+
+        # rule watcher: the collectors' gate rows (ORIGIN#*) and its own state (RULEWATCH#*) in kw-public, the
+        # collectors' kill switch, and one send to the Discord queue
+        # ORIGIN# rows of the two servers it asks (rulewatch.RULE_HOST, kwnotice NOTICE_HOST) only
+        rule_watch.add_to_role_policy(iam.PolicyStatement(
+            actions=["dynamodb:GetItem", "dynamodb:UpdateItem"], resources=[public.table_arn],
+            conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": [
+                "ORIGIN#rule.kw.ac.kr", "ORIGIN#www.kw.ac.kr", "RULEWATCH#*"]}}))
+        rule_watch.add_to_role_policy(iam.PolicyStatement(
+            actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/collector/enabled"]))
+        rule_watch.add_to_role_policy(iam.PolicyStatement(actions=["sqs:SendMessage"], resources=[queue.queue_arn]))
+
         # Discord buttons (#알림-설정): its own function and API, reads only the three parameters it
         # needs, and touches only the invite rows of kw-bridge (granted below, next to the bridge whose
         # address its invites carry). Discord must get an answer within 3 s.
@@ -233,8 +286,11 @@ class KwCampusStack(cdk.Stack):
         # public MCP: read-only on kw-public, its own token list, and one look at an invite row each
         # (a Discord-issued invite is a token too: invites.check)
         public.grant_read_data(public_mcp)
-        public_mcp.add_to_role_policy(iam.PolicyStatement(
-            actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/mcp/*"]))
+        if invites_ssm:
+            public_mcp.add_to_role_policy(iam.PolicyStatement(
+                actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/mcp/*"]))
+        else:
+            public_mcp.add_environment("KW_INVITES_SSM", "0")
         public_mcp.add_to_role_policy(iam.PolicyStatement(
             actions=["dynamodb:GetItem"], resources=[bridge_table.table_arn],
             conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["INVITE#*"]}}))
@@ -260,15 +316,18 @@ class KwCampusStack(cdk.Stack):
         # Capped, so a flood on the bridge can't take the concurrency the collector and Discord need.
         bridge_app_env = {**web_env, **bridge_env, "KW_APP": "kwcampus.bridge.app:app",
                           "KW_BRIDGE_BASE_URL": bridge_api.api_endpoint}
+        if not invites_ssm:
+            bridge_app_env["KW_INVITES_SSM"] = "0"
         bridge = fn("Bridge", "run.sh", 30, memory=512, layers=[lwa], concurrency=BRIDGE_CONCURRENCY, extra_env={
             **bridge_app_env, "KW_BRIDGE_WS_URL": ws_stage.url, "KW_BRIDGE_WS_MGMT": ws_stage.callback_url,
         })
         bridge_table.grant_read_write_data(bridge)
         public.grant_read_data(bridge)
         ws_stage.grant_management_api_access(bridge)
-        # Only what it reads: the JWT secret and the hand-made invite list (invites.TOKENS_PARAM).
+        # Only what it reads: the JWT secret and, until invitesSsm=0, the hand-made invite list (invites.TOKENS_PARAM).
         bridge.add_to_role_policy(iam.PolicyStatement(
-            actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/bridge/jwt-secret", f"{ssm_arn}/kw/mcp/tokens"]))
+            actions=["ssm:GetParameter"], resources=[f"{ssm_arn}/kw/bridge/jwt-secret",
+                                                     *([f"{ssm_arn}/kw/mcp/tokens"] if invites_ssm else [])]))
         # Discord buttons hand out invites for this bridge: INVITE# rows, the member's DMEMBER# row and the
         # day's DINVITES# count only (invites.issue: one transaction of Updates, authorised per Update).
         interactions.add_environment("KW_BRIDGE_TABLE", bridge_table.table_name)
@@ -313,8 +372,14 @@ class KwCampusStack(cdk.Stack):
         collector.grant_invoke(schedule_role)
         campus.grant_invoke(schedule_role)
         reminders.grant_invoke(schedule_role)
+        ops_digest.grant_invoke(schedule_role)
+        rule_watch.grant_invoke(schedule_role)
         for construct_id, name, expression, target in (("CampusSchedule", "kw-campus-tick", CAMPUS_SCHEDULE, campus),
-                                                       ("RemindSchedule", "kw-remind-tick", REMIND_SCHEDULE, reminders)):
+                                                       ("RemindSchedule", "kw-remind-tick", REMIND_SCHEDULE, reminders),
+                                                       ("OpsDigestSchedule", "kw-ops-digest", OPS_DIGEST_SCHEDULE,
+                                                        ops_digest),
+                                                       ("RuleWatchSchedule", "kw-rule-watch", RULE_WATCH_SCHEDULE,
+                                                        rule_watch)):
             scheduler.CfnSchedule(
                 self, construct_id,
                 name=name,
@@ -369,6 +434,9 @@ class KwCampusStack(cdk.Stack):
             alarm(f"{f.node.id.lower()}-errors", f.metric_errors(period=five_min))
         for f in (collector, bridge, bridge_result, interactions):
             alarm(f"{f.node.id.lower()}-throttles", f.metric_throttles(period=five_min))
+        # the #운영 functions: a digest or a watch run that failed (the digest then never arrives)
+        for f in (ops_digest, rule_watch):
+            alarm(f"{f.node.id.lower()}-errors", f.metric_errors(period=five_min))
         # 5xx answers that never raise in the function (adapter or integration failures, timeouts)
         for name, http_api in (("bridge", bridge_api), ("public-api", api), ("discord-api", discord_api)):
             alarm(f"{name}-5xx", http_api.metric_server_error(period=five_min), threshold=3)

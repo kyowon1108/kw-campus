@@ -8,12 +8,18 @@
 # release cut from other code than the kw-mcp tree next to it: the kw-campus tests import that tree,
 # while the bundle gets the released wheel, so the two must be the same code for the tests to count.
 #
+# A kw-mcp data release (`scripts/release.sh data` writes dist/data/: knowledge base and rules files with a
+# signed data.json), if there is one, goes in too: checked against the release key the same way, or the
+# build stops. The bridge serves it at /dist/data/ and reads it itself (run.sh sets KW_DATA_DIR). Without
+# dist/data the build is as before.
+#
 # Everything is built in build/lambda.tmp and moved into place at the end: a failed build leaves the
 # last good build/lambda untouched.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 KW_MCP_DIR="${KW_MCP_DIR:-../kw-mcp}"
 RELEASE="$KW_MCP_DIR/dist/release"
+DATA_RELEASE="$KW_MCP_DIR/dist/data"
 OUT=build/lambda
 TMP=build/lambda.tmp
 
@@ -23,6 +29,10 @@ if [ ! -f "$RELEASE/latest.json" ]; then
 fi
 # Signatures (wheel, constraints, extension) against kw_mcp.release.PUBLIC_KEY, and every file's hash.
 uv run --project "$KW_MCP_DIR" --frozen --quiet python -m kw_mcp.release check "$RELEASE"
+# The data release's data.json against the same key, every listed file's size and hash, nothing unlisted.
+if [ -f "$DATA_RELEASE/data.json" ]; then
+  uv run --project "$KW_MCP_DIR" --frozen --quiet python -m kw_mcp.release check-data "$DATA_RELEASE"
+fi
 # The released version is the tree's pyproject.toml version, and the wheel's kw_mcp code and data
 # (*.py, and the rules/knowledge *.json) equal the tree's src/kw_mcp byte for byte (the comparison
 # release.sign_mcpb makes for the extension).
@@ -72,6 +82,10 @@ STATIC="$TMP/lambda/kwcampus/bridge/static"
 mkdir -p "$STATIC"
 cp "$RELEASE/$WHEEL" "$RELEASE/$CONSTRAINTS" "$RELEASE/$MCPB" "$RELEASE/latest.json" "$STATIC/"
 uv run --project "$KW_MCP_DIR" --frozen --quiet python -m kw_mcp.release check "$STATIC" >/dev/null
+if [ -f "$DATA_RELEASE/data.json" ]; then
+  mkdir -p "$STATIC/data" && cp -R "$DATA_RELEASE/." "$STATIC/data/"
+  uv run --project "$KW_MCP_DIR" --frozen --quiet python -m kw_mcp.release check-data "$STATIC/data" >/dev/null
+fi
 find "$TMP/lambda" -name '__pycache__' -prune -exec rm -rf {} +
 # anthropic: the collector's notice extraction (kwcampus/extract.py) imports it; pypdf and olefile (kw-mcp's
 # dependencies, in the export above) read the attachments of notices in the page runs

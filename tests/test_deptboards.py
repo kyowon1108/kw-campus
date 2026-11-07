@@ -169,9 +169,83 @@ def test_b_group_boards_read_admin_mode_links():
 
 def test_every_new_board_is_a_department_category():
     for b in deptboards.BOARDS:
-        assert routing.CATEGORY_LABEL[b.category_id] == b.name and routing.channel_for(b.category_id) == "department"
+        assert routing.CATEGORY_LABEL[b.category_id] == b.name
+        if b.office:  # a school office's or program's own board: a channel of its own, never 학과
+            assert b.category_id == f"office-{b.key}" and routing.channel_for(b.category_id) != "department"
+        else:
+            assert b.category_id == f"dept-{b.key}" and routing.channel_for(b.category_id) == "department"
     assert len({b.key for b in deptboards.BOARDS}) == len(deptboards.BOARDS)
     assert {b.key for b in deptboards.BOARDS}.isdisjoint({f.key for f in wixfeeds.FEEDS} | {"aicon"})
+    assert all(b.key.isascii() and b.key.isalpha() and b.key.islower() for b in deptboards.BOARDS)  # kw-mcp's post ids
+
+
+# Saved from each board's list page on 2026-11-07 (public pages, the URL list_url asks for; job.kw.ac.kr
+# has no BOARD_CODE), cut down to a few real rows each; writers are 관리자 or masked by the sites.
+NEW_BOARDS = {  # key -> (pinned and normal rows as (uid, pinned, date), first title)
+    "career": ([("12631", True, "2026-11-05"), ("12624", True, "2026-11-04"), ("12599", False, "2026-10-29"),
+                ("12593", False, "2026-10-28")], "[캠퍼스리크루팅] 2026년 하반기 남해화학 채용설명회_11/9"),
+    "startup": ([("474", True, "2026-11-05"), ("473", True, "2026-11-05"), ("466", False, "2026-10-22"),
+                 ("463", False, "2026-10-21")], "[동대문문화재단] 「회사는 영원하지 않다, '홀로서기'를 준비할 때!」 특강 홍보"),
+    "electricjob": ([("901", True, "2026-11-04"), ("862", True, "2026-08-31"), ("891", False, "2026-10-06"),
+                     ("887", False, "2026-09-30")], "2026 광운대학교 취업박람회 개최 안내"),
+    # pinned rows served as loose cells without <tr>, like 법학부
+    "kwiie": ([("155", True, "2026-08-28"), ("127", True, "2025-07-08"), ("168", False, "2026-11-05"),
+               ("166", False, "2026-10-27")],
+              "⭐2026 겨울학기 정규과정 온라인 접수 안내 / 2026 Winter Regular Course online application guide"),
+    # every pinned row comes again as a numbered row: read once, as pinned
+    "humanrights": ([("29", True, "2026-10-16"), ("26", True, "2026-05-12"), ("28", False, "2026-09-08"),
+                     ("27", False, "2026-07-30")],
+                    "[인권센터 특강 - 기프티콘 제공] 보내기 전에 10초! : AI · SNS시대, 나와 타인의 디지털 경계를 지키는 법 New"),
+    "oia": ([("1022", True, "2026-11-06"), ("1006", True, "2026-09-22"), ("1010", False, "2026-10-07"),
+             ("1009", False, "2026-10-06")], "2026-2 글로벌 외국인 잡페어 안내"),
+    # 8 columns (연구소명, 연구소장, 설립일 left empty): the title and date are found by their headers
+    "grad": ([("71015", True, "2026-09-29"), ("71011", True, "2026-09-15"), ("71019", False, "2026-10-21"),
+              ("71014", False, "2026-09-17")], "[졸업] 2026학년도 2학기 석사과정 학위논문 제출 면제 신청 안내"),
+    "liberal": ([("100", True, "2026-11-05"), ("97", True, "2026-10-01"), ("88", False, "2026-06-04"),
+                 ("86", False, "2026-05-27")], "[경력개발팀]2026 광운대학교 취업박람회 개최 안내"),
+    "semi": ([("525", True, "2026-09-11"), ("389", True, "2026-05-26"), ("548", False, "2026-10-27"),
+              ("542", False, "2026-10-13")], "이수활동 및 증서 자동 발신 기능 안내"),
+    "huss": ([("332", True, "2026-11-05"), ("331", True, "2026-11-02"), ("318", False, "2026-10-06"),
+              ("316", False, "2026-09-28")],
+             "2026학년도 동계 계절학기 인문사회융합인재양성사업단 학점 교류 안내(국립순천대, 전주대)"),
+    "inno": ([("141", False, "2026-11-05"), ("140", False, "2026-11-04"), ("136", False, "2026-10-16")],
+             "[모집] 대학혁신지원사업 참여학생 사례영상 경진대회(총괄협의회)"),
+}
+
+
+def test_the_boards_added_in_1_2_parse_with_the_a_group_reader():
+    assert set(NEW_BOARDS) <= set(BOARD)
+    for key, (expected, title) in NEW_BOARDS.items():
+        board = BOARD[key]
+        rows = deptboards.parse_board((FIXTURES / f"dept_{key}_list.html").read_text(), board)
+        assert [(r.duid, r.pinned, r.posted_date.isoformat()) for r in rows] == expected, key
+        assert rows[0].title == title and rows[0].department == board.name, key
+        assert rows[0].category_id == board.category_id and rows[0].source_url == board.post_url(expected[0][0]), key
+        assert board.post_url("7") == f"https://{board.host}{board.path}?BoardMode=view&UID=7"
+        assert politeness.robots_allows(board.list_url), key
+    assert BOARD["career"].list_url == "https://job.kw.ac.kr/community/notice.php"  # no BOARD_CODE: pages by ?tpage=
+    assert BOARD["oia"].list_url == "https://oia.kw.ac.kr/campus/notice.php?BoardMode=list&BOARD_CODE=note&CURRENT_PAGE=1"
+    assert (BOARD["electricjob"].name, BOARD["electricjob"].category_id) == ("전기공학과", "dept-electricjob")
+    assert {b.server for b in (BOARD["semi"], BOARD["huss"], BOARD["inno"], BOARD["liberal"])} == {deptboards.SERVER_E3}
+    assert {b.server for b in (BOARD["kwiie"], BOARD["humanrights"], BOARD["oia"], BOARD["grad"])} == {deptboards.SERVER_E2}
+    assert {b.server for b in (BOARD["career"], BOARD["startup"], BOARD["electricjob"])} == {deptboards.SERVER_E1}
+
+
+def test_an_office_board_seeds_and_announces_in_its_own_channel(aws, monkeypatch):
+    oia = BOARD["oia"]
+    monkeypatch.setattr(deptboards, "BOARDS", (oia,))
+    table, html = aws["public"], (FIXTURES / "dept_oia_list.html").read_text()
+    first = deptboards.collect(NOW, table, fetch=page(html))[deptboards.SERVER_E2]
+    assert first["board"] == "oia" and first["seed_run"] is True and first["inserted"] == 4
+    newer = html.replace("UID=1010&", "UID=1030&").replace("2026-10-07", "2026-11-05")
+    deptboards.collect(NOW + timedelta(minutes=20), table, fetch=page(newer))
+    new = notices(table, "dept-oia")["1030"]
+    assert new["seed"] is False and new["category_id"] == "office-oia" and new["department"] == "국제처 유학생"
+    assert routing.channel_for(new["category_id"]) == "international" and not routing.urgent_source("office-oia")
+    public_data.clear_cache()
+    assert "dept-oia-1030" in {r["post_id"] for r in public_data.latest(table, "유학생", 50)}
+    assert {r["category"] for r in public_data.latest(table, "국제처", 50)} == {"국제처 유학생"}
+    assert public_data.latest(table, "학과", 50) == []  # not a department board
 
 
 def test_seeds_quietly_then_treats_higher_uids_as_new(aws, monkeypatch):
@@ -234,13 +308,15 @@ def test_one_request_to_the_server_per_run_round_robin(aws, monkeypatch):
 def test_each_server_gets_one_request_a_run_and_its_own_round(aws):
     table, calls = aws["public"], []
 
+    b_group = {b.list_url for b in deptboards.BOARDS if b.group == "B"}
+
     def fake(url, encoding="utf-8", errors="strict"):
         calls.append(url)
-        return FetchResult(EE_PAGE if "BoardMode=list" in url else SPORTS_PAGE, None, 200)
+        return FetchResult(SPORTS_PAGE if url in b_group else EE_PAGE, None, 200)
 
     rounds = {s: [b for b in deptboards.BOARDS if b.server == s] for s in dict.fromkeys(b.server for b in deptboards.BOARDS)}
-    assert {s: len(r) for s, r in rounds.items()} == {
-        deptboards.SERVER_E1: 8, deptboards.SERVER_E2: 8, deptboards.SERVER_E3: 5, deptboards.SERVER_E4: 2}
+    assert {s: len(r) for s, r in rounds.items()} == {  # the budget in deptboards' docstring
+        deptboards.SERVER_E1: 11, deptboards.SERVER_E2: 12, deptboards.SERVER_E3: 9, deptboards.SERVER_E4: 2}
     for run in range(8):
         out = deptboards.collect(NOW + timedelta(minutes=20 * run), table, fetch=fake)
         assert {s: r["status"] for s, r in out.items()} == dict.fromkeys(rounds, "ok")

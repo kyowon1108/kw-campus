@@ -116,6 +116,7 @@ INSTRUCTIONS = """\
 - 수강신청·휴학·졸업요건·다전공·장학·기숙사·학교 메일·와이파이·상담·현장실습·동아리 같은 학사·생활 질문은 school_guide로 먼저 찾으세요(PC 불필요).
   학과·학번별 교과목은 department_curriculum입니다. 답할 때 sources(규정·조항·URL)와 confidence를 밝히고,
   disagreement나 not_in_documents가 있으면 그대로 알리세요. 날짜와 이번 학기 변경은 공지로 확인하세요.
+- school_guide의 recent_notices가 있으면 그 공지의 마감·대상·링크를 먼저 말하고, 규정 안내는 그다음에 붙이세요.
 - 광운대 공지·학칙·장학 질문은 latest_notices·search_notices로 먼저 찾고 read_notice로 본문·첨부·이미지를 읽으세요.
   일반 웹 검색은 다른 학교 페이지가 섞이니 이 도구들에서 찾지 못했을 때만 쓰세요.
 - 도구 결과에 없는 광운대 규정·날짜·절차를 일반론이나 다른 학교 관행, 지난 학기 패턴으로 채우지 마세요.
@@ -138,9 +139,10 @@ def _jwt_secret() -> bytes:
 
 
 def _invite_alive(row: dict) -> bool:
-    """False once the invite this device (or grant) came in with is withdrawn: taken off the SSM
-    list, or revoked when Discord issued it (invites.hash_alive, cached a minute). Rows from before
-    invites were recorded have none and stay alive."""
+    """False once the invite this device (or grant) came in with is withdrawn (invites.hash_alive,
+    cached a minute): a hand-made one taken off the SSM list (also after migrate, until KW_INVITES_SSM=0;
+    from then on revoked on its INVITE# item with scripts/invites_admin.py revoke), a Discord-issued one
+    revoked (/초대회수). Rows from before invites were recorded have none and stay alive."""
     invite_hash = row.get("invite_hash")
     return not invite_hash or invites.hash_alive(str(invite_hash), store.table())
 
@@ -859,8 +861,34 @@ async def school_guide(question: str, category: str | None = None) -> dict[str, 
     계절학기, 수업·출석, 학적변동, 졸업, 다전공, 전과·전공배정, 학점교류·교환학생, 장학, 등록·등록금, 증명서·학생증,
     기숙사, 셔틀·교통, 도서관, 학식·편의시설, 병무·예비군, IT·계정, 상담·학생지원, 진로·취업, 동아리·학생자치, 기타).
     내 학점·이수 현황이 필요하면 my_graduation이나
-    my_graduation_outlook을, 이번 학기 날짜·변경은 search_notices를 함께 쓰세요."""
-    return knowledge.guide(question, category)
+    my_graduation_outlook을, 이번 학기 날짜·변경은 search_notices를 함께 쓰세요. 그 분야의 최근 공지가 있으면
+    recent_notices(제목·게시일·url·마감·대상·신청 방법)를 함께 줍니다. "unavailable"이면 공지를 확인하지 못한 것이에요."""
+    return _with_recent_notices(knowledge.guide(question, category))
+
+
+def _with_recent_notices(answer: dict[str, Any]) -> dict[str, Any]:
+    """The guide answer plus up to 3 school notices of the top answer's category (kw_mcp's
+    knowledge/notice_links.json), read here like search_notices: the ones whose deadline is still
+    ahead, else the newest of the last NOTICE_DAYS days. Any failure gives recent_notices "unavailable"."""
+    top = next(iter(answer.get("answers") or []), {}).get("category")
+    queries = knowledge.notice_queries(top)
+    if not queries:
+        return answer
+    today = _now().date()
+
+    def rows(open_only: bool = False, since: str | None = None) -> list[dict[str, Any]]:
+        return [r for q in queries
+                for r in public_http.search_notices(q.get("q", ""), q.get("category"), since, 5, open_only=open_only)]
+
+    try:
+        picked = knowledge.pick_notices(rows(open_only=True), today, open_only=True)
+        if not picked:
+            picked = knowledge.pick_notices(rows(since=(today - timedelta(days=knowledge.NOTICE_DAYS)).isoformat()),
+                                            today)
+    except Exception as e:  # noqa: BLE001 - notices are extra: the knowledge answer still goes out
+        log("school_guide_notices_unavailable", error=e.__class__.__name__)
+        return {**answer, "recent_notices": "unavailable"}
+    return {**answer, "recent_notices": picked, **({"recent_notices_note": knowledge.NOTICES_NOTE} if picked else {})}
 
 
 @mcp.tool(annotations=LOCAL_DATA)

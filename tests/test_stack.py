@@ -35,7 +35,7 @@ def route_targets(t: Template) -> dict[str, str]:
 
 def test_functions_and_tables(tmp_path):
     t = template(tmp_path)
-    t.resource_count_is("AWS::Lambda::Function", 10)  # kw-reminders added
+    t.resource_count_is("AWS::Lambda::Function", 12)  # kw-opsdigest and kw-rulewatch added
     t.resource_count_is("AWS::DynamoDB::Table", 3)
     t.has_resource_properties("AWS::DynamoDB::Table", {
         "TableName": "kw-public",
@@ -348,3 +348,111 @@ def test_collector_extracts_with_openai_and_has_room_for_images_and_files(tmp_pa
     variables = fn["Environment"]["Variables"]
     assert variables["KW_EXTRACT_PROVIDER"] == "openai" and "KW_EXTRACT_MODEL" not in variables  # gpt-5.4-mini
     assert fn["MemorySize"] == 512 and fn["Timeout"] == 150
+
+
+def _statements(t: Template, prefix: str) -> list[dict]:
+    return policy_of(t, prefix)["Properties"]["PolicyDocument"]["Statement"]
+
+
+def test_ops_digest_and_rule_watch_run_on_their_schedules(tmp_path):
+    t = template(tmp_path)
+    functions = {f["Properties"]["FunctionName"]: f["Properties"] for f in t.find_resources("AWS::Lambda::Function").values()}
+    digest, watch = functions["kw-opsdigest"], functions["kw-rulewatch"]
+    assert (digest["Handler"], digest["Timeout"]) == ("kwcampus.opsdigest.handler", 60)
+    assert (watch["Handler"], watch["Timeout"], watch["MemorySize"]) == ("kwcampus.rulewatch.handler", 900, 512)
+    assert set(digest["Environment"]["Variables"]) >= {"KW_DISCORD_QUEUE_URL", "KW_DISCORD_DLQ_URL", "KW_BRIDGE_TABLE"}
+    assert "KW_BRIDGE_TABLE" not in watch["Environment"]["Variables"]
+    schedules = {s["Properties"]["Name"]: s["Properties"] for s in t.find_resources("AWS::Scheduler::Schedule").values()}
+    for name, expression, fn in (("kw-ops-digest", "cron(40 8 ? * MON-FRI *)", "OpsDigest"),
+                                 ("kw-rule-watch", "cron(0 9 ? * MON *)", "RuleWatch")):
+        s = schedules[name]
+        assert s["ScheduleExpression"] == expression and s["ScheduleExpressionTimezone"] == "Asia/Seoul"
+        assert s["Target"]["RetryPolicy"] == {"MaximumRetryAttempts": 0}
+        assert s["Target"]["Arn"]["Fn::GetAtt"][0].startswith(fn)
+    t.has_resource_properties("AWS::Lambda::EventInvokeConfig", {"MaximumRetryAttempts": 0,
+                                                                 "MaximumEventAgeInSeconds": 300,
+                                                                 "FunctionName": {"Ref": Match.string_like_regexp(
+                                                                     "^RuleWatch")}})
+    alarms = {a["Properties"]["AlarmName"]: a["Properties"] for a in t.find_resources("AWS::CloudWatch::Alarm").values()}
+    for name in ("kw-opsdigest-errors", "kw-rulewatch-errors"):
+        assert alarms[name]["MetricName"] == "Errors" and alarms[name]["Threshold"] == 1
+
+
+def test_ops_digest_reads_only_what_it_counts(tmp_path):
+    t = template(tmp_path)
+    statements = _statements(t, "OpsDigestServiceRole")
+    public_arn = {"Fn::GetAtt": ["PublicD0AE4A11", "Arn"]}  # the table, no index
+    bridge_arn = {"Fn::GetAtt": ["BridgeTable91945A73", "Arn"]}
+    tables = [s for s in statements if "dynamodb" in str(s["Action"])]
+    assert tables == [
+        # the gate's and the sources' state rows
+        {"Action": "dynamodb:GetItem", "Effect": "Allow", "Resource": public_arn,
+         "Condition": {"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["ORIGIN#*", "SRC#*"]}}},
+        # the notices: first_seen, seed and removed only (the keys are named by the key condition)
+        {"Action": "dynamodb:Query", "Effect": "Allow", "Resource": public_arn,
+         "Condition": {"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["SRC#*"]},
+                       "ForAllValues:StringEquals": {"dynamodb:Attributes": ["PK", "SK", "first_seen", "seed", "removed"]},
+                       "StringEqualsIfExists": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"}}},
+        {"Action": "dynamodb:GetItem", "Effect": "Allow", "Resource": bridge_arn,
+         "Condition": {"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["DINVITES#*"]}}},
+    ]
+    # opsdigest.QUERY_ATTRIBUTES is checked against this list in test_opsdigest
+    by_action = {s["Action"]: s for s in statements if "dynamodb" not in str(s["Action"])}
+    assert set(by_action) == {"sqs:GetQueueAttributes", "sqs:SendMessage", "cloudwatch:GetMetricData",
+                              "cloudwatch:DescribeAlarms"}
+    queues = by_action["sqs:GetQueueAttributes"]["Resource"]
+    assert queues == [{"Fn::GetAtt": ["DiscordQueueF83490F5", "Arn"]}, {"Fn::GetAtt": ["DiscordDlq7CEACF49", "Arn"]}]
+    assert by_action["sqs:SendMessage"]["Resource"] == {"Fn::GetAtt": ["DiscordQueueF83490F5", "Arn"]}
+    assert by_action["cloudwatch:GetMetricData"]["Resource"] == "*"  # AWS has no resource for it
+    assert by_action["cloudwatch:DescribeAlarms"]["Resource"]["Fn::Join"][1][-1] == ":alarm:kw-*"
+    text = str(statements)
+    assert "ssm:" not in text and "PutItem" not in text and "UpdateItem" not in text and "Scan" not in text
+    assert "INVITE#" not in text and "DMEMBER#" not in text  # counters only, never an invite or a member
+
+
+def test_rule_watch_touches_only_the_gate_its_state_and_the_kill_switch(tmp_path):
+    t = template(tmp_path)
+    statements = _statements(t, "RuleWatchServiceRole")
+    by_action = {tuple(s["Action"]) if isinstance(s["Action"], list) else (s["Action"],): s for s in statements}
+    assert set(by_action) == {("dynamodb:GetItem", "dynamodb:UpdateItem"), ("ssm:GetParameter",),
+                              ("sqs:SendMessage",)}
+    table = by_action[("dynamodb:GetItem", "dynamodb:UpdateItem")]
+    assert table["Resource"] == {"Fn::GetAtt": ["PublicD0AE4A11", "Arn"]}
+    from kwcampus import rulewatch
+    from kwcampus.kwnotice.source import NOTICE_HOST
+
+    # the gate rows of the two servers it asks, and its own state: never another server's gate
+    assert table["Condition"] == {"ForAllValues:StringLike": {"dynamodb:LeadingKeys": [
+        f"ORIGIN#{rulewatch.RULE_HOST}", f"ORIGIN#{NOTICE_HOST}", "RULEWATCH#*"]}}
+    assert {w.url.split("/")[2] for w in rulewatch.WATCHES} == {rulewatch.RULE_HOST, NOTICE_HOST}
+    assert by_action[("ssm:GetParameter",)]["Resource"]["Fn::Join"][1][-1] == ":parameter/kw/collector/enabled"
+    assert by_action[("sqs:SendMessage",)]["Resource"] == {"Fn::GetAtt": ["DiscordQueueF83490F5", "Arn"]}
+    assert "BridgeTable" not in str(statements) and "/kw/discord" not in str(statements)
+
+
+def test_invites_ssm_off_drops_the_token_list_everywhere(tmp_path):
+    def ssm_resources(t: Template, prefix: str) -> list[str]:
+        out = []
+        for s in _statements(t, prefix):
+            if s["Action"] == "ssm:GetParameter":
+                resources = s["Resource"] if isinstance(s["Resource"], list) else [s["Resource"]]
+                out += [r["Fn::Join"][1][-1] for r in resources]
+        return sorted(out)
+
+    def variables(t: Template) -> dict[str, dict]:
+        return {f["Properties"]["FunctionName"]: f["Properties"]["Environment"]["Variables"]
+                for f in t.find_resources("AWS::Lambda::Function").values()}
+
+    on = template(tmp_path)
+    assert ssm_resources(on, "BridgeServiceRole") == [":parameter/kw/bridge/jwt-secret", ":parameter/kw/mcp/tokens"]
+    assert ssm_resources(on, "PublicMcpServiceRole") == [":parameter/kw/mcp/*"]
+    assert not any("KW_INVITES_SSM" in v for v in variables(on).values())
+
+    (tmp_path / "off").mkdir()
+    off = template(tmp_path / "off", context={"invitesSsm": "0"})  # cdk deploy -c invitesSsm=0
+    assert ssm_resources(off, "BridgeServiceRole") == [":parameter/kw/bridge/jwt-secret"]
+    assert ssm_resources(off, "PublicMcpServiceRole") == []
+    assert "/kw/mcp" not in str(off.to_json()["Resources"])
+    env = variables(off)
+    assert {name for name, v in env.items() if v.get("KW_INVITES_SSM") == "0"} == {
+        "kw-bridge", "kw-bridgeresult", "kw-publicmcp"}

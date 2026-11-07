@@ -94,8 +94,10 @@ class PoliteGate:
             extra = self.extra(now)
             if extract.spare(self.public, page, now) + extra < 1:
                 raise self.refused(f"{host}: 오늘 이 서버에 보낼 수 있는 요청을 다 썼습니다.")
+            # a shorter gap never undercuts the host's robots.txt Crawl-delay (job.kw.ac.kr: 10 s)
+            interval = self.interval and max(self.interval, timedelta(seconds=politeness.crawl_delay(url)))
             permit = politeness.acquire(self.public, page.origin, now, daily_cap=page.daily_cap + extra,
-                                        interval=self.interval)
+                                        interval=interval)
             if permit.granted:
                 self.origins.add(page.origin)
                 if self.budget is not None:
@@ -225,14 +227,21 @@ def page_run(table, notice: dict, page, url: str, html: str, clock: Callable[[],
              inner_transport: Callable[[], httpx.AsyncBaseTransport] | None = None, sleep=None
              ) -> tuple[list[tuple[str, bytes]], list[tuple[str, str]], str]:
     """(images, attachments, how) of a notice whose page (`html`, from `url` on `page`'s server) a page
-    run just fetched. how: "read", "none" (nothing to read), "no_spare", "no_time" or "failed". The
+    run just fetched. how: "read", "none" (nothing to read), "no_spare", "no_time", "failed" or "host" (a
+    host kw_mcp.notices doesn't read yet: a board collected ahead of the extension's release). The
     caller has checked the title (name_risk) and gives the page's server its minute back afterwards."""
     from kw_mcp import notices
 
+    try:
+        fetched = notices.check_url(url)
+    except notices.NoticeError:  # a board collected ahead of the released kw-mcp's host list: the body goes alone
+        log("extract_assets_skipped", notice=notice.get("SK"), reason="host")
+        metrics(ExtractAssetsSkipped=1)
+        return [], [], "host"
     how = "no_time"
     left = ASSET_DEADLINE_S if time_left is None else min(ASSET_DEADLINE_S, time_left() - extract.MODEL_S)
     gate = PoliteGate(table, clock, sleep or asyncio.sleep, refused=notices.Refused, gap_s=politeness.ASSET_GAP_S,
-                      fetched=notices.check_url(url), deadline=time.monotonic() + left)
+                      fetched=fetched, deadline=time.monotonic() + left)
     read = read or notices.read_notice
 
     def transport() -> httpx.AsyncBaseTransport:

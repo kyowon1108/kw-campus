@@ -12,7 +12,11 @@ What --apply does, each step only when something is missing or different (safe t
 4. the button message in #알림-설정 and the 설치하기 message in #설치-안내, each posted once and edited
    when it changes
 5. #제보-검토, hidden from @everyone, and the /제보 and /설치 guild commands
-6. /kw/discord/roles in SSM (guild, role ids, menu, install and report channels); with
+6. #운영 (found by name inside the 운영 category, never created): hidden from @everyone, the bot may
+   view, post, embed links and read history there; its id goes to the "ops" key of /kw/discord/channels
+   (the morning ops digest and the rule watcher post there)
+7. the admin-only /초대회수 and /초대현황 guild commands (default_member_permissions = Manage Server)
+8. /kw/discord/roles in SSM (guild, role ids, menu, install and report channels); with
    --department-channel also the "department" key of /kw/discord/channels
 
 The #설치-안내 message links to the bridge's install page: --bridge-url, else env KW_BRIDGE_BASE_URL,
@@ -43,6 +47,7 @@ from kwcampus.interactions import (
     REPORT_COMMAND,
     SETUP_COMMAND,
     SETUP_START,
+    admin_commands,
     install_message,
     menu_message,
 )
@@ -107,7 +112,7 @@ ONLY_MENTIONS = 1  # guild default_message_notifications: 0 = all messages, 1 = 
 
 NOTICE_CHANNEL_KEYS = ("notice", "academic", "scholarship", "career", "international")
 # One short label per channel, the same shape everywhere (the channel list reads like a menu).
-NOTICE_TOPICS = {"notice": "학교 홈페이지 공지", "academic": "학사 공지", "scholarship": "장학 공지",
+NOTICE_TOPICS = {"notice": "학교·기관 공지", "academic": "학사 공지", "scholarship": "장학 공지",
                  "career": "취업 공지", "international": "국제 공지"}
 MENU_CHANNEL = "알림-설정"
 MENU_TOPIC = "받을 공지 알림 고르기"
@@ -120,6 +125,11 @@ REPORT_TOPIC = "들어온 제보"
 REPORT_DESCRIPTION = "틀린 정보 알리기"
 SETUP_DESCRIPTION = "설치 링크와 내 초대 코드 받기"
 COMMANDS = ((REPORT_COMMAND, REPORT_DESCRIPTION), (SETUP_COMMAND, SETUP_DESCRIPTION))
+# Every guild command as registered: the two above for everyone, then the admin-only ones.
+COMMAND_SPECS = [{"name": name, "description": description, "type": 1} for name, description in COMMANDS] + \
+    admin_commands()
+OPS_CATEGORY = OPS_CHANNEL = "운영"
+CATEGORY = 4
 TEXT_CHANNEL = 0
 NEW = "<새로 만듦>"
 
@@ -190,6 +200,14 @@ def _overwrites_for(guild_id: str, bot_id: str, mention: bool) -> list[tuple[str
     return [(bot_id, 1, bot_allow, 0, "봇"), (guild_id, 0, EVERYONE_ALLOW, EVERYONE_DENY, "@everyone")]
 
 
+def _command_shape(command: dict) -> tuple:
+    """What setup owns on a guild command: Discord answers with more fields (id, version, ...)."""
+    options = tuple((o.get("type"), o.get("name"), o.get("description"), bool(o.get("required")))
+                    for o in command.get("options") or [])
+    perms = command.get("default_member_permissions")
+    return command.get("description"), options, None if perms is None else str(perms)
+
+
 def _button_ids(message: dict) -> list[tuple]:
     return [(c.get("type"), c.get("style"), c.get("label"), c.get("custom_id"), c.get("url"))
             for row in message.get("components") or [] for c in row.get("components") or []]
@@ -258,6 +276,7 @@ class Setup:
             guild_id, bot_id, notice, channels_cfg, saved, by_id, channels)
         self._permissions(guild_id, bot_id, targets, by_id)
         report_channel = self._report_channel(guild_id, bot_id, notice, saved, by_id, channels)
+        ops_channel = self._ops_channel(guild_id, bot_id, channels_cfg, by_id, channels)
         # The role map goes in before the buttons change, so no button points at a role the Lambda can't see.
         self.out("\n[SSM]")
 
@@ -282,6 +301,10 @@ class Setup:
             else:
                 self._put_if_changed(DISCORD_CHANNELS_PARAM, channels_cfg, {**channels_cfg, "department": dept_channel},
                                      label="(학과 공지가 #학과-공지로 감)")
+                channels_cfg = {**channels_cfg, "department": dept_channel}
+        if ops_channel:
+            self._put_if_changed(DISCORD_CHANNELS_PARAM, channels_cfg, {**channels_cfg, "ops": ops_channel},
+                                 label=f"(운영 알림이 #{OPS_CHANNEL}로 감)")
         self._commands(guild_id)
         self._report_permissions(everyone, own, guild)
 
@@ -443,10 +466,44 @@ class Setup:
                               {"type": kind, "allow": str(new_allow), "deny": str(new_deny)})
         return cid
 
+    def _ops_channel(self, guild_id: str, bot_id: str, channels_cfg: dict, by_id: dict,
+                     channels: list[dict]) -> str | None:
+        """#운영 inside the 운영 category, for the ops digest and the rule watcher: its saved id first, else
+        by name in that category only. Never created here (the owner makes it, private). The bot may view,
+        post, embed links and read history there; @everyone may not view it."""
+        self.out(f"\n[#{OPS_CHANNEL}]")
+        categories = {str(c["id"]) for c in channels if c.get("type") == CATEGORY and c.get("name") == OPS_CATEGORY}
+        saved = by_id.get(str(channels_cfg.get("ops") or ""))
+        channel = saved if saved and saved.get("type") == TEXT_CHANNEL else next(
+            (c for c in channels if c.get("name") == OPS_CHANNEL and c.get("type") == TEXT_CHANNEL
+             and str(c.get("parent_id")) in categories), None)
+        if channel is None:
+            self.step("!", f"'{OPS_CATEGORY}' 분류 안에 #{OPS_CHANNEL} 채널이 없어 건너뜁니다. "
+                           "@everyone에게 숨긴 채널로 만든 뒤 다시 실행하세요. 그 전까지 운영 알림은 가지 않습니다.")
+            return None
+        cid = str(channel["id"])
+        self.step("=", f"#{channel['name']} 있음 ({cid})")
+        bot_allow = VIEW_CHANNEL | SEND_MESSAGES | EMBED_LINKS | READ_MESSAGE_HISTORY
+        existing = {str(o["id"]): o for o in channel.get("permission_overwrites") or []}
+        for oid, kind, allow, deny, who in ((bot_id, 1, bot_allow, 0, "봇"), (guild_id, 0, 0, VIEW_CHANNEL, "@everyone")):
+            old = existing.get(oid)
+            new_allow, new_deny = _merge(old, allow, deny)
+            if old and (int(old["allow"]), int(old["deny"])) == (new_allow, new_deny):
+                self.step("=", f"#{channel['name']} {who}: 이미 맞음")
+                continue
+            self.needed |= new_allow | new_deny
+            self.step("~", f"#{channel['name']} {who}: " + ("보기 숨김" if who == "@everyone" else "보기·보내기 허용"))
+            if self.apply:
+                self.api.call("PUT", f"/channels/{cid}/permissions/{oid}",
+                              {"type": kind, "allow": str(new_allow), "deny": str(new_deny)})
+        return cid
+
     def _commands(self, guild_id: str) -> None:
-        """The /제보 and /설치 guild commands. Registering needs the app installed with the
-        applications.commands scope; without it this says how to fix that, and the buttons keep working."""
-        slash = "·".join(f"/{name}" for name, _ in COMMANDS)
+        """The /제보 and /설치 guild commands, and the admin-only /초대회수 and /초대현황. Registering needs
+        the app installed with the applications.commands scope; without it this says how to fix that, and
+        the buttons keep working. A command whose description, options or admin restriction differ is
+        posted again (Discord overwrites a guild command of the same name)."""
+        slash = "·".join(f"/{c['name']}" for c in COMMAND_SPECS)
         self.out(f"\n[{slash} 명령]")
         try:
             app_id = str(self.api.call("GET", "/oauth2/applications/@me")["id"])
@@ -455,17 +512,19 @@ class Setup:
             self.step("!", f"명령 목록을 읽지 못했습니다({e}). 봇을 applications.commands 범위로 다시 초대하면 "
                            f"{slash}가 생깁니다. 제보하기·설치하기 버튼은 그대로 됩니다.")
             return
-        for name, description in COMMANDS:
+        for want in COMMAND_SPECS:
+            name = want["name"]
             current = next((c for c in have if c.get("name") == name), None)
-            if current and current.get("description") == description:
+            if current and _command_shape(current) == _command_shape(want):
                 self.step("=", f"/{name} 있음")
                 continue
-            self.step("+" if current is None else "~", f"/{name} 명령 " + ("만들기" if current is None else "설명 고치기"))
+            admin = " (서버 관리 권한만 보임)" if want.get("default_member_permissions") else ""
+            self.step("+" if current is None else "~",
+                      f"/{name} 명령 " + ("만들기" if current is None else "고치기") + admin)
             if not self.apply:
                 continue
             try:
-                self.api.call("POST", f"/applications/{app_id}/guilds/{guild_id}/commands",
-                              {"name": name, "description": description, "type": 1})
+                self.api.call("POST", f"/applications/{app_id}/guilds/{guild_id}/commands", want)
             except RuntimeError as e:
                 self.step("!", f"/{name}를 만들지 못했습니다({e}). 봇을 applications.commands 범위로 "
                                "다시 초대해 주세요. 제보하기·설치하기 버튼은 그대로 됩니다.")

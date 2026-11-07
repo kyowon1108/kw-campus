@@ -98,7 +98,7 @@ def test_a_day_has_a_cap_across_members_and_a_refusal_uses_up_nothing(bridge, mo
     assert invites.issued_count(bridge, "323456789012345678") == 0  # the member's own cap is untouched
     assert len([i for i in bridge.scan()["Items"] if i["PK"].startswith("INVITE#")]) == 2
     counter = bridge.get_item(Key={"PK": "DINVITES#2026-11-07", "SK": "META"})["Item"]
-    assert int(counter["n"]) == 2 and int(counter["ttl"]) == day + 2 * 86400
+    assert int(counter["n"]) == 2 and int(counter["ttl"]) == day + 8 * 86400  # Monday's digest reads Friday's
     invites.issue(bridge, "323456789012345678", SERVER, now=day + 86400)  # the next day starts again
 
 

@@ -23,6 +23,9 @@ posting so an SQS retry never posts the same notice twice.
   11/18(수) 24:00까지", mentioning nobody. Each D-level is claimed in the delivery record (remind_d3, remind_d1)
   before posting, so it goes out at most once; nothing goes out when the notice's 신청마감 changed
   since the job was made, or the message is gone (that level is then marked gone).
+- ops (opsdigest.py, rulewatch.py): a short operator message to the private #운영 channel (the "ops"
+  key of /kw/discord/channels) and nowhere else, mentioning nobody. Its id becomes the message nonce, so
+  an SQS retry within Discord's nonce window doesn't post it twice. No channel set yet: dropped.
 A notice taken down by hand (removed=true) is never posted or edited again, whatever job comes late.
 
 The delivery record lives 30 days longer than its notice: each edit, repost and keep moves its ttl
@@ -483,10 +486,26 @@ def _remind(job, item, dkey, record, delivery, token, send, now) -> str:
     return "reminded"
 
 
+def _ops(job: dict, token: str, channels: dict[str, str], send) -> str:
+    """An operator message, only ever to the ops channel, with no mentions and no embeds."""
+    channel = str(channels.get("ops") or "")
+    if not is_snowflake(channel):
+        return "no_channel"
+    content = str(job.get("content") or "").strip()[:MAX_LEN]
+    if not content:
+        return "empty"
+    send("POST", f"/channels/{channel}/messages", token, {
+        "content": content, "allowed_mentions": NO_PINGS, "flags": SUPPRESS_EMBEDS,
+        "nonce": _nonce("ops", str(job.get("id") or content)), "enforce_nonce": True})
+    return "ops_posted"
+
+
 def handle_job(job: dict, public, delivery, token: str, channels: dict[str, str],
                roles: dict[str, str] | None = None, send=_discord, now: datetime | None = None) -> str:
     now = now or datetime.now(UTC)
     action = job["action"]
+    if action == "ops":  # no notice behind it: the ops channel only
+        return _ops(job, token, channels, send)
     # A department channel is optional: until its id is set, department notices go to "notice".
     channel_id = channels.get(job["channel"]) or (channels.get("notice") if job["channel"] == "department" else None)
     if action == "post" and not channel_id:

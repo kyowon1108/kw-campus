@@ -27,9 +27,26 @@ CATEGORY_TO_CHANNEL: dict[str, str] = {
     "international-exchange": "international",
     "international-student": "international",
     "dept-aicon": "department",  # 인공지능융합대학 (falls back to "notice" until a channel is set)
-    **{b.category_id: "department" for b in (*deptboards.BOARDS, *wixfeeds.FEEDS)},
+    **{b.category_id: "department" for b in (*deptboards.BOARDS, *wixfeeds.FEEDS) if b.category_id.startswith("dept-")},
     "job": "career",  # 취업게시판
+    # School offices' and funded programs' own boards (deptboards, office=True):
+    # 반도체특성화대학사업단 and HUSS 사업단 pick students of every major for their tracks and courses
+    # (양성인원 선발, 계절학기 학점 교류, 교과목 수강 모집, 1학점 프로그램): 학사.
+    "office-semi": "academic",
+    "office-huss": "academic",
+    # 일반대학원's 교학팀 board: 학위논문, 졸업, 입학, 장학 of graduate students, the school's 학사 for them.
+    "office-grad": "academic",
+    # 한국어교육센터 (outside events and courses for foreign students), 인권센터 (특강, the 폭력예방교육 every
+    # student must take, outside campaigns), 대학혁신사업단 (contests, surveys, events) and 창업지원단 (mostly
+    # other schools' and districts' startup programs) post nothing about classes or credits: 일반.
+    "office-kwiie": "notice",
+    "office-humanrights": "notice",
+    "office-inno": "notice",
+    "office-startup": "notice",
+    "office-career": "career",  # 경력개발팀: 채용설명회, 취업박람회, 직무특강
+    "office-oia": "international",  # 국제처's notices for international students
 }
+OFFICE_CATEGORIES = frozenset(b.category_id for b in deptboards.BOARDS if b.office)
 # Searchable but never announced: FAQ entries are reference pages, not news.
 QUIET_CATEGORIES = frozenset({"faq"})
 
@@ -60,7 +77,7 @@ def channel_for(category_id: str) -> str | None:
 # Department boards and feeds by college: key (category "dept-<key>") → college topic.
 # A new board or feed needs a line here (tests/test_routing.py fails until it has one).
 COLLEGE_OF: dict[str, str] = {
-    **dict.fromkeys(("ei", "ee", "elcomm", "radiowave", "electric", "snme", "semicon"), "ei"),
+    **dict.fromkeys(("ei", "ee", "elcomm", "radiowave", "electric", "electricjob", "snme", "semicon"), "ei"),
     "aicon": "aicon",  # the college home widget, all four schools
     **dict.fromkeys(("archi", "chemng", "architecture"), "eng"),  # 건축공학과, 화학공학과, 건축학과
     "sports": "natsci",  # 스포츠융합과학과
@@ -68,7 +85,7 @@ COLLEGE_OF: dict[str, str] = {
     **dict.fromkeys(("law", "kwpa"), "law"),  # 법학부, 행정학과
     "biz": "biz",
     **dict.fromkeys(("kwlife", "kwlaw", "kwgame", "kwsports"), "kwlife"),
-    "ingenium": "ingenium",
+    **dict.fromkeys(("ingenium", "liberal"), "ingenium"),  # 인제니움학부대학, 자율전공학부
 }
 # The other topics are the channels themselves; the 학교-공지 channel is the "general" topic.
 _CHANNEL_TOPIC = {"notice": "general", "academic": "academic", "scholarship": "scholarship",
@@ -107,13 +124,14 @@ def is_urgent(title: str) -> bool:
 
 
 # The main board's 외부 category carries outside organisations' notices (a certificate exam moved to
-# another hall, a closed exhibition): they are not about our campus, so they never ring 긴급.
-_NOT_URGENT_SOURCES = frozenset({"external"})
+# another hall, a closed exhibition): they are not about our campus, so they never ring 긴급. Nor do the
+# offices' and programs' own boards: a moved class or closed room there concerns one program's students.
+_NOT_URGENT_SOURCES = frozenset({"external"}) | OFFICE_CATEGORIES
 
 
 def urgent_source(category_id: str) -> bool:
     """긴급 is for school-wide notices about our campus (the main board but its 외부 category, the job
-    board), not department boards or feeds."""
+    board), not department boards, feeds or the offices' own boards."""
     channel = channel_for(category_id)
     return channel is not None and channel != "department" and category_id not in _NOT_URGENT_SOURCES
 

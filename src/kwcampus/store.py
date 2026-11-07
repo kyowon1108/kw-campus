@@ -10,10 +10,13 @@ title_key is the title without tags, brackets and punctuation, to fold cross-pos
 A notice taken down by hand (scripts/collector_admin.py takedown) keeps a blank item with
 removed=true until its ttl, so the next collector run cannot bring it back.
 
-A new notice (not a seed row) or one whose title changed also gets a row in the page queue
-(PK = "BODYQ", SK = "<notice PK>|<notice SK>"): extract.py reads that notice's own page once, in a
-later collector run, and stores what it found on the notice (`extracted`, `body_hash`). The queue's
-SK does not start with "N#", so the stream filter keeps it away from the dispatcher.
+A new notice (not a seed row), one whose title changed, and one whose updated_date changed (the
+수정일 of the main board, the job board and the FAQ; the 등록일 of a department board re-using a post)
+also get a row in the page queue (PK = "BODYQ", SK = "<notice PK>|<notice SK>"): extract.py reads
+that notice's own page once, in a later collector run, and stores what it found on the notice
+(`extracted`, `body_hash`). A re-read of an unchanged body skips the model (same body_hash), so an
+edit costs one page request from the server's spare, and the facts follow the edit. The queue's SK
+does not start with "N#", so the stream filter keeps it away from the dispatcher.
 """
 
 from __future__ import annotations
@@ -89,8 +92,9 @@ def upsert(table, item: dict[str, object]) -> str:
 
     An update also moves posted_date (a department re-posting an old post for a new term keeps its
     number but gets a new 등록일) and the ttl: a notice the school keeps changing stays 120 days
-    from its last change. A new notice that is no seed row, and any notice whose title changed, get
-    their page queued (queue_body)."""
+    from its last change. A new notice that is no seed row, and any notice whose title or updated date
+    changed (the school's edits, which the Discord edit note also follows), get their page queued
+    (queue_body)."""
     try:
         table.put_item(Item=item, ConditionExpression="attribute_not_exists(PK)")
         if not item.get("seed"):
@@ -131,7 +135,8 @@ def upsert(table, item: dict[str, object]) -> str:
     # An item stored before norm_v existed has none: its retitle counts as the school's.
     ours = (old.get("norm_v") is not None and old["norm_v"] != item["norm_v"]
             and old.get("updated_date") == item["updated_date"])
-    if old.get("title") != item["title"] and not ours:
+    edited = old.get("updated_date") != item["updated_date"]  # 수정일 moved: the page may say something new
+    if (old.get("title") != item["title"] and not ours) or edited:
         queue_body(table, item)
     return "updated"
 

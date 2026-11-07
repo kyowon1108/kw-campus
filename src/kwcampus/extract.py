@@ -1,8 +1,8 @@
-"""Facts from a notice's own page, read once: deadlines, who it is for, how to apply.
+"""Facts from a notice's own page, read once, and again after an edit: deadlines, who it is for, how to apply.
 
-When the collector stores a new notice (no seed row) or one whose title changed, store.upsert queues
-its page (PK "BODYQ"). The collector's page runs (between the list runs, 10 minutes after each)
-call collect(): oldest first, at most one page per server and run, through the same per-server gate
+When the collector stores a new notice (no seed row) or one whose title or updated date (수정일)
+changed, store.upsert queues its page (PK "BODYQ"); a re-read whose body is unchanged makes no model
+call. The collector's page runs (between the list runs, 10 minutes after each) call collect(): oldest first, at most one page per server and run, through the same per-server gate
 (politeness.acquire) and daily cap as the list pages. A page read only takes what the day's cap has
 to spare after the list requests still planned today (_reserve), so it never costs a list run its
 turn; a page that gets no turn waits for a later run (the queue row lives 14 days). Right after the
@@ -876,9 +876,10 @@ def collect(now: datetime, table, fetch=fetch_list_page, clock: Callable[[], dat
                 counts["no_spare"] += 1
                 continue
             # A notice whose title can't name people may have its images and files read right after the
-            # page, ASSET_GAP_S apart; the server gets its full minute back once the notice is done.
+            # page, ASSET_GAP_S apart (or the host's Crawl-delay if longer); the server gets its full minute
+            # back once the notice is done.
             short = left > 1 and not name_risk(str(notice.get("category_id") or ""), str(notice.get("title") or ""))
-            gap = timedelta(seconds=politeness.ASSET_GAP_S) if short else None
+            gap = timedelta(seconds=max(politeness.ASSET_GAP_S, politeness.crawl_delay(url))) if short else None
             if not politeness.acquire(table, page.origin, clock(), daily_cap=page.daily_cap, interval=gap).granted:
                 counts["gate"] += 1
                 continue

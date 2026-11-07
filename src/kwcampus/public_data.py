@@ -9,10 +9,16 @@ can lag by days) and items taken down by hand are never served. The same notice 
 several boards (the very same title, brackets included) comes back once, with the other copies'
 post ids in "also" and their boards in "also_boards", so a department filter still finds its copy.
 
+A department without a board of its own (정보융합학부: its posts sit on the 인공지능융합대학 board with
+the department set) is a category too: its college's board, only the rows of that department and
+the college-wide ones (no department, or the college's own name). Of a notice posted both college-wide
+and for the department, the department's copy comes back; other departments' copies never do.
+
 A notice whose page was read (extract.py) also carries "extracted" (deadlines, 대상, 자격, 신청 방법,
 금액, 문의 부서, as a model read them) and "deadline": the earliest 신청마감 still ahead, else the
 earliest deadline still ahead, else the earliest one. Rows without them keep their old shape.
 open_only / deadline_after keep only notices whose deadline is today or later (KST) / on or after a day.
+search also looks in those facts as served (masked), title and department matches first.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from collections.abc import Iterable
 from datetime import UTC, date, datetime
 
 from boto3.dynamodb.conditions import Key
+from kw_mcp.combined import COLLEGE_OF_DEPARTMENT
 
 from kwcampus import deptboards, extract, wixfeeds, wwwboards
 from kwcampus.config import KST, NOTICE_SOURCE
@@ -48,8 +55,10 @@ _ALIASES: dict[str, frozenset[str]] = {
     "장학": _SCHOLARSHIP, "장학금": _SCHOLARSHIP, "장학생": _SCHOLARSHIP, "등록": _SCHOLARSHIP,
     "등록금": _SCHOLARSHIP,
     "채용": _JOB, "취업관련": _JOB, "취업정보": _JOB, "일자리": _JOB, "인턴": _JOB,
-    "대외활동": frozenset({"external"}), "국제": frozenset({"international-exchange", "international-student"}),
-    "교환학생": frozenset({"international-exchange"}), "유학생": frozenset({"international-student"}),
+    "대외활동": frozenset({"external"}),
+    "국제": frozenset({"international-exchange", "international-student", "office-oia"}),  # + 국제처's own board
+    "교환학생": frozenset({"international-exchange"}), "유학생": frozenset({"international-student", "office-oia"}),
+    "대학원": frozenset({"office-grad"}),
     "학과": DEPARTMENT_IDS, "학과공지": DEPARTMENT_IDS, "단과대": DEPARTMENT_IDS, "학부": DEPARTMENT_IDS,
     "인융대": frozenset({"dept-aicon"}), "인공지능융합": frozenset({"dept-aicon"}),
     "전정대": frozenset({"dept-ei"}), "전자정보공대": frozenset({"dept-ei"}), "인사대": frozenset({"dept-chss"}),
@@ -80,6 +89,26 @@ def valid_labels() -> list[str]:
 _LABEL_WORDS = re.compile(r"[\s/·]+")
 
 
+def _college_board(department: str) -> frozenset[str]:
+    """The college board to read for a department (spaces ignored) without a board of its own, by
+    kw_mcp.combined.COLLEGE_OF_DEPARTMENT; empty when it has its own board, isn't a department we know,
+    or its college's board isn't collected."""
+    name = "".join(department.split())
+    college = COLLEGE_OF_DEPARTMENT.get(name)
+    if college is None or any(CATEGORY_LABEL[cid] == name for cid in DEPARTMENT_IDS):
+        return frozenset()
+    return frozenset(cid for cid in DEPARTMENT_IDS if CATEGORY_LABEL[cid] == college)
+
+
+def departments_of(value: str | None) -> frozenset[str]:
+    """The departments without a board of their own that a category value names (the whole value or its
+    words): their college's board is then kept to their rows and the college-wide ones. Empty otherwise.
+    resolve_category refuses departments of different colleges, so they always share one board."""
+    if not value or not value.strip():
+        return frozenset()
+    return frozenset("".join(word.split()) for word in (value, *value.split()) if _college_board(word))
+
+
 def _resolve_one(v: str) -> frozenset[str] | None:
     if v in CATEGORY_LABEL:
         return frozenset({v})
@@ -88,6 +117,8 @@ def _resolve_one(v: str) -> frozenset[str] | None:
         return by_label
     if v.casefold() in _ALIASES or v in _ALIASES:
         return _ALIASES.get(v) or _ALIASES[v.casefold()]
+    if college := _college_board(v):  # 정보융합학부: the 인공지능융합대학 board (filtered in _filter)
+        return college
     if len(v) < 2:
         return None
     # The start of a label or of one of its words: "건축" is 건축공학과 and 건축학과, but "공지" is
@@ -223,8 +254,10 @@ def _filter(rows: Iterable[dict], category: str | Iterable[str] | None, since: d
             sources: Iterable[str] | None = None, deadline_from: date | None = None) -> list[dict]:
     """quiet=False leaves out the FAQ (reference pages, never announced) unless asked for by category.
     sources keeps only rows of those sources ("kw-notice" is the main board). deadline_from keeps only
-    rows whose deadline falls on that day or later."""
+    rows whose deadline falls on that day or later. Departments without a board of their own (departments_of)
+    keep their rows and the college-wide ones of their college's board."""
     ids = _category_ids(category)
+    departments = departments_of(category) if isinstance(category, str) else frozenset()
     wanted = frozenset(sources) if sources is not None else None
     after = deadline_from.isoformat() if deadline_from else None
     out = []
@@ -233,6 +266,8 @@ def _filter(rows: Iterable[dict], category: str | Iterable[str] | None, since: d
             continue
         if ids is not None and r.get("category_id") not in ids:
             continue
+        if departments and r.get("department") not in departments | {"", r.get("category")}:
+            continue  # another department's post on the college board
         if ids is None and not quiet and r.get("category_id") in QUIET_CATEGORIES:
             continue
         if since and r["posted_date"] < since.isoformat():
@@ -240,7 +275,18 @@ def _filter(rows: Iterable[dict], category: str | Iterable[str] | None, since: d
         if after and not (r.get("deadline") and str(r["deadline"]["at"])[:10] >= after):
             continue
         out.append(r)
-    return out
+    return _own_copies(out, departments) if departments else out
+
+
+def _own_copies(rows: list[dict], departments: frozenset[str]) -> list[dict]:
+    """Of a notice the college board posted both college-wide and for one of `departments` (one source,
+    so _fold_cross_posts keeps both), only the departments' copies."""
+    own: dict[str, list[dict]] = {}
+    for r in rows:
+        if r.get("department") in departments and (k := _fold_key(str(r.get("title", "")))):
+            own.setdefault(k, []).append(r)
+    return [r for r in rows if r.get("department") in departments or not any(
+        _days_apart(r, mine) <= CROSS_POST_DAYS for mine in own.get(_fold_key(str(r.get("title", ""))), ()))]
 
 
 def _fold_key(title: str) -> str:
@@ -310,12 +356,32 @@ def latest(table, category: str | Iterable[str] | None = None, limit: int = 10, 
 def search(table, query: str, category: str | Iterable[str] | None = None, since: date | None = None,
            limit: int = 20, sources: Iterable[str] | None = None, max_limit: int = MAX_LIMIT, *,
            deadline_after: date | None = None, open_only: bool = False) -> list[dict]:
-    """Notices whose title or department has every word of query; filters apply before the limit."""
+    """Notices that have every word of query in their title, department and read facts together (_facts_text);
+    those with every word in the title or department come first, each group newest first. Filters apply
+    before the limit."""
     terms = [t.casefold() for t in query.split() if t.strip()]
     rows = _filter(notices(table), category, since, quiet=bool(terms), sources=sources,
                    deadline_from=_deadline_from(deadline_after, open_only))
-    hits = [r for r in rows if all(t in (r["title"] + " " + r["department"]).casefold() for t in terms)]
-    return _limited(hits, limit, max_limit)
+    titled, by_facts = [], []
+    for r in rows:
+        head = (r["title"] + " " + r["department"]).casefold()
+        if all(t in head for t in terms):
+            titled.append(r)
+        elif all(t in head + " " + _facts_text(r) for t in terms):
+            by_facts.append(r)
+    return _limited(titled + by_facts, limit, max_limit)
+
+
+def _facts_text(row: dict) -> str:
+    """The searchable part of a row's read facts: who it is for, the conditions, how to apply, the amount,
+    the deadlines' wording and the summary. Taken from the row as served (public_view: extract.public_facts
+    masks them once more), so search finds nothing a reader couldn't see; the contact line is left out."""
+    facts = row.get("extracted")
+    if not isinstance(facts, dict):
+        return ""
+    parts = [facts.get("target"), *(facts.get("eligibility") or []), facts.get("how_to_apply"), facts.get("amount"),
+             *(d.get("text") for d in facts.get("deadlines") or [] if isinstance(d, dict)), facts.get("summary")]
+    return " ".join(str(p) for p in parts if p).casefold()
 
 
 def get(table, post_id: str) -> dict | None:

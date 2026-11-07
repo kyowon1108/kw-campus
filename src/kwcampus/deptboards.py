@@ -1,7 +1,8 @@
-"""Department and college boards on two shared PHP board engines.
+"""Department and college boards, and school offices' boards, on two shared PHP board engines.
 
-A group: list `<page>.php?BoardMode=list&BOARD_CODE=<code>&CURRENT_PAGE=1`, post
-`?BoardMode=view&UID=<n>`, rows in `table.board_table`, pinned rows `tr.notice_tr`.
+A group: list `<page>.php?BoardMode=list&BOARD_CODE=<code>&CURRENT_PAGE=1` (just `<page>.php` for a
+board without a BOARD_CODE: 경력개발팀 pages with ?tpage=), post `?BoardMode=view&UID=<n>`, rows in
+`table.board_table`, pinned rows `tr.notice_tr`.
 B group (the aicon-style engine): list `<page>.php`, post `?admin_mode=read&no=<n>`, rows in
 `table.board_list` or `table.board-list`, pinned rows without a number.
 Page 1 shows every pinned post plus the newest normal ones, and some departments post new items
@@ -18,8 +19,22 @@ A board's own trouble (404, a redirect, a changed page) backs off only that boar
 challenge page and connection failures or 5xx count for the server (politeness.py).
 
 Each board is its own source ("SRC#dept-<key>"): ids stay distinct and seeding is per board.
+A department's or college's board has the category "dept-<key>" (routing: the 학과 channel and its
+college's topic); a school office's or funded program's board on the same servers (사업단, 센터,
+경력개발팀, 국제처, 일반대학원) has "office-<key>", and routing.CATEGORY_TO_CHANNEL gives each its channel.
 The 전자정보공과대학 notice is mirrored on every department site; it is collected once, from ei.
 To add a board, append a row to BOARDS. Department names live only there (they change in 2028).
+
+Request budget per server and weekday (31 list runs: every 20 min 09:00-18:40, and 21:00). A board
+adds no request, only a longer wait for each board on its server:
+  E1  11 boards                 31 requests, each board every 11 runs (3 h 40 min)
+  E2  12 boards                 31 requests, each board every 12 runs (4 h)
+  E3   9 boards + aicon widget  31 requests, the widget every other run, each board every 18 runs (6 h)
+  E4   2 boards                 31 requests, each board every 2 runs (40 min)
+So DAILY_CAP stays 32 a server (31 + a spare), and the page runs' reserve (extract._reserve: one
+request for each list run still to come) stays the same; pages get what the cap has left over.
+job.kw.ac.kr asks for Crawl-delay: 10: list requests are a minute apart (politeness.MIN_INTERVAL), and a
+page run's images and files on that host wait 10 s instead of ASSET_GAP_S (politeness.crawl_delay).
 """
 
 from __future__ import annotations
@@ -39,28 +54,29 @@ from kwcampus.kwnotice.redaction import redact_text
 from kwcampus.kwnotice.values import DUID, SourceURL
 from kwcampus.obs import log, metrics
 
-SERVER_E1 = "61.111.8.4"  # ei, ee, elcomm, radiowave, electric, snme, semicon, law (and job).kw.ac.kr
-SERVER_E2 = "61.111.6.200"  # archi, chss, korean, english, psy, dnaci, kwpa, biz
-SERVER_E3 = "211.233.72.248"  # aicon (ce, cs, ic, cni), kwlife, kwlaw, kwgame, kwsports, ingenium
+SERVER_E1 = "61.111.8.4"  # ei, ee, elcomm, radiowave, electric, snme, semicon, law, job, startup.kw.ac.kr
+SERVER_E2 = "61.111.6.200"  # archi, chss, korean, english, psy, dnaci, kwpa, biz, kwiie, humanrights, oia, grad
+# aicon (ce, cs, ic, cni), kwlife, kwlaw, kwgame, kwsports, ingenium, semi, huss, inno, liberal
+SERVER_E3 = "211.233.72.248"
 SERVER_E4 = "114.203.87.122"  # chemng, sports
-# The collector runs 30 times a weekday (every 20 min, 09:00-18:40), one request per server each;
-# the cap keeps manual or overlapping runs from adding more. Each board is read every
-# <boards on its server> runs: E1 and E2 (8 boards) every 2h40m, E4 (2) every 40 min, and E3's
-# 5 boards share the runs the aicon widget leaves (every other one), so every 3h20m.
+# The collector runs 30 times a weekday (every 20 min, 09:00-18:40) and at 21:00, one request per
+# server each; the cap keeps manual or overlapping runs from adding more. Each board is read every
+# <boards on its server> runs (the budget in the module docstring).
 DAILY_CAP = 32  # one request per server per run: 30 daytime weekday runs + 21:00 (+ a spare)
 BOARD_BACKOFF = timedelta(hours=2)  # a board's own failures: 2 h, 4 h, ... up to 24 h
 
 
 @dataclass(frozen=True)
 class Board:
-    key: str  # source and category id are "dept-<key>"
+    key: str  # source "dept-<key>"; lowercase letters only (kw-mcp reads post ids "dept-<key>-<n>")
     name: str  # what users see as the category and department
     host: str
     path: str  # the list page
-    code: str  # BOARD_CODE ("" for the B group)
+    code: str  # BOARD_CODE ("" for the B group, and for an A board without one)
     encoding: str = "utf-8"  # "cp949" for EUC-KR sites (english.kw.ac.kr)
     server: str = SERVER_E1
     group: str = "A"
+    office: bool = False  # a school office's or program's board, not a department's: category "office-<key>"
 
     @property
     def source(self) -> str:
@@ -68,11 +84,11 @@ class Board:
 
     @property
     def category_id(self) -> str:
-        return f"dept-{self.key}"
+        return f"office-{self.key}" if self.office else f"dept-{self.key}"
 
     @property
     def list_url(self) -> str:
-        if self.group == "B":
+        if self.group == "B" or not self.code:
             return f"https://{self.host}{self.path}"
         return f"https://{self.host}{self.path}?BoardMode=list&BOARD_CODE={self.code}&CURRENT_PAGE=1"
 
@@ -91,6 +107,10 @@ BOARDS: tuple[Board, ...] = (
     Board("snme", "전자재료공학과", "snme.kw.ac.kr", "/college/college_notice.php", "college"),
     Board("semicon", "반도체시스템공학부", "semicon.kw.ac.kr", "/HTML/community/notice.php", "notice"),
     Board("law", "법학부", "law.kw.ac.kr", "/bulletin/notice.php", "notice"),  # 100 rows a page
+    # 취업정보·대외활동: the department's own second board, so the same name (a student's my_notices finds it)
+    Board("electricjob", "전기공학과", "electric.kw.ac.kr", "/autonomy_active/employment_field.php", "job"),
+    Board("career", "경력개발팀", "job.kw.ac.kr", "/community/notice.php", "", office=True),  # robots: Crawl-delay 10
+    Board("startup", "창업지원단", "startup.kw.ac.kr", "/communication/notice.php", "notice", office=True),
     Board("archi", "건축공학과", "archi.kw.ac.kr", "/community/notice.php", "note", server=SERVER_E2),
     Board("chss", "인문사회과학대학", "chss.kw.ac.kr", "/notice/news.php", "notice", server=SERVER_E2),
     Board("korean", "국어국문학과", "korean.kw.ac.kr", "/community/notice.php", "notice", server=SERVER_E2),
@@ -100,11 +120,21 @@ BOARDS: tuple[Board, ...] = (
     Board("dnaci", "동북아문화산업학부", "dnaci.kw.ac.kr", "/notice/news.php", "notice", server=SERVER_E2),
     Board("kwpa", "행정학과", "kwpa.kw.ac.kr", "/notice/faculty.php", "faculty", server=SERVER_E2),
     Board("biz", "경영대학", "biz.kw.ac.kr", "/community/notice.php", "note", server=SERVER_E2),  # 65 pinned
+    Board("kwiie", "한국어교육센터", "kwiie.kw.ac.kr", "/community/notice.php", "notice", server=SERVER_E2, office=True),
+    Board("humanrights", "인권센터", "humanrights.kw.ac.kr", "/community/notice.php", "notice", server=SERVER_E2,
+          office=True),
+    Board("oia", "국제처 유학생", "oia.kw.ac.kr", "/campus/notice.php", "note", server=SERVER_E2, office=True),
+    Board("grad", "일반대학원", "grad.kw.ac.kr", "/notice/news.php", "notice", server=SERVER_E2, office=True),
     Board("kwlife", "참빛인재대학", "kwlife.kw.ac.kr", "/notice/notice.php", "notice", server=SERVER_E3),
     Board("kwlaw", "금융부동산법무학과", "kwlaw.kw.ac.kr", "/notice/notice.php", "notice", server=SERVER_E3),
     Board("kwgame", "게임콘텐츠학과", "kwgame.kw.ac.kr", "/notice/notice.php", "notice", server=SERVER_E3),
     Board("kwsports", "스포츠상담재활학과", "kwsports.kw.ac.kr", "/notice/notice.php", "notice", server=SERVER_E3),
     Board("ingenium", "인제니움학부대학", "ingenium.kw.ac.kr", "/inform/notice.php", "notice", server=SERVER_E3),
+    Board("liberal", "자율전공학부", "liberal.kw.ac.kr", "/bulletin/notice.php", "notice", server=SERVER_E3),
+    Board("semi", "반도체특성화대학사업단", "semi.kw.ac.kr", "/communication/notice.php", "notice", server=SERVER_E3,
+          office=True),
+    Board("huss", "HUSS 사업단", "huss.kw.ac.kr", "/bulletin/notice.php", "notice", server=SERVER_E3, office=True),
+    Board("inno", "대학혁신사업단", "inno.kw.ac.kr", "/bulletin/notice.php", "notice", server=SERVER_E3, office=True),
     Board("chemng", "화학공학과", "chemng.kw.ac.kr", "/community/notice.php", "", server=SERVER_E4, group="B"),
     Board("sports", "스포츠융합과학과", "sports.kw.ac.kr", "/community/notice.php", "", server=SERVER_E4, group="B"),
 )

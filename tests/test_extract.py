@@ -179,6 +179,41 @@ def test_new_and_retitled_notices_are_queued_but_seeds_and_our_own_retitles_are_
     # our redaction changed the title (norm_v up, same 수정일): no new page
     assert store.upsert(table, {**first, "title": "가린 제목", "content_hash": "r", "norm_v": 99}) == "updated"
     assert queue(table) == []
+    # the school edited it: the same title, a new 수정일 on the list
+    assert store.upsert(table, {**first, "title": "가린 제목", "updated_date": "2026-11-07", "content_hash": "e",
+                                "norm_v": 99}) == "updated"
+    assert [r["SK"] for r in queue(table)] == ["SRC#kw-notice|N#2"]
+
+
+def test_an_edited_notice_is_read_again_and_its_facts_follow_the_edit(aws):
+    table = aws["public"]
+    keys(aws)
+    first = notice("kw-notice", 1001, "registration-scholarship", WWW_URL)
+    store.upsert(table, first)
+    claude = FakeClaude()
+    assert extract.collect(NOW, table, fetch=fetcher([], {WWW_URL: WWW_PAGE}), anthropic_client=claude) == {
+        "status": "ok", "extracted": 1}
+    key = {"PK": first["PK"], "SK": first["SK"]}
+    assert item(table, key)["extracted"]["deadlines"][0]["at"] == "2026-11-18T23:59:59+09:00"
+
+    # the school moves the deadline: the list shows a new 수정일, the page a new date
+    edited = {**first, "updated_date": "2026-11-08", "content_hash": "edited"}
+    assert store.upsert(table, edited) == "updated" and len(queue(table)) == 1
+    page = WWW_PAGE.replace("11.18.(수) 24:00", "11.25.(수) 24:00")
+    moved = {**ANSWER, "deadlines": [{"kind": "신청마감", "at": "2026-11-25T24:00", "text": "11.25.(수) 24:00까지"}]}
+    later, calls = FakeClaude(answer=moved), []
+    out = extract.collect(NOW + timedelta(minutes=20), table, fetch=fetcher(calls, {WWW_URL: page}), anthropic_client=later)
+    assert out == {"status": "ok", "extracted": 1} and calls == [WWW_URL] and len(later.calls) == 1
+    assert item(table, key)["extracted"]["deadlines"][0]["at"] == "2026-11-25T23:59:59+09:00"
+    assert queue(table) == []
+
+    # edited again, but only the 수정일 moved: one page request, no model call, the facts stay
+    store.upsert(table, {**edited, "updated_date": "2026-11-09", "content_hash": "again"})
+    unchanged, calls = FakeClaude(), []
+    out = extract.collect(NOW + timedelta(minutes=40), table, fetch=fetcher(calls, {WWW_URL: page}),
+                          anthropic_client=unchanged)
+    assert out == {"status": "ok", "unchanged": 1} and calls == [WWW_URL] and unchanged.calls == []
+    assert item(table, key)["extracted"]["deadlines"][0]["at"] == "2026-11-25T23:59:59+09:00" and queue(table) == []
 
 
 # --- reading pages -----------------------------------------------------------------------------
@@ -441,6 +476,27 @@ def test_local_claude_calls_go_into_the_spend_ledger(monkeypatch, tmp_path):
     monkeypatch.setenv("KW_SPEND_LEDGER", str(tmp_path / "missing.py"))  # Lambda: no ledger, no error
     extract.ask_anthropic(ITEM, "본문", FakeClaude())
     assert len(rows.read_text().splitlines()) == 1
+
+
+def test_a_board_on_a_host_kw_mcp_does_not_read_yet_gets_its_body_read(aws, capsys, monkeypatch):
+    # A board collected ahead of the released extension, whose reader refuses the host (kw-mcp 1.2 knows
+    # 경력개발팀; the Lambda may still run an older wheel): the page run reads the body it fetched itself and
+    # skips the images and files, instead of failing.
+    from kw_mcp import notices
+
+    def refuse(url):
+        raise notices.NoticeError("이 주소는 아직 못 읽어요.")
+
+    monkeypatch.setattr(notices, "check_url", refuse)
+    table, url = aws["public"], "https://job.kw.ac.kr/community/notice.php?BoardMode=view&UID=12631"
+    keys(aws)
+    store.upsert(table, notice("dept-career", 12631, "office-career", url, title="2026 광운대학교 취업박람회 개최 안내"))
+    page = '<div class="view_con"><p>취업박람회 참가 신청은 2026년 11월 18일까지 KLAS에서 받습니다.</p></div>'
+    calls = []
+    out = extract.collect(NOW, table, fetch=fetcher(calls, {url: page}), anthropic_client=FakeClaude())
+    assert out == {"status": "ok", "extracted": 1, "assets_host": 1} and calls == [url] and queue(table) == []
+    assert item(table, {"PK": "SRC#dept-career", "SK": "N#12631"})["extracted"]["sources_used"] == ["body"]
+    assert '"reason": "host"' in capsys.readouterr().out
 
 
 def test_the_collectors_page_runs(aws, monkeypatch):
@@ -829,6 +885,43 @@ def test_asset_requests_stop_at_the_notice_budget_and_the_daily_spare(aws):
     table.put_item(Item={"PK": "ORIGIN#61.111.8.4", "SK": "STATE", "day": "2026-11-07", "day_count": 32})
     with pytest.raises(Refused):  # no spare left: never borrowed from the list runs
         asyncio.run(notice_assets.PoliteGate(table, lambda: clock[0], sleep, refused=Refused).before(EE_URL))
+
+
+def test_a_hosts_crawl_delay_stretches_the_asset_gap(aws, monkeypatch):
+    """job.kw.ac.kr's robots.txt asks for Crawl-delay: 10. A notice's images and files there wait 10 s, not
+    ASSET_GAP_S, both after the page request (extract.collect) and between each other (PoliteGate)."""
+    from kw_mcp.notices import Refused
+
+    from kwcampus import notice_assets
+
+    job = "https://job.kw.ac.kr/community/notice.php?BoardMode=view&UID=12631"
+    assert politeness.crawl_delay(job) == 10 and politeness.crawl_delay(EE_URL) == 0
+    assert politeness.crawl_delay("https://unchecked.example/") == 0
+    table = aws["public"]
+    clock, slept, sleep = ticking()
+    gate = notice_assets.PoliteGate(table, lambda: clock[0], sleep, refused=Refused, gap_s=politeness.ASSET_GAP_S)
+    for i in (1, 2, 3):
+        asyncio.run(gate.before(f"https://job.kw.ac.kr/upload/poster{i}.png"))
+    assert 2 * 10 <= sum(slept) <= 2 * 12 and len(slept) == 2  # 10 s each, never 3
+    assert int(politeness.state(table, "61.111.8.4")["next_at"]) - int(clock[0].timestamp()) == 10
+    gate.rest()
+    # the same server's other hosts keep the 3 s gap
+    clock2, slept2, sleep2 = ticking()
+    clock2[0] = clock[0] + timedelta(hours=1)
+    other = notice_assets.PoliteGate(table, lambda: clock2[0], sleep2, refused=Refused, gap_s=politeness.ASSET_GAP_S)
+    for i in (1, 2):
+        asyncio.run(other.before(f"{EE_URL}&img={i}"))
+    assert 3 <= sum(slept2) <= 5
+
+    # the page request of a page run sets the same longer gap for the first image
+    asked = []
+    real = politeness.acquire
+    monkeypatch.setattr(politeness, "acquire", lambda *a, **kw: asked.append(kw.get("interval")) or real(*a, **kw))
+    keys(aws)
+    store.upsert(table, notice("dept-career", 12631, "office-career", job, title="2026 광운대학교 취업박람회 개최 안내"))
+    page = '<div class="view_con"><p>취업박람회 참가 신청은 2026년 11월 18일까지 KLAS에서 받습니다.</p></div>'
+    extract.collect(NOW + timedelta(hours=2), table, fetch=fetcher([], {job: page}), anthropic_client=FakeClaude())
+    assert asked == [timedelta(seconds=10)]
 
 
 def test_openai_takes_images_and_a_used_up_quota_counts_as_a_key_problem(aws, monkeypatch):
